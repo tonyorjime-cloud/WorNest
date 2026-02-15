@@ -18,3 +18,4 @@ Login with staff email or name. Default password: `fcda`. Admin seed: `admin` / 
 - In-app reminder dashboard shows due-soon and overdue assignments.
 - Optional email reminders: set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD (and optionally SMTP_FROM, SMTP_TLS).
 - You can run reminders from the UI (admin) or via `python reminder_worker.py`.
+"# branchmanagement" 
