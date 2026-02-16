@@ -429,7 +429,7 @@ def execute(q, p=()):
 # ---------- Notifications (Email Reminders) ----------
 
 
-def exec_sql(q, p=()):
+def execute(q, p=()):
     """Backward-compatible alias used by some pages."""
     return execute(q, p)
 def smtp_configured()->bool:
@@ -872,14 +872,14 @@ def page_dashboard():
                         st.error("Project Code and Name are required.")
                     else:
                         if selected is None:
-                            exec_sql(
+                            execute(
                                 "INSERT INTO projects(code,name,client,location,supervisor_staff_id,start_date,end_date) VALUES (?,?,?,?,?,?,?)",
                                 (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None),
                             )
                             st.success("Project created.")
                             st.rerun()
                         else:
-                            exec_sql(
+                            execute(
                                 "UPDATE projects SET code=?,name=?,client=?,location=?,supervisor_staff_id=?,start_date=?,end_date=? WHERE id=?",
                                 (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None, int(selected["id"])),
                             )
@@ -888,7 +888,7 @@ def page_dashboard():
             with colB:
                 if selected is not None:
                     if st.button("Delete project", use_container_width=True):
-                        exec_sql("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
+                        execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
                         st.warning("Project deleted.")
                         st.rerun()
     if selected is not None:
@@ -1280,7 +1280,7 @@ def page_chat():
                     disk_path=os.path.join(chat_dir,fname)
                     with open(disk_path,'wb') as f: f.write(img.getbuffer())
                     image_path=disk_path
-                exec_sql('INSERT INTO chat_messages (staff_id,message,image_path) VALUES (?,?,?)', (sid, m if m else None, image_path))
+                execute('INSERT INTO chat_messages (staff_id,message,image_path) VALUES (?,?,?)', (sid, m if m else None, image_path))
                 st.success('Sent')
                 st.rerun()
 
@@ -1305,6 +1305,458 @@ def page_chat():
         if r.get('image_path') and os.path.exists(r['image_path']):
             st.image(r['image_path'])
         st.divider()
+
+def page_leave_table():
+    st.markdown("<div class='worknest-header'><h2>📄 Leave Table</h2></div>", unsafe_allow_html=True)
+    df=fetch_df("""
+        SELECT L.id, S.name AS staff, S.rank, L.leave_type, L.start_date, L.end_date, L.working_days,
+               R.name AS reliever, L.status, L.reason
+        FROM leaves L
+        JOIN staff S ON S.id = L.staff_id
+        LEFT JOIN staff R ON R.id = L.relieving_staff_id
+        ORDER BY date(L.start_date) DESC, S.name
+    """)
+    if df.empty:
+        st.info("No leave applications yet."); return
+    c1,c2,c3=st.columns(3)
+    with c1:
+        staff_filter = st.selectbox("Filter by staff", ["All"] + sorted(df["staff"].unique().tolist()), key="lvf1")
+    with c2:
+        type_filter = st.selectbox("Filter by type", ["All"] + sorted(df["leave_type"].unique().tolist()), key="lvf2")
+    with c3:
+        years = sorted({dtparser.parse(d).year for d in df["start_date"]})
+        year_filter = st.selectbox("Filter by year", ["All"] + [str(y) for y in years], key="lvf3")
+    f = df.copy()
+    if staff_filter!="All": f = f[f["staff"]==staff_filter]
+    if type_filter!="All": f = f[f["leave_type"]==type_filter]
+    if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
+    st.dataframe(f.reset_index(drop=True), width='stretch')
+
+# ---------- Tasks & Performance ----------
+def _build_expected_biweekly_windows(start_date:date, today:date)->list:
+    out=[]
+    if not isinstance(start_date, date): return out
+    cur=start_date
+    while cur + timedelta(days=14) <= today:
+        nxt=cur + timedelta(days=14)
+        out.append((cur, nxt))
+        cur=nxt
+    return out
+def page_projects():
+    st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
+    projects=fetch_df("""
+        SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.supervisor_staff_id,
+               (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
+        FROM projects p ORDER BY p.code
+    """)
+    left,right=st.columns([1,2])
+    with left:
+        st.subheader("Project List")
+        if projects.empty:
+            st.info("No projects yet. Use the form on the right to add one.")
+            selected=None
+        else:
+            labels=[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
+            selected_label=st.selectbox("Select a project", labels, key="proj_select")
+            selected=projects.iloc[labels.index(selected_label)] if labels else None
+    with right:
+        st.subheader("Create / Update Project")
+        if not can_manage_projects():
+            st.info("Only Admin can create/update/delete projects.")
+
+        staff=fetch_df("SELECT id,name FROM staff ORDER BY name")
+        sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
+        code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
+        name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
+        client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key="proj_client")
+        location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key="proj_loc")
+        start=st.date_input("Start Date", value=(dtparser.parse(selected["start_date"]).date() if selected is not None and pd.notna(selected["start_date"]) else date.today()), key="proj_start")
+        end=st.date_input("End Date", value=(dtparser.parse(selected["end_date"]).date() if selected is not None and pd.notna(selected["end_date"]) else date.today()), key="proj_end")
+        sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
+        sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key="proj_sup")
+        colA,colB=st.columns(2)
+        with colA:
+            if can_manage_projects() and st.button("💾 Save / Update", key="proj_save"):
+                if selected is None:
+                    sup_id=None
+                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
+                    execute("""INSERT INTO projects (code,name,client,location,start_date,end_date,supervisor_staff_id)
+                               VALUES (?,?,?,?,?,?,?)""", (code,name,client or None,location or None,str(start),str(end),sup_id))
+                    st.success("Project created.")
+                else:
+                    sup_id=None
+                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
+                    execute("""UPDATE projects SET code=?,name=?,client=?,location=?,start_date=?,end_date=?,supervisor_staff_id=? WHERE id=?""",
+                            (code,name,client or None,location or None,str(start),str(end),sup_id,int(selected["id"])))
+                    st.success("Project updated.")
+                st.rerun()
+        with colB:
+            if (selected is not None) and st.button("🗑️ Delete", key="proj_del"):
+                execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
+                st.success("Project deleted."); st.rerun()
+
+    if selected is not None:
+        pid=int(selected["id"])
+        st.markdown("### Posted Staff")
+        df=fetch_df("""
+            SELECT s.name, s.rank, ps.role
+            FROM project_staff ps JOIN staff s ON s.id=ps.staff_id
+            WHERE ps.project_id=? ORDER BY s.rank, s.name
+        """,(pid,))
+        st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), width='stretch')
+
+        st.markdown("---")
+        tabs = st.tabs(["🏢 Buildings","📄 Core Docs","🧪 Tests","📝 Biweekly Reports"])
+
+        # Buildings
+        with tabs[0]:
+            bdf=fetch_df("SELECT id,name,floors FROM buildings WHERE project_id=? ORDER BY name",(pid,))
+            st.subheader("Buildings")
+            st.dataframe(bdf if not bdf.empty else pd.DataFrame(columns=["id","name","floors"]), width='stretch')
+            st.markdown("**Add / Edit Building**")
+            names = ["— New —"] + (bdf["name"].tolist() if not bdf.empty else [])
+            pick = st.selectbox("Choose building", names, key="b_pick")
+            if pick=="— New —":
+                b_name = st.text_input("Building name", key="b_name_new")
+                floors = st.number_input("Floors", 0, 200, 0, key="b_f_new")
+                if st.button("➕ Add Building", key="b_add"):
+                    execute("INSERT INTO buildings (project_id,name,floors) VALUES (?,?,?)",(pid,b_name,int(floors)))
+                    st.success("Building added."); st.rerun()
+            else:
+                brow = bdf[bdf["name"]==pick].iloc[0]
+                b_name = st.text_input("Building name", value=brow["name"], key="b_name_edit")
+                floors = st.number_input("Floors", 0, 200, int(brow["floors"]), key="b_f_edit")
+                colx,coly=st.columns(2)
+                with colx:
+                    if st.button("💾 Save Building", key="b_save"):
+                        execute("UPDATE buildings SET name=?, floors=? WHERE id=?", (b_name,int(floors),int(brow["id"])))
+                        st.success("Building updated."); st.rerun()
+                with coly:
+                    if st.button("🗑️ Delete Building", key="b_del"):
+                        execute("DELETE FROM buildings WHERE id=?", (int(brow["id"]),))
+                        st.success("Building deleted."); st.rerun()
+
+        # Core Documents upload/list
+        with tabs[1]:
+            st.subheader("Core Documents")
+            c1,c2=st.columns(2)
+            with c1:
+                st.caption("Required categories: " + ", ".join(CORE_DOC_CATEGORIES))
+            with c2:
+                allowed = can_upload_core_to_project(pid)
+                st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
+            if allowed:
+                cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
+                up = st.file_uploader("Upload file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="doc_file")
+                if st.button("⬆️ Upload Document", key="doc_up"):
+                    path=save_uploaded_file(up, f"project_{pid}/docs")
+                    if path:
+                        execute("""INSERT INTO documents (project_id, building_id, category, file_path, uploaded_at, uploader_staff_id)
+                                   VALUES (?,?,?,?,?,?)""",(pid, None, cat, path, datetime.now().isoformat(timespec="seconds"), current_staff_id()))
+                        st.success("Document uploaded.")
+                    else:
+                        st.error("Select a file first.")
+            ddf=fetch_df("SELECT id,category,file_path,uploaded_at FROM documents WHERE project_id=? ORDER BY uploaded_at DESC",(pid,))
+            if ddf.empty:
+                st.info("No documents yet.")
+            else:
+                for _,r in ddf.iterrows():
+                    colA,colB=st.columns([3,1])
+                    with colA: st.write(f"**{r['category']}** — {os.path.basename(r['file_path'])}  \n*{r['uploaded_at']}*")
+                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"docdl{r['id']}")
+
+        # Tests upload/list
+        with tabs[2]:
+            st.subheader("Test Results (per building & stage)")
+            bdf=fetch_df("SELECT id,name FROM buildings WHERE project_id=? ORDER BY name",(pid,))
+            b_opts = ["— (no specific building) —"] + (bdf["name"].tolist() if not bdf.empty else [])
+            b_pick = st.selectbox("Building", b_opts, key="t_building")
+            bid = None
+            if b_pick!="— (no specific building) —" and (not bdf.empty):
+                bid = int(bdf[bdf["name"]==b_pick]["id"].iloc[0])
+
+            stage = st.selectbox("Stage", STAGES, key="t_stage")
+            ttype_label = st.selectbox("Test Type", [x[1] for x in TEST_TYPES_DISPLAY], key="t_type")
+            ttype = [k for k,v in TEST_TYPES_DISPLAY if v==ttype_label][0]
+            batch_needed = (ttype in ["steel","reinforcement"])
+            batch_id = st.text_input("Batch ID (required for batch tests)", key="t_batch") if batch_needed else None
+
+            allowed = can_upload_project_outputs(pid)
+            st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
+
+            up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="t_file")
+            if st.button("⬆️ Upload Test", key="t_upload"):
+                if not allowed:
+                    st.error("You don't have permission to upload to this project.")
+                else:
+                    if batch_needed and (not batch_id or not batch_id.strip()):
+                        st.error("Batch ID is required for steel/reinforcement tests.")
+                    else:
+                        path=save_uploaded_file(up, f"project_{pid}/tests")
+                        if path:
+                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id)
+                                       VALUES (?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id()))
+                            st.success("Test uploaded.")
+                        else:
+                            st.error("Select a file first.")
+
+            # List
+            tdf=fetch_df("""
+                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at
+                FROM test_results tr
+                LEFT JOIN buildings b ON b.id=tr.building_id
+                WHERE tr.project_id=?
+                ORDER BY tr.uploaded_at DESC
+            """,(pid,))
+            if tdf.empty:
+                st.info("No tests uploaded yet.")
+            else:
+                for _,r in tdf.iterrows():
+                    colA,colB,colC=st.columns([3,1,1])
+                    bname = r["building"] if pd.notna(r["building"]) else "—"
+                    lab = r["test_type"].capitalize()
+                    if r["test_type"] in ["steel","reinforcement"] and pd.notna(r["batch_id"]):
+                        lab += f" (Batch: {r['batch_id']})"
+                    with colA: st.write(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n*{r['uploaded_at']}*")
+                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"tdl{r['id']}")
+                    with colC:
+                        if is_admin() and st.button("🗑️", key=f"tdel{r['id']}"):
+                            execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
+                            st.experimental_rerun()
+
+        # Biweekly Reports
+        with tabs[3]:
+            st.subheader("Biweekly Reports")
+            allowed = can_upload_project_outputs(pid)
+            st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
+            rdate = st.date_input("Report Date", value=date.today(), key="bw_date")
+            up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
+            if st.button("⬆️ Upload Report", key="bw_up"):
+                if not allowed:
+                    st.error("You don't have permission to upload to this project.")
+                else:
+                    path=save_uploaded_file(up, f"project_{pid}/reports")
+                    if path:
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
+                                      (pid, str(rdate), path, current_staff_id()))
+                        st.success("Report uploaded.")
+                        sid = current_staff_id()
+                        if sid is not None:
+                            try:
+                                execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
+                                        (int(sid), "biweekly", int(rid), 5, datetime.now().isoformat(timespec="seconds")))
+                            except Exception:
+                                pass
+                        posted = fetch_df("SELECT staff_id FROM project_staff WHERE project_id=?", (pid,))
+                        if not posted.empty:
+                            for _,pr in posted.iterrows():
+                                try:
+                                    execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
+                                            (int(pr["staff_id"]), "biweekly", int(rid), 5, datetime.now().isoformat(timespec="seconds")))
+                                except Exception:
+                                    pass
+                    else:
+                        st.error("Select a file first.")
+            rdf=fetch_df("SELECT id,report_date,file_path FROM biweekly_reports WHERE project_id=? ORDER BY date(report_date) DESC",(pid,))
+            if rdf.empty:
+                st.info("No reports yet.")
+            else:
+                for _,r in rdf.iterrows():
+                    colA,colB=st.columns([3,1])
+                    with colA: st.write(f"**{r['report_date']}** — {os.path.basename(r['file_path'])}")
+                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
+
+# ---------- Staff ----------
+def page_staff():
+    st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
+    staff=fetch_df("SELECT id,name,rank,email,section FROM staff ORDER BY name")
+    if staff.empty:
+        st.info("No staff yet. Import from CSVs or add directly via DB.")
+        return
+    names=[r["name"] for _,r in staff.iterrows()]
+    sel=st.selectbox("Select staff", names, key="staff_pick")
+    srow=staff[staff["name"]==sel].iloc[0]
+    st.markdown(f"**Name:** {srow['name']}  \n**Rank:** {srow['rank']}  \n**Email:** {srow['email'] or '—'}  \n**Section:** {srow['section'] or '—'}")
+    st.markdown("**Projects posted on:**")
+    df=fetch_df("""
+        SELECT p.code AS project_code, p.name AS project_name, COALESCE(ps.role,'Staff') AS role
+        FROM project_staff ps JOIN projects p ON p.id=ps.project_id
+        WHERE ps.staff_id=? ORDER BY p.code
+    """,(int(srow["id"]),))
+    st.dataframe(df if not df.empty else pd.DataFrame(columns=["project_code","project_name","role"]), width='stretch')
+
+# ---------- Leave ----------
+def working_days_between(start, end, holidays):
+    if end < start: return 0
+    d=start; H=set(holidays); days=0
+    while d<=end:
+        if d.weekday()<5 and d not in H: days+=1
+        d+=timedelta(days=1)
+    return days
+
+def add_working_days(start, n, holidays, cap_dec31=True):
+    if n<=1: return start
+    d=start; count=1; H=set(holidays)
+    last=date(start.year,12,31) if cap_dec31 else None
+    while count<n:
+        d+=timedelta(days=1)
+        if last and d>last: return last
+        if d.weekday()<5 and d not in H: count+=1
+    return d
+
+def page_leave():
+    st.markdown("<div class='worknest-header'><h2>🧳 Leave</h2></div>", unsafe_allow_html=True)
+    staff_df=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
+    hol_df=fetch_df("SELECT date FROM public_holidays")
+    holidays=[dtparser.parse(x).date() for x in hol_df["date"].tolist()] if not hol_df.empty else []
+
+    if staff_df.empty:
+        st.info("Add staff first."); return
+
+    colA,colB=st.columns([2,1])
+    with colA:
+        if is_admin():
+            staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
+            srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
+        else:
+            sid=current_staff_id()
+            if sid is None:
+                st.error("No staff profile linked to this account."); return
+            srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
+            st.write(f"Applicant: **{srow['name']}**")
+        ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
+
+        yr=start.year
+        casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
+                                  (int(srow["id"]), str(yr)))
+        taken_so_far=int(casual_taken_row["d"].iloc[0]) if (not casual_taken_row.empty and pd.notna(casual_taken_row["d"].iloc[0])) else 0
+        casual_remaining=max(0, 14-taken_so_far)
+
+        max_days=None; cap_dec31=True; force_days=None
+        if ltype=="Annual":
+            max_days=30; cap_dec31=True
+        elif ltype=="Casual":
+            max_days=casual_remaining; cap_dec31=True
+        elif ltype=="Paternity":
+            force_days=14; cap_dec31=True
+        elif ltype=="Maternity":
+            force_days=112; cap_dec31=False
+        else:
+            max_days=30
+
+        if force_days is not None:
+            req=force_days; st.write(f"Working days (fixed): **{force_days}**")
+        else:
+            if ltype=="Casual" and max_days==0:
+                st.warning(f"You have used all 14 casual leave days in {yr}.")
+            req=st.number_input("Requested working days", min_value=0 if ltype=="Casual" else 1,
+                                max_value=max_days if (max_days and max_days>0) else 60,
+                                value=min(5, max_days or 5), key="lv_req")
+
+        end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
+        st.write(f"Computed End Date: **{end}**")
+
+    with colB:
+        st.markdown("**Casual Balance**")
+        st.metric(label=f"{start.year} casual remaining", value=f"{casual_remaining} days")
+
+    # --- Reliever enforcement (relaxed for future-year planning and unknown ranks) ---
+    all_staff=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
+    all_leaves=fetch_df("SELECT staff_id, relieving_staff_id, start_date, end_date, status FROM leaves")
+
+    def is_on_leave(sid, s, e):
+        if all_leaves.empty: return False
+        for _,L in all_leaves.iterrows():
+            if int(L["staff_id"])==int(sid):
+                try:
+                    Ls=dtparser.parse(L["start_date"]).date(); Le=dtparser.parse(L["end_date"]).date()
+                except: continue
+                if (s<=Le and Ls<=e) and (str(L.get("status","Pending"))!="Rejected"):
+                    return True
+        return False
+
+    def is_already_relieving(sid, s, e):
+        if all_leaves.empty: return False
+        for _,L in all_leaves.iterrows():
+            if pd.notna(L["relieving_staff_id"]) and int(L["relieving_staff_id"])==int(sid):
+                try:
+                    Ls=dtparser.parse(L["start_date"]).date(); Le=dtparser.parse(L["end_date"]).date()
+                except: continue
+                if (s<=Le and Ls<=e) and (str(L.get("status","Pending"))!="Rejected"):
+                    return True
+        return False
+
+    planning_future_year = start.year > date.today().year
+    enforce_nearest = not planning_future_year
+
+    app_idx = rank_index_safe(srow["rank"])
+    pool=[]
+    for _,cand in all_staff.iterrows():
+        if int(cand["id"])==int(srow["id"]): 
+            continue
+        if is_on_leave(int(cand["id"]), start, end): 
+            continue
+        if is_already_relieving(int(cand["id"]), start, end): 
+            continue
+        c_idx = rank_index_safe(cand["rank"])
+        if enforce_nearest and (app_idx is not None and c_idx is not None):
+            dist = abs(c_idx - app_idx)
+        else:
+            dist = 0
+        pool.append((int(cand["id"]), cand["name"], cand["rank"], dist))
+
+    if not pool:
+        st.error("No available reliever found for the requested period. Adjust dates or add staff.")
+        allowed_names=[]; nearest_names=[]
+    else:
+        min_dist=min(p[3] for p in pool)
+        nearest=[p for p in pool if p[3]==min_dist]
+        nearest_names=[p[1] for p in nearest]
+        allowed_names=[p[1] for p in pool]
+        cap_note=" (relaxed for future-year planning)" if planning_future_year else ""
+        st.caption("Reliever must be nearest in rank and available" + cap_note + ".")
+
+    reliever=st.selectbox("Relieving Officer", allowed_names, key="lv_rel", disabled=(len(allowed_names)==0))
+
+    non_nearest_selected = (not planning_future_year) and (reliever and (reliever not in nearest_names))
+    if non_nearest_selected:
+        ch = [p for p in pool if p[1]==reliever][0]
+        chosen_rank = ch[2]; chosen_dist = ch[3]
+        nearest_dist = min(p[3] for p in pool) if pool else None
+        st.warning(f"Selected reliever **{reliever} ({chosen_rank})** is not nearest in rank (distance={chosen_dist}). "
+                   f"Nearest allowed distance is **{nearest_dist}**. Choose from: " + ", ".join(nearest_names))
+
+    reason=st.text_area("Reason (optional)", key="lv_reason")
+    wd=working_days_between(start, end, holidays)
+    st.write(f"Working days in this request: **{wd}**")
+
+    can_submit=True; msg=None
+    if ltype=="Casual":
+        remaining_after=max(0, casual_remaining - wd)
+        st.info(f"Casual leave remaining after this request in {yr}: **{remaining_after}** working days")
+        if wd>casual_remaining: can_submit=False; msg=f"Casual request exceeds remaining balance ({casual_remaining})."
+        if end.year>yr: can_submit=False; msg="Casual leave end date cannot exceed 31st December."
+    if ltype=="Paternity" and wd!=14: can_submit=False; msg="Paternity leave must be exactly 14 working days."
+    if ltype=="Maternity" and wd!=112: can_submit=False; msg="Maternity leave must be exactly 112 working days."
+    if ltype=="Annual" and wd>30: can_submit=False; msg="Annual leave exceeds 30 working days."
+    if not reliever: can_submit=False; msg = msg or "No reliever selected."
+    elif non_nearest_selected: can_submit=False; msg = msg or "You must select a nearest-in-rank reliever."
+    else:
+        chosen = [p for p in pool if p[1]==reliever]
+        if chosen:
+            ch_id = chosen[0][0]
+            if is_on_leave(ch_id, start, end): can_submit=False; msg="Relieving officer is on leave in the requested period."
+            if is_already_relieving(ch_id, start, end): can_submit=False; msg="Relieving officer is already assigned to relieve another staff in the requested period."
+
+    if st.button("📝 Submit Leave Application", key="lv_submit"):
+        if can_submit:
+            reliever_id=int([p for p in pool if p[1]==reliever][0][0])
+            execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
+                    (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
+            st.success("Leave application submitted.")
+        else:
+            st.error(msg or "Validation failed.")
 
 def page_leave_table():
     st.markdown("<div class='worknest-header'><h2>📄 Leave Table</h2></div>", unsafe_allow_html=True)
