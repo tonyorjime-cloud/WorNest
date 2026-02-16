@@ -1,31 +1,59 @@
-import os, sqlite3, smtplib, ssl
+import os, smtplib, ssl
 from datetime import date
 from email.message import EmailMessage
 from dateutil import parser as dtparser
 import pandas as pd
 
-DB_PATH=os.getenv("WORKNEST_DB_PATH","worknest.db")
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None  # type: ignore
+
+import sqlite3
+
+DB_URL = os.getenv("DATABASE_URL") or os.getenv("WORKNEST_DB_URL") or ""
+DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(("postgres://","postgresql://")))
+DB_PATH = os.getenv("WORKNEST_DB_PATH","worknest.db")
+
+def _adapt_query(q: str) -> str:
+    if DB_IS_POSTGRES:
+        return q.replace("?", "%s")
+    return q
 
 def get_conn():
+    if DB_IS_POSTGRES:
+        if not psycopg2:
+            raise RuntimeError("psycopg2 not installed. Add psycopg2-binary.")
+        return psycopg2.connect(DB_URL)
     c=sqlite3.connect(DB_PATH, check_same_thread=False)
     c.execute("PRAGMA foreign_keys=ON")
     return c
 
 def fetch_df(q, p=()):
+    q=_adapt_query(q)
     c=get_conn()
-    df=pd.read_sql_query(q, c, params=p)
-    c.close()
-    return df
+    try:
+        df=pd.read_sql_query(q, c, params=p)
+        return df
+    finally:
+        try: c.close()
+        except Exception: pass
 
 def execute(q, p=()):
-    c=get_conn(); cur=c.cursor()
-    cur.execute(q, p); c.commit()
-    lid=cur.lastrowid
-    c.close()
-    return lid
-
-def smtp_configured()->bool:
-    return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
+    q=_adapt_query(q).strip()
+    c=get_conn()
+    try:
+        if DB_IS_POSTGRES:
+            with c:
+                with c.cursor() as cur:
+                    cur.execute(q, p)
+        else:
+            cur=c.cursor()
+            cur.execute(q, p)
+            c.commit()
+    finally:
+        try: c.close()
+        except Exception: pass
 
 def send_email(to_email:str, subject:str, body:str)->tuple[bool,str]:
     if not to_email:

@@ -1,9 +1,21 @@
-import os, sqlite3, hashlib
+import os, hashlib
 import smtplib, ssl
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
 from dateutil import parser as dtparser
 import pandas as pd, numpy as np, streamlit as st
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None  # type: ignore
+
+import sqlite3
+
+# Database backend selection
+DB_URL = os.getenv('DATABASE_URL') or os.getenv('WORKNEST_DB_URL') or ''
+DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(('postgres://','postgresql://')))
 
 st.set_page_config(page_title="WorkNest Mini v3.2.1", layout="wide")
 APP_TITLE="WorkNest Mini v3.2.1"
@@ -27,7 +39,7 @@ ENV_DATA_DIR=os.getenv("WORKNEST_DATA_DIR","").strip()
 DEFAULT_LOCAL_DATA=os.path.join(os.getcwd(), "data")
 DATA_DIR=_first_writable_dir([ENV_DATA_DIR, DEFAULT_LOCAL_DATA, os.getcwd()])
 
-DB_PATH=os.getenv("WORKNEST_DB_PATH", os.path.join(DATA_DIR,"worknest.db"))
+DB_PATH=os.getenv('WORKNEST_DB_PATH', os.path.join(DATA_DIR,'worknest.db'))
 UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads"))
 
 
@@ -64,15 +76,56 @@ def rank_index_safe(r):
     return RANK_TO_INDEX.get(rr, None)
 
 def get_conn():
+    if DB_IS_POSTGRES:
+        if not psycopg2:
+            raise RuntimeError("psycopg2 is not installed. Add psycopg2-binary to requirements.txt")
+        if not DB_URL:
+            raise RuntimeError("DATABASE_URL (or WORKNEST_DB_URL) is not set.")
+        return psycopg2.connect(DB_URL)
     c=sqlite3.connect(DB_PATH, check_same_thread=False)
     c.execute("PRAGMA foreign_keys=ON")
     return c
+
+
+def _adapt_query(q: str) -> str:
+    if DB_IS_POSTGRES:
+        return q.replace("?", "%s")
+    return q
+
+def _exec_script(cur, sql_script: str):
+    if not sql_script:
+        return
+    if not DB_IS_POSTGRES:
+        cur.executescript(sql_script)
+        return
+    stmts=[s.strip() for s in sql_script.split(";") if s.strip()]
+    for stmt in stmts:
+        cur.execute(stmt)
 
 def hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
 
 def init_db():
-    c=get_conn(); cur=c.cursor()
+    c=get_conn()
+    cur=c.cursor()
+    if DB_IS_POSTGRES:
+        _exec_script(cur, "CREATE TABLE IF NOT EXISTS public_holidays (\n  id SERIAL PRIMARY KEY,\n  date TEXT NOT NULL,\n  name TEXT\n);\nCREATE TABLE IF NOT EXISTS staff (\n  id SERIAL PRIMARY KEY,\n  name TEXT NOT NULL,\n  rank TEXT NOT NULL,\n  email TEXT UNIQUE,\n  phone TEXT,\n  section TEXT,\n  role TEXT,\n  grade TEXT,\n  join_date TEXT,\n  dob TEXT\n);\nCREATE TABLE IF NOT EXISTS users (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  username TEXT UNIQUE NOT NULL,\n  password_hash TEXT NOT NULL,\n  is_admin INTEGER DEFAULT 0,\n  role TEXT DEFAULT 'staff',\n  is_active INTEGER DEFAULT 1\n);\nCREATE TABLE IF NOT EXISTS projects (\n  id SERIAL PRIMARY KEY,\n  code TEXT UNIQUE NOT NULL,\n  name TEXT NOT NULL,\n  client TEXT,\n  location TEXT,\n  rebar_strength DOUBLE PRECISION,\n  concrete_strength DOUBLE PRECISION,\n  target_slump_min DOUBLE PRECISION,\n  target_slump_max DOUBLE PRECISION,\n  supervisor_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  start_date TEXT,\n  end_date TEXT\n);\nCREATE TABLE IF NOT EXISTS project_staff (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  role TEXT,\n  UNIQUE(project_id,staff_id)\n);\nCREATE TABLE IF NOT EXISTS buildings (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  name TEXT NOT NULL,\n  floors INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS documents (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,\n  category TEXT NOT NULL,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS biweekly_reports (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  report_date TEXT NOT NULL,\n  file_path TEXT,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS tasks (\n  id SERIAL PRIMARY KEY,\n  title TEXT NOT NULL,\n  description TEXT,\n  date_assigned TEXT NOT NULL,\n  days_allotted INTEGER NOT NULL,\n  due_date TEXT NOT NULL,\n  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n  created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS task_assignments (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  status TEXT DEFAULT 'In progress',\n  completed_date TEXT,\n  days_taken INTEGER\n);\nCREATE TABLE IF NOT EXISTS task_documents (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  original_name TEXT,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminders_sent (\n  id SERIAL PRIMARY KEY,\n  assignment_id INTEGER NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,\n  reminder_type TEXT NOT NULL,\n  sent_on TEXT NOT NULL,\n  UNIQUE(assignment_id, reminder_type, sent_on)\n);\nCREATE TABLE IF NOT EXISTS leaves (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  leave_type TEXT NOT NULL,\n  start_date TEXT NOT NULL,\n  end_date TEXT NOT NULL,\n  working_days INTEGER DEFAULT 0,\n  reliever_name TEXT,\n  request_date TEXT,\n  approval_status TEXT DEFAULT 'Pending',\n  approved_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminder_settings (\n  key TEXT PRIMARY KEY,\n  value TEXT\n);\nCREATE TABLE IF NOT EXISTS notice_posts (\n  id SERIAL PRIMARY KEY,\n  author_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  title TEXT NOT NULL,\n  body TEXT,\n  category TEXT DEFAULT 'General',\n  created_at TEXT NOT NULL,\n  pinned INTEGER DEFAULT 0,\n  locked INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS notice_attachments (\n  id SERIAL PRIMARY KEY,\n  post_id INTEGER NOT NULL REFERENCES notice_posts(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS notice_replies (\n  id SERIAL PRIMARY KEY,\n  post_id INTEGER NOT NULL REFERENCES notice_posts(id) ON DELETE CASCADE,\n  author_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  body TEXT NOT NULL,\n  created_at TEXT NOT NULL\n);\n")
+        c.commit()
+        try: c.close()
+        except Exception: pass
+        # Bootstrap admin if none
+        try:
+            df=fetch_df("SELECT COUNT(1) AS n FROM users")
+            n=int(df.iloc[0]["n"]) if not df.empty else 0
+            if n==0:
+                sid=execute("INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date,dob) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            ("Admin","Assistant Director","","","","admin","","",None))
+                execute("INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (sid,"admin",hash_pwd("fcda"),1,"admin",1))
+        except Exception:
+            pass
+        return
+
     cur.executescript("""
 CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT);
@@ -108,8 +161,13 @@ CREATE TABLE IF NOT EXISTS points (
     UNIQUE(staff_id, source, source_id)
 );
 """)
-
-    # --- lightweight migrations for newer versions ---
+    # SQLite migrations
+    try:
+        cols=[r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
+        if "dob" not in cols:
+            cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
+    except Exception:
+        pass
     try:
         cols=[r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
         if "role" not in cols:
@@ -118,36 +176,62 @@ CREATE TABLE IF NOT EXISTS points (
             cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
     except Exception:
         pass
-
-    # Tasks schema upgrades
     try:
         tcols=[r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
         if "created_by_staff_id" not in tcols:
             cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
     except Exception:
         pass
-
-    # Ensure at least one admin user exists (bootstrap)
+    c.commit(); c.close()
+    # Bootstrap admin
     try:
-        ucnt=cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if ucnt==0:
-            admin_user=os.getenv("WORKNEST_ADMIN_USER","admin")
-            admin_pwd=os.getenv("WORKNEST_ADMIN_PASSWORD","fcda")
-            cur.execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active) VALUES (NULL, ?, ?, 1, 'admin', 1)",
-                        (admin_user, hash_pwd(admin_pwd)))
+        ucnt=fetch_df("SELECT COUNT(1) AS n FROM users")
+        n=int(ucnt.iloc[0]["n"]) if not ucnt.empty else 0
+        if n==0:
+            sid=execute("INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date) VALUES (?,?,?,?,?,?,?,?)",
+                        ("Admin","Assistant Director","","","","admin","",""))
+            execute("INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (?,?,?,?,?,?)",
+                    (sid,"admin",hash_pwd("fcda"),1,"admin",1))
     except Exception:
         pass
-    if not cur.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
-        cur.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,1)", ("admin", hash_pwd("fcda")))
-    c.commit(); c.close()
-    if not os.path.isdir(UPLOAD_DIR):
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 def fetch_df(q, p=()):
-    c=get_conn(); df=pd.read_sql_query(q, c, params=p); c.close(); return df
+    q=_adapt_query(q)
+    c=get_conn()
+    try:
+        df=pd.read_sql_query(q, c, params=p)
+        return df
+    finally:
+        try: c.close()
+        except Exception: pass
 
 def execute(q, p=()):
-    c=get_conn(); cur=c.cursor(); cur.execute(q, p); c.commit(); lid=cur.lastrowid; c.close(); return lid
+    q=_adapt_query(q).strip()
+    c=get_conn()
+    try:
+        if DB_IS_POSTGRES:
+            with c:
+                with c.cursor() as cur:
+                    low=q.lower()
+                    if low.startswith("insert") and "returning" not in low:
+                        q2=q.rstrip().rstrip(";")+" RETURNING id"
+                        cur.execute(q2, p)
+                        row=cur.fetchone()
+                        return int(row[0]) if row else None
+                    cur.execute(q, p)
+                    if "returning" in low:
+                        row=cur.fetchone()
+                        return int(row[0]) if row else None
+                    return None
+        else:
+            cur=c.cursor()
+            cur.execute(q, p)
+            c.commit()
+            return cur.lastrowid
+    finally:
+        try: c.close()
+        except Exception: pass
 
 
 # ---------- Notifications (Email Reminders) ----------
