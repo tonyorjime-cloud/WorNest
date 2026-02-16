@@ -427,6 +427,11 @@ def execute(q, p=()):
 
 
 # ---------- Notifications (Email Reminders) ----------
+
+
+def exec_sql(q, p=()):
+    """Backward-compatible alias used by some pages."""
+    return execute(q, p)
 def smtp_configured()->bool:
     return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
 
@@ -716,6 +721,7 @@ def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
     sid=current_staff_id()
     admin=is_admin()
+    selected = None  # ensure defined for all branches
     col1,col2,col3=st.columns(3)
     projects=fetch_df("SELECT * FROM projects")
     staff=fetch_df("SELECT * FROM staff")
@@ -817,36 +823,74 @@ def page_dashboard():
         st.dataframe(df_items, hide_index=True, use_container_width=True)
     else:
         st.success("No due/overdue items in the next 7 days.")
-        sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
-        code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
-        name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
-        client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key="proj_client")
-        location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key="proj_loc")
-        start=st.date_input("Start Date", value=(dtparser.parse(selected["start_date"]).date() if selected is not None and pd.notna(selected["start_date"]) else date.today()), key="proj_start")
-        end=st.date_input("End Date", value=(dtparser.parse(selected["end_date"]).date() if selected is not None and pd.notna(selected["end_date"]) else date.today()), key="proj_end")
-        sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
-        sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key="proj_sup")
-        colA,colB=st.columns(2)
-        with colA:
-            if can_manage_projects() and st.button("💾 Save / Update", key="proj_save"):
-                if selected is None:
-                    sup_id=None
-                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""INSERT INTO projects (code,name,client,location,start_date,end_date,supervisor_staff_id)
-                               VALUES (?,?,?,?,?,?,?)""", (code,name,client or None,location or None,str(start),str(end),sup_id))
-                    st.success("Project created.")
-                else:
-                    sup_id=None
-                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""UPDATE projects SET code=?,name=?,client=?,location=?,start_date=?,end_date=?,supervisor_staff_id=? WHERE id=?""",
-                            (code,name,client or None,location or None,str(start),str(end),sup_id,int(selected["id"])))
-                    st.success("Project updated.")
-                st.rerun()
-        with colB:
-            if (selected is not None) and st.button("🗑️ Delete", key="proj_del"):
-                execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
-                st.success("Project deleted."); st.rerun()
 
+    # --- Project Quick Edit (Admin only) ---
+    st.markdown("### Project Quick Edit")
+    pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
+    if not pdf.empty:
+        options = ["— Select project —"] + [f"{r['code']} — {r['name']}" for _, r in pdf.iterrows()]
+        pick = st.selectbox("Project", options, key="dash_proj_pick")
+        if pick != "— Select project —":
+            sel_code = pick.split(" — ")[0].strip()
+            row = pdf[pdf["code"] == sel_code]
+            if not row.empty:
+                selected = row.iloc[0].to_dict()
+    else:
+        st.info("No projects found yet. Import projects via Import CSVs (admin).")
+
+    # Basic edit form (admin only)
+    sup_name_by_id = {int(r["id"]): r["name"] for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
+    sup_id_by_name = {r["name"]: int(r["id"]) for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
+    sup_options = [""] + sorted([n for n in staff["name"].dropna().tolist() if str(n).strip()])
+
+    default_sup = ""
+    if selected is not None and selected.get("supervisor_staff_id"):
+        try:
+            default_sup = sup_name_by_id.get(int(selected["supervisor_staff_id"]), "") or ""
+        except Exception:
+            default_sup = ""
+
+    if can_manage_projects:
+        with st.expander("Create / Edit Project", expanded=False):
+            code = st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
+            name = st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
+            client = st.text_input("Client", value=(selected.get("client") if selected is not None else "") or "", key="proj_client")
+            location = st.text_input("Location", value=(selected.get("location") if selected is not None else "") or "", key="proj_location")
+            start_date = st.text_input("Start date (YYYY-MM-DD)", value=(selected.get("start_date") if selected is not None else "") or "", key="proj_start")
+            end_date = st.text_input("End date (YYYY-MM-DD)", value=(selected.get("end_date") if selected is not None else "") or "", key="proj_end")
+
+            sup_idx = 0
+            if default_sup and default_sup in sup_options:
+                sup_idx = sup_options.index(default_sup)
+            supervisor_name = st.selectbox("Supervisor", sup_options, index=sup_idx, key="proj_supervisor")
+            supervisor_id = sup_id_by_name.get(supervisor_name) if supervisor_name else None
+
+            colA, colB = st.columns([1, 1])
+            with colA:
+                if st.button("Save project", use_container_width=True):
+                    if not code.strip() or not name.strip():
+                        st.error("Project Code and Name are required.")
+                    else:
+                        if selected is None:
+                            exec_sql(
+                                "INSERT INTO projects(code,name,client,location,supervisor_staff_id,start_date,end_date) VALUES (?,?,?,?,?,?,?)",
+                                (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None),
+                            )
+                            st.success("Project created.")
+                            st.rerun()
+                        else:
+                            exec_sql(
+                                "UPDATE projects SET code=?,name=?,client=?,location=?,supervisor_staff_id=?,start_date=?,end_date=? WHERE id=?",
+                                (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None, int(selected["id"])),
+                            )
+                            st.success("Project updated.")
+                            st.rerun()
+            with colB:
+                if selected is not None:
+                    if st.button("Delete project", use_container_width=True):
+                        exec_sql("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
+                        st.warning("Project deleted.")
+                        st.rerun()
     if selected is not None:
         pid=int(selected["id"])
         st.markdown("### Posted Staff")
