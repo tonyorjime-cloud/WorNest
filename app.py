@@ -592,7 +592,7 @@ def login_ui():
         if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
             st.session_state["user"]=dict(u.iloc[0]); st.rerun()
         else:
-        s=fetch_df("SELECT id,name,email,rank FROM staff WHERE (lower(email)=lower(?)) OR (lower(name)=lower(?))", (username, username))
+            s=fetch_df("SELECT id,name,email,rank FROM staff WHERE (lower(email)=lower(?)) OR (lower(name)=lower(?))", (username, username))
             if s.empty:
                 st.error("User not found. Ask Admin to add you in Staff, then login using your email or name.")
             else:
