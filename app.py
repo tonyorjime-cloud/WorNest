@@ -634,6 +634,18 @@ def is_assigned_to_task(task_id:int, staff_id:int|None=None)->bool:
     return (not df.empty)
 
 
+
+
+def is_assigned_to_project(project_id:int, staff_id:int|None=None)->bool:
+    # Admin can upload to any project; staff can upload only if assigned to the project.
+    if is_admin():
+        return True
+    sid = staff_id if staff_id is not None else current_staff_id()
+    if sid is None:
+        return False
+    df = fetch_df("SELECT 1 FROM project_staff WHERE project_id=? AND staff_id=?", (int(project_id), int(sid)))
+    return (not df.empty)
+
 def can_upload_project_outputs(project_id:int)->bool:
     # reports + test results: admin can upload anywhere; staff only where assigned
     if is_admin(): return True
