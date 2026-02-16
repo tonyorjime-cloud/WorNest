@@ -109,25 +109,19 @@ def init_db():
     c=get_conn()
     cur=c.cursor()
     if DB_IS_POSTGRES:
-        _exec_script(cur, "CREATE TABLE IF NOT EXISTS public_holidays (\n  id SERIAL PRIMARY KEY,\n  date TEXT NOT NULL,\n  name TEXT\n);\nCREATE TABLE IF NOT EXISTS staff (\n  id SERIAL PRIMARY KEY,\n  name TEXT NOT NULL,\n  rank TEXT NOT NULL,\n  email TEXT UNIQUE,\n  phone TEXT,\n  section TEXT,\n  role TEXT,\n  grade TEXT,\n  join_date TEXT,\n  dob TEXT\n);\nCREATE TABLE IF NOT EXISTS users (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  username TEXT UNIQUE NOT NULL,\n  password_hash TEXT NOT NULL,\n  is_admin INTEGER DEFAULT 0,\n  role TEXT DEFAULT 'staff',\n  is_active INTEGER DEFAULT 1\n);\nCREATE TABLE IF NOT EXISTS projects (\n  id SERIAL PRIMARY KEY,\n  code TEXT UNIQUE NOT NULL,\n  name TEXT NOT NULL,\n  client TEXT,\n  location TEXT,\n  rebar_strength DOUBLE PRECISION,\n  concrete_strength DOUBLE PRECISION,\n  target_slump_min DOUBLE PRECISION,\n  target_slump_max DOUBLE PRECISION,\n  supervisor_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  start_date TEXT,\n  end_date TEXT\n);\nCREATE TABLE IF NOT EXISTS project_staff (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  role TEXT,\n  UNIQUE(project_id,staff_id)\n);\nCREATE TABLE IF NOT EXISTS buildings (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  name TEXT NOT NULL,\n  floors INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS documents (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,\n  category TEXT NOT NULL,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS biweekly_reports (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  report_date TEXT NOT NULL,\n  file_path TEXT,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS tasks (\n  id SERIAL PRIMARY KEY,\n  title TEXT NOT NULL,\n  description TEXT,\n  date_assigned TEXT NOT NULL,\n  days_allotted INTEGER NOT NULL,\n  due_date TEXT NOT NULL,\n  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n  created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS task_assignments (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  status TEXT DEFAULT 'In progress',\n  completed_date TEXT,\n  days_taken INTEGER\n);\nCREATE TABLE IF NOT EXISTS task_documents (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  original_name TEXT,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminders_sent (\n  id SERIAL PRIMARY KEY,\n  assignment_id INTEGER NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,\n  reminder_type TEXT NOT NULL,\n  sent_on TEXT NOT NULL,\n  UNIQUE(assignment_id, reminder_type, sent_on)\n);\nCREATE TABLE IF NOT EXISTS leaves (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  leave_type TEXT NOT NULL,\n  start_date TEXT NOT NULL,\n  end_date TEXT NOT NULL,\n  working_days INTEGER DEFAULT 0,\n  reliever_name TEXT,\n  request_date TEXT,\n  approval_status TEXT DEFAULT 'Pending',\n  approved_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminder_settings (\n  key TEXT PRIMARY KEY,\n  value TEXT\n);\nCREATE TABLE IF NOT EXISTS notice_posts (\n  id SERIAL PRIMARY KEY,\n  author_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  title TEXT NOT NULL,\n  body TEXT,\n  category TEXT DEFAULT 'General',\n  created_at TEXT NOT NULL,\n  pinned INTEGER DEFAULT 0,\n  locked INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS notice_attachments (\n  id SERIAL PRIMARY KEY,\n  post_id INTEGER NOT NULL REFERENCES notice_posts(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS notice_replies (\n  id SERIAL PRIMARY KEY,\n  post_id INTEGER NOT NULL REFERENCES notice_posts(id) ON DELETE CASCADE,\n  author_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  body TEXT NOT NULL,\n  created_at TEXT NOT NULL\n);\n")
-        c.commit()
-        try: c.close()
-        except Exception: pass
-        # Bootstrap admin if none
-        try:
-            df=fetch_df("SELECT COUNT(1) AS n FROM users")
-            n=int(df.iloc[0]["n"]) if not df.empty else 0
-            if n==0:
-                sid=execute("INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date,dob) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                            ("Admin","Assistant Director","","","","admin","","",None))
-                execute("INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (sid,"admin",hash_pwd("fcda"),1,"admin",1))
-        except Exception:
-            pass
-        return
-
-    cur.executescript("""
-CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
+        _exec_script(cur, "CREATE TABLE IF NOT EXISTS public_holidays (\n  id SERIAL PRIMARY KEY,\n  date TEXT NOT NULL,\n  name TEXT\n);\nCREATE TABLE IF NOT EXISTS staff (\n  id SERIAL PRIMARY KEY,\n  name TEXT NOT NULL,\n  rank TEXT NOT NULL,\n  email TEXT UNIQUE,\n  phone TEXT,\n  section TEXT,\n  role TEXT,\n  grade TEXT,\n  join_date TEXT,\n  dob TEXT\n);\nCREATE TABLE IF NOT EXISTS users (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  username TEXT UNIQUE NOT NULL,\n  password_hash TEXT NOT NULL,\n  is_admin INTEGER DEFAULT 0,\n  role TEXT DEFAULT 'staff',\n  is_active INTEGER DEFAULT 1\n);\nCREATE TABLE IF NOT EXISTS projects (\n  id SERIAL PRIMARY KEY,\n  code TEXT UNIQUE NOT NULL,\n  name TEXT NOT NULL,\n  client TEXT,\n  location TEXT,\n  rebar_strength DOUBLE PRECISION,\n  concrete_strength DOUBLE PRECISION,\n  target_slump_min DOUBLE PRECISION,\n  target_slump_max DOUBLE PRECISION,\n  supervisor_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  start_date TEXT,\n  end_date TEXT\n);\nCREATE TABLE IF NOT EXISTS project_staff (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  role TEXT,\n  UNIQUE(project_id,staff_id)\n);\nCREATE TABLE IF NOT EXISTS buildings (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  name TEXT NOT NULL,\n  floors INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS documents (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,\n  category TEXT NOT NULL,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS biweekly_reports (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  report_date TEXT NOT NULL,\n  file_path TEXT,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS tasks (\n  id SERIAL PRIMARY KEY,\n  title TEXT NOT NULL,\n  description TEXT,\n  date_assigned TEXT NOT NULL,\n  days_allotted INTEGER NOT NULL,\n  due_date TEXT NOT NULL,\n  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n  created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS task_assignments (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  status TEXT DEFAULT 'In progress',\n  completed_date TEXT,\n  days_taken INTEGER\n);\nCREATE TABLE IF NOT EXISTS task_documents (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  original_name TEXT,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminders_sent (\n  id SERIAL PRIMARY KEY,\n  assignment_id INTEGER NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,\n  reminder_type TEXT NOT NULL,\n  sent_on TEXT NOT NULL,\n  UNIQUE(assignment_id, reminder_type, sent_on)\n);\nCREATE TABLE IF NOT EXISTS leaves (
+  id SERIAL PRIMARY KEY,
+  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  leave_type TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  working_days INTEGER DEFAULT 0,
+  relieving_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+  status TEXT DEFAULT 'Pending',
+  reason TEXT,
+  request_date TEXT,
+  approved_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
@@ -162,7 +156,32 @@ CREATE TABLE IF NOT EXISTS points (
 );
 """)
     # SQLite migrations
-    try:
+    
+    # --- Postgres schema migrations (idempotent) ---
+    if DB_IS_POSTGRES:
+        def _pg_has_column(table: str, column: str) -> bool:
+            cur.execute(
+                """SELECT 1
+                   FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name=%s AND column_name=%s
+                  LIMIT 1""", (table, column)
+            )
+            return cur.fetchone() is not None
+
+        def _pg_add_column(table: str, ddl: str):
+            # ddl should be like: ALTER TABLE <table> ADD COLUMN ...
+            cur.execute(ddl)
+
+        # leaves: align old schema to new fields expected by UI
+        if not _pg_has_column('leaves', 'relieving_staff_id'):
+            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN relieving_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+        if not _pg_has_column('leaves', 'status'):
+            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN status TEXT DEFAULT 'Pending'")
+        if not _pg_has_column('leaves', 'reason'):
+            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN reason TEXT")
+        if not _pg_has_column('leaves', 'request_date'):
+            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN request_date TEXT")
+try:
         cols=[r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
         if "dob" not in cols:
             cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
@@ -200,8 +219,15 @@ def fetch_df(q, p=()):
     q=_adapt_query(q)
     c=get_conn()
     try:
-        df=pd.read_sql_query(q, c, params=p)
-        return df
+        if DB_IS_POSTGRES:
+            with c.cursor() as cur:
+                cur.execute(q, p or ())
+                cols=[d[0] for d in (cur.description or [])]
+                rows=cur.fetchall() if cur.description else []
+            return pd.DataFrame(rows, columns=cols)
+        else:
+            df=pd.read_sql_query(q, c, params=p)
+            return df
     finally:
         try: c.close()
         except Exception: pass
@@ -979,7 +1005,7 @@ def page_leave_table():
                R.name AS reliever, L.status, L.reason
         FROM leaves L
         JOIN staff S ON S.id = L.staff_id
-        JOIN staff R ON R.id = L.relieving_staff_id
+        LEFT JOIN staff R ON R.id = L.relieving_staff_id
         ORDER BY date(L.start_date) DESC, S.name
     """)
     if df.empty:
