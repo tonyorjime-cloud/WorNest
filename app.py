@@ -7,8 +7,13 @@ import pandas as pd, numpy as np, streamlit as st
 
 st.set_page_config(page_title="WorkNest Mini v3.2.1", layout="wide")
 APP_TITLE="WorkNest Mini v3.2.1"
-DB_PATH="worknest.db"
-UPLOAD_DIR=os.path.join("data","uploads")
+DATA_DIR=os.getenv("WORKNEST_DATA_DIR","")
+DB_PATH=os.getenv("WORKNEST_DB_PATH", os.path.join(DATA_DIR,"worknest.db") if DATA_DIR else "worknest.db")
+UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads") if DATA_DIR else os.path.join("data","uploads"))
+
+# Ensure persistence paths exist
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 CORE_DOC_CATEGORIES=["architectural","structural","electrical","mechanical","soil_investigation","boq","program_of_work"]
 STAGES=["Substructure","Ground Floor","Typical Floor","Roof","External Works"]
@@ -893,41 +898,42 @@ def page_tasks():
         with colC:
             st.caption("Scores only computed for **Completed** tasks. Overdue **In progress** tasks are flagged below.")
 
-    # --- Task Attachments ---
-    st.markdown("#### 📎 Task Attachments")
-    attach_files = st.file_uploader("Attach files (PDF/DWG/DOC/XLS/Images, etc.)",
-                                    accept_multiple_files=True,
-                                    key=f"tsk_attach_{tid}")
-    if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
-        if not attach_files:
-            st.error("Select one or more files first.")
+    if mode=="Edit existing":
+        # --- Task Attachments ---
+        st.markdown("#### 📎 Task Attachments")
+        attach_files = st.file_uploader("Attach files (PDF/DWG/DOC/XLS/Images, etc.)",
+                                        accept_multiple_files=True,
+                                        key=f"tsk_attach_{tid}")
+        if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
+            if not attach_files:
+                st.error("Select one or more files first.")
+            else:
+                ok=0
+                for f in attach_files:
+                    path=save_uploaded_file(f, f"task_{tid}/attachments")
+                    if path:
+                        execute("""INSERT INTO task_documents (task_id,file_path,original_name,uploaded_at,uploader_staff_id)
+                                   VALUES (?,?,?,?,?)""",
+                                (int(tid), path, getattr(f, "name", None), datetime.now().isoformat(timespec="seconds"), current_staff_id()))
+                        ok += 1
+                st.success(f"Uploaded {ok} attachment(s)."); st.rerun()
+    
+        adf=fetch_df("SELECT id, original_name, file_path, uploaded_at FROM task_documents WHERE task_id=? ORDER BY uploaded_at DESC",(int(tid),))
+        if adf.empty:
+            st.caption("No attachments yet.")
         else:
-            ok=0
-            for f in attach_files:
-                path=save_uploaded_file(f, f"task_{tid}/attachments")
-                if path:
-                    execute("""INSERT INTO task_documents (task_id,file_path,original_name,uploaded_at,uploader_staff_id)
-                               VALUES (?,?,?,?,?)""",
-                            (int(tid), path, getattr(f, "name", None), datetime.now().isoformat(timespec="seconds"), current_staff_id()))
-                    ok += 1
-            st.success(f"Uploaded {ok} attachment(s)."); st.rerun()
-
-    adf=fetch_df("SELECT id, original_name, file_path, uploaded_at FROM task_documents WHERE task_id=? ORDER BY uploaded_at DESC",(int(tid),))
-    if adf.empty:
-        st.caption("No attachments yet.")
-    else:
-        for _,r in adf.iterrows():
-            c1,c2,c3=st.columns([4,1,1])
-            with c1:
-                nm = r["original_name"] if pd.notna(r["original_name"]) else os.path.basename(r["file_path"])
-                st.write(f"**{nm}**  \n*{r['uploaded_at']}*")
-            with c2:
-                file_download_button("⬇️ Download", r["file_path"], key=f"tsk_adl_{tid}_{int(r['id'])}")
-            with c3:
-                if is_admin() and st.button("🗑️", key=f"tsk_adel_{tid}_{int(r['id'])}"):
-                    execute("DELETE FROM task_documents WHERE id=?", (int(r["id"]),))
-                    st.success("Attachment removed."); st.rerun()
-
+            for _,r in adf.iterrows():
+                c1,c2,c3=st.columns([4,1,1])
+                with c1:
+                    nm = r["original_name"] if pd.notna(r["original_name"]) else os.path.basename(r["file_path"])
+                    st.write(f"**{nm}**  \n*{r['uploaded_at']}*")
+                with c2:
+                    file_download_button("⬇️ Download", r["file_path"], key=f"tsk_adl_{tid}_{int(r['id'])}")
+                with c3:
+                    if is_admin() and st.button("🗑️", key=f"tsk_adel_{tid}_{int(r['id'])}"):
+                        execute("DELETE FROM task_documents WHERE id=?", (int(r["id"]),))
+                        st.success("Attachment removed."); st.rerun()
+    
     else:
         title=st.text_input("Title", key="tsk_title_new")
         desc=st.text_area("Description", key="tsk_desc_new")

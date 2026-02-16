@@ -18,4 +18,7 @@ Login with staff email or name. Default password: `fcda`. Admin seed: `admin` / 
 - In-app reminder dashboard shows due-soon and overdue assignments.
 - Optional email reminders: set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD (and optionally SMTP_FROM, SMTP_TLS).
 - You can run reminders from the UI (admin) or via `python reminder_worker.py`.
-"# branchmanagement" 
+
+## Deployment notes (Render)
+- For persistence on Render, attach a Persistent Disk and set WORKNEST_DATA_DIR to the disk mount path (e.g. /var/data).
+- Optional: set WORKNEST_DB_PATH and WORKNEST_UPLOAD_DIR to override defaults.
