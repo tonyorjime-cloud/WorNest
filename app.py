@@ -1288,7 +1288,12 @@ def page_tasks():
 # ---------- Import CSVs ----------
 def page_import():
     st.markdown("<div class='worknest-header'><h2>⬆️ Import CSVs</h2></div>", unsafe_allow_html=True)
-    st.caption("Place your CSV files inside the <b>data</b> folder next to app.py, then click the buttons below.", unsafe_allow_html=True)
+    st.caption("Upload your CSV templates below (recommended for Render), or place them inside a local <b>data</b> folder next to app.py.", unsafe_allow_html=True)
+
+    up_staff = st.file_uploader("Upload staff_template.csv", type=["csv"], key="up_staff")
+    up_projects = st.file_uploader("Upload structural_project_info_min.csv", type=["csv"], key="up_projects")
+    up_holidays = st.file_uploader("Upload nigeria_public_holidays_2025_2026.csv", type=["csv"], key="up_holidays")
+
     c1,c2=st.columns(2)
     c3,c4=st.columns(2)
 
