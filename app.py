@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS points (
     UNIQUE(staff_id, source, source_id)
 );
 """)
+
+    # --- lightweight migrations for newer versions ---
+    try:
+        cols=[r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+        if "role" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
+        if "is_active" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
+    except Exception:
+        pass
+
+    # Ensure at least one admin user exists (bootstrap)
+    try:
+        ucnt=cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if ucnt==0:
+            admin_user=os.getenv("WORKNEST_ADMIN_USER","admin")
+            admin_pwd=os.getenv("WORKNEST_ADMIN_PASSWORD","fcda")
+            cur.execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active) VALUES (NULL, ?, ?, 1, 'admin', 1)",
+                        (admin_user, hash_pwd(admin_pwd)))
+    except Exception:
+        pass
     if not cur.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
         cur.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,1)", ("admin", hash_pwd("fcda")))
     c.commit(); c.close()
@@ -234,7 +255,16 @@ def apply_styles():
     </style>""", unsafe_allow_html=True)
 
 def current_user(): return st.session_state.get("user")
-def is_admin(): u=current_user(); return bool(u and u.get("is_admin",0)==1)
+def user_role():
+    u=current_user()
+    if not u: return None
+    r=u.get('role')
+    if r: return str(r)
+    return 'admin' if int(u.get('is_admin',0) or 0)==1 else 'staff'
+def is_admin():
+    u=current_user()
+    if not u: return False
+    return user_role()=='admin' or int(u.get('is_admin',0) or 0)==1
 def current_staff_id():
     u=current_user()
     if not u: return None
@@ -250,7 +280,7 @@ def login_ui():
     password=st.text_input("Password", type="password", key="login_pwd")
     if st.button("Login", key="login_btn"):
         u=fetch_df("SELECT * FROM users WHERE username=?", (username,))
-        if (not u.empty) and u["password_hash"].iloc[0]==hash_pwd(password):
+        if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
             st.session_state["user"]=dict(u.iloc[0]); st.rerun()
         else:
             s=fetch_df("SELECT id,name,email,rank FROM staff WHERE (email=? COLLATE NOCASE) OR (name=?)", (username, username))
@@ -262,9 +292,9 @@ def login_ui():
                 ex=fetch_df("SELECT id FROM users WHERE username=?", (uname,))
                 if ex.empty:
                     adm=1 if normalize_rank(s["rank"].iloc[0])=="Assistant Director" else 0
-                    execute("INSERT INTO users (staff_id, username, password_hash, is_admin) VALUES (?,?,?,?)", (sid, uname, hash_pwd("fcda"), adm))
+                    execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active) VALUES (?,?,?,?,?,?)", (sid, uname, hash_pwd("fcda"), adm, ("admin" if adm==1 else "staff"), 1))
                 u=fetch_df("SELECT * FROM users WHERE username=?", (uname,))
-                if (not u.empty) and u["password_hash"].iloc[0]==hash_pwd(password):
+                if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
                     st.session_state["user"]=dict(u.iloc[0]); st.rerun()
                 else:
                     st.error("Wrong password. Default is 'fcda' unless changed.")
@@ -273,14 +303,18 @@ def logout_button():
     if st.sidebar.button("🚪 Logout", key="logout_btn"):
         st.session_state.pop("user", None); st.rerun()
 
+
 def sidebar_nav():
     u=current_user()
     st.sidebar.title("📚 Navigation")
-    if u: st.sidebar.markdown(f"**User:** {u['username']}")
+    if u: st.sidebar.markdown(f"**User:** {u['username']}  \\n**Role:** {user_role()}")
     logout_button()
-    return st.sidebar.radio("Go to",
-        ["🏠 Dashboard","🏗️ Projects","👥 Staff","🧳 Leave","📄 Leave Table","🗂️ Tasks & Performance","⬆️ Import CSVs"],
-        key="nav_radio")
+
+    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave"]
+    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control"]
+    pages = base_pages + (admin_pages if is_admin() else [])
+
+    return st.sidebar.radio("Go to", pages, key="nav_radio")
 
 # ---------- Helpers ----------
 def can_upload_to_project(project_id:int)->bool:
@@ -454,7 +488,7 @@ def page_projects():
                 st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if allowed:
                 cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
-                up = st.file_uploader("Upload file", key="doc_file")
+                up = st.file_uploader("Upload file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="doc_file")
                 if st.button("⬆️ Upload Document", key="doc_up"):
                     path=save_uploaded_file(up, f"project_{pid}/docs")
                     if path:
@@ -491,7 +525,7 @@ def page_projects():
             allowed = can_upload_to_project(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
 
-            up = st.file_uploader("Upload test result file (PDF, XLSX, etc.)", key="t_file")
+            up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="t_file")
             if st.button("⬆️ Upload Test", key="t_upload"):
                 if not allowed:
                     st.error("You don't have permission to upload to this project.")
@@ -537,7 +571,7 @@ def page_projects():
             allowed = can_upload_to_project(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             rdate = st.date_input("Report Date", value=date.today(), key="bw_date")
-            up = st.file_uploader("Upload biweekly report (PDF/Doc)", key="bw_file")
+            up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
             if st.button("⬆️ Upload Report", key="bw_up"):
                 if not allowed:
                     st.error("You don't have permission to upload to this project.")
@@ -901,7 +935,7 @@ def page_tasks():
     if mode=="Edit existing":
         # --- Task Attachments ---
         st.markdown("#### 📎 Task Attachments")
-        attach_files = st.file_uploader("Attach files (PDF/DWG/DOC/XLS/Images, etc.)",
+        attach_files = st.file_uploader("Attach files (PDF/Image)", type=["pdf","png","jpg","jpeg"],
                                         accept_multiple_files=True,
                                         key=f"tsk_attach_{tid}")
         if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
@@ -1169,6 +1203,49 @@ def page_import():
             st.success("Project postings imported/updated.")
         else:
             st.error("data/postings.csv not found.")
+
+
+# ---------- Access Control (Admin) ----------
+def page_access_control():
+    st.subheader("🔐 Access Control")
+    st.caption("Admin can define what staff see by assigning roles and enabling/disabling accounts. Default password for new staff accounts is 'fcda'.")
+    if not is_admin():
+        st.error("Admin only.")
+        return
+
+    df=fetch_df("""SELECT u.id as user_id,u.username,
+                          COALESCE(u.role, CASE WHEN u.is_admin=1 THEN 'admin' ELSE 'staff' END) as role,
+                          u.is_admin,
+                          COALESCE(u.is_active,1) as is_active,
+                          s.id as staff_id,s.name,s.email,s.rank
+                   FROM users u
+                   LEFT JOIN staff s ON s.id=u.staff_id
+                   ORDER BY COALESCE(s.name,u.username)""")
+    if df.empty:
+        st.info("No users found.")
+        return
+
+    st.dataframe(df[["user_id","username","role","is_admin","is_active","name","email","rank"]], use_container_width=True)
+
+    st.markdown("### Update a user")
+    user_id=st.number_input("User ID", min_value=1, step=1)
+    col1,col2,col3=st.columns(3)
+    with col1:
+        new_role=st.selectbox("Role", ["staff","admin"], index=0)
+    with col2:
+        active=st.selectbox("Status", [1,0], index=0, format_func=lambda x: "Active" if x==1 else "Disabled")
+    with col3:
+        new_pwd=st.text_input("Reset password (optional)", type="password", help="Leave blank to keep existing password.")
+    if st.button("Apply changes"):
+        isadm = 1 if new_role=="admin" else 0
+        if new_pwd.strip():
+            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=? WHERE id=?",
+                    (new_role, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
+        else:
+            execute("UPDATE users SET role=?, is_admin=?, is_active=? WHERE id=?",
+                    (new_role, isadm, int(active), int(user_id)))
+        st.success("Updated.")
+        st.rerun()
 
 def main():
     init_db(); apply_styles()
