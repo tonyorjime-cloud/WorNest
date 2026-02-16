@@ -747,7 +747,7 @@ def page_dashboard():
                 flags.append({"Project":f"{p['code']} — {p['name']}", "Issue":f"Biweekly overdue — last on {last_d} (expected by {exp})"})
 
     st.subheader("🚩 Red Flags")
-    st.dataframe(pd.DataFrame(flags) if flags else pd.DataFrame([{"Project":"—","Issue":"No red flags"}]), use_container_width=True)
+    st.dataframe(pd.DataFrame(flags) if flags else pd.DataFrame([{"Project":"—","Issue":"No red flags"}]), width='stretch')
 
 # ---------- Projects ----------
 def page_projects():
@@ -811,7 +811,7 @@ def page_projects():
             FROM project_staff ps JOIN staff s ON s.id=ps.staff_id
             WHERE ps.project_id=? ORDER BY s.rank, s.name
         """,(pid,))
-        st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), use_container_width=True)
+        st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), width='stretch')
 
         st.markdown("---")
         tabs = st.tabs(["🏢 Buildings","📄 Core Docs","🧪 Tests","📝 Biweekly Reports"])
@@ -820,7 +820,7 @@ def page_projects():
         with tabs[0]:
             bdf=fetch_df("SELECT id,name,floors FROM buildings WHERE project_id=? ORDER BY name",(pid,))
             st.subheader("Buildings")
-            st.dataframe(bdf if not bdf.empty else pd.DataFrame(columns=["id","name","floors"]), use_container_width=True)
+            st.dataframe(bdf if not bdf.empty else pd.DataFrame(columns=["id","name","floors"]), width='stretch')
             st.markdown("**Add / Edit Building**")
             names = ["— New —"] + (bdf["name"].tolist() if not bdf.empty else [])
             pick = st.selectbox("Choose building", names, key="b_pick")
@@ -991,7 +991,7 @@ def page_staff():
         FROM project_staff ps JOIN projects p ON p.id=ps.project_id
         WHERE ps.staff_id=? ORDER BY p.code
     """,(int(srow["id"]),))
-    st.dataframe(df if not df.empty else pd.DataFrame(columns=["project_code","project_name","role"]), use_container_width=True)
+    st.dataframe(df if not df.empty else pd.DataFrame(columns=["project_code","project_name","role"]), width='stretch')
 
 # ---------- Leave ----------
 def working_days_between(start, end, holidays):
@@ -1190,7 +1190,7 @@ def page_leave_table():
     if staff_filter!="All": f = f[f["staff"]==staff_filter]
     if type_filter!="All": f = f[f["leave_type"]==type_filter]
     if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
-    st.dataframe(f.reset_index(drop=True), use_container_width=True)
+    st.dataframe(f.reset_index(drop=True), width='stretch')
 
 # ---------- Tasks & Performance ----------
 def _build_expected_biweekly_windows(start_date:date, today:date)->list:
@@ -1234,11 +1234,11 @@ def page_tasks():
         with c1:
             st.caption("Due soon (0–2 days)")
             st.dataframe(due_soon[["project","title","staff","due_date","days_to_due"]] if not due_soon.empty else pd.DataFrame(columns=["project","title","staff","due_date","days_to_due"]),
-                         use_container_width=True)
+                         width='stretch')
         with c2:
             st.caption("Overdue")
             st.dataframe(overdue[["project","title","staff","due_date","days_to_due"]] if not overdue.empty else pd.DataFrame(columns=["project","title","staff","due_date","days_to_due"]),
-                         use_container_width=True)
+                         width='stretch')
 
         if is_admin():
             st.caption("Email reminders are optional. Configure SMTP_* env vars to enable sending.")
@@ -1402,7 +1402,7 @@ def page_tasks():
             late=max((cd-due).days, 0)
             return max(0, 100 - 5*late)
         df["score"]=df.apply(score_row, axis=1)
-        st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], use_container_width=True)
+        st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
     st.subheader("♟️ Chess Points (5 per completed task, 5 per bi-weekly report upload)")
     pts=fetch_df("""
@@ -1413,7 +1413,7 @@ def page_tasks():
     if pts.empty:
         st.info("No points yet. Complete tasks or upload bi-weekly reports to earn points.")
     else:
-        st.dataframe(pts, use_container_width=True)
+        st.dataframe(pts, width='stretch')
 
     st.subheader("Staff Performance (Task Scores + Report Compliance)")
     if df.empty:
@@ -1477,7 +1477,7 @@ def page_tasks():
             return float(np.mean(vals)) if vals else np.nan
         perf["combined_score"]=perf.apply(combined, axis=1).round(1)
         perf = perf.sort_values(by=["combined_score","staff"], ascending=[False,True])
-        st.dataframe(perf, use_container_width=True)
+        st.dataframe(perf, width='stretch')
 
 # ---------- Import CSVs ----------
 def page_import():
@@ -1636,7 +1636,7 @@ def page_access_control():
         st.info("No users found.")
         return
 
-    st.dataframe(df[["user_id","username","role","is_admin","is_active","name","email","rank"]], use_container_width=True)
+    st.dataframe(df[["user_id","username","role","is_admin","is_active","name","email","rank"]], width='stretch')
 
     st.markdown("### Update a user")
     user_id=st.number_input("User ID", min_value=1, step=1)
@@ -1672,14 +1672,17 @@ def main():
     except Exception:
         pass
 
-    page=sidebar_nav()
+        page=sidebar_nav()
     if page.startswith("🏠"): page_dashboard()
     elif page.startswith("🏗️"): page_projects()
     elif page.startswith("👥"): page_staff()
     elif page.startswith("🧳"): page_leave()
     elif page.startswith("📄"): page_leave_table()
     elif page.startswith("🗂️"): page_tasks()
-    else: page_import()
+    elif page.startswith("⬆️"): page_import()
+    elif page.startswith("🔐"): page_access_control()
+    else: page_dashboard()
+
 
 if __name__=="__main__":
     main()
