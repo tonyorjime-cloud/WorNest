@@ -429,7 +429,7 @@ def execute(q, p=()):
 # ---------- Notifications (Email Reminders) ----------
 
 
-def execute(q, p=()):
+def execute_sql(q, p=()):
     """Backward-compatible alias used by some pages."""
     return execute(q, p)
 def smtp_configured()->bool:
