@@ -7,9 +7,29 @@ import pandas as pd, numpy as np, streamlit as st
 
 st.set_page_config(page_title="WorkNest Mini v3.2.1", layout="wide")
 APP_TITLE="WorkNest Mini v3.2.1"
-DATA_DIR=os.getenv("WORKNEST_DATA_DIR","")
-DB_PATH=os.getenv("WORKNEST_DB_PATH", os.path.join(DATA_DIR,"worknest.db") if DATA_DIR else "worknest.db")
-UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads") if DATA_DIR else os.path.join("data","uploads"))
+# --- Storage paths (Render-safe) ---
+def _first_writable_dir(candidates):
+    for d in candidates:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            test_path=os.path.join(d, ".worknest_write_test")
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_path)
+            return d
+        except Exception:
+            continue
+    return ""
+
+ENV_DATA_DIR=os.getenv("WORKNEST_DATA_DIR","").strip()
+DEFAULT_LOCAL_DATA=os.path.join(os.getcwd(), "data")
+DATA_DIR=_first_writable_dir([ENV_DATA_DIR, DEFAULT_LOCAL_DATA, os.getcwd()])
+
+DB_PATH=os.getenv("WORKNEST_DB_PATH", os.path.join(DATA_DIR,"worknest.db"))
+UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads"))
+
 
 # Ensure persistence paths exist
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -96,6 +116,14 @@ CREATE TABLE IF NOT EXISTS points (
             cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
         if "is_active" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
+    except Exception:
+        pass
+
+    # Tasks schema upgrades
+    try:
+        tcols=[r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "created_by_staff_id" not in tcols:
+            cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
     except Exception:
         pass
 
@@ -258,13 +286,38 @@ def current_user(): return st.session_state.get("user")
 def user_role():
     u=current_user()
     if not u: return None
-    r=u.get('role')
-    if r: return str(r)
+    r=(u.get('role') or '').strip()
+    if r: return r
+    # Backward compatibility
     return 'admin' if int(u.get('is_admin',0) or 0)==1 else 'staff'
+
 def is_admin():
-    u=current_user()
-    if not u: return False
-    return user_role()=='admin' or int(u.get('is_admin',0) or 0)==1
+    return user_role()=='admin' or int((current_user() or {}).get('is_admin',0) or 0)==1
+
+def is_sub_admin():
+    return user_role() in ('admin','sub_admin')
+
+def is_section_head():
+    return user_role() in ('admin','sub_admin','section_head')
+
+def can_import_csv():
+    return is_admin()
+
+def can_manage_projects():
+    # create/edit/delete projects
+    return is_admin()
+
+def can_upload_core_docs():
+    # "core" project documents (drawings, approvals, etc.)
+    return is_sub_admin()
+
+def can_assign_tasks():
+    # create/assign tasks
+    return is_section_head()
+
+def can_approve_leave():
+    return is_admin()
+
 def current_staff_id():
     u=current_user()
     if not u: return None
@@ -291,7 +344,7 @@ def login_ui():
                 uname=s["email"].iloc[0] if pd.notna(s["email"].iloc[0]) else s["name"].iloc[0]
                 ex=fetch_df("SELECT id FROM users WHERE username=?", (uname,))
                 if ex.empty:
-                    adm=1 if normalize_rank(s["rank"].iloc[0])=="Assistant Director" else 0
+                    adm=0  # new users are staff by default; Admin promotes via Access Control
                     execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active) VALUES (?,?,?,?,?,?)", (sid, uname, hash_pwd("fcda"), adm, ("admin" if adm==1 else "staff"), 1))
                 u=fetch_df("SELECT * FROM users WHERE username=?", (uname,))
                 if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
@@ -317,12 +370,45 @@ def sidebar_nav():
     return st.sidebar.radio("Go to", pages, key="nav_radio")
 
 # ---------- Helpers ----------
-def can_upload_to_project(project_id:int)->bool:
+
+def is_assigned_to_task(task_id:int, staff_id:int|None=None)->bool:
+    sid = staff_id if staff_id is not None else current_staff_id()
+    if sid is None: return False
+    df=fetch_df("SELECT 1 FROM task_assignments WHERE task_id=? AND staff_id=?", (int(task_id), int(sid)))
+    return (not df.empty)
+
+
+def can_upload_project_outputs(project_id:int)->bool:
+    # reports + test results: admin can upload anywhere; staff only where assigned
+    if is_admin(): return True
+    return is_assigned_to_project(project_id)
+
+def can_upload_task_files(task_row:dict)->bool:
+    # task attachments: admin always; task creator or assignee can upload
     if is_admin(): return True
     sid=current_staff_id()
     if sid is None: return False
-    df=fetch_df("SELECT 1 FROM project_staff WHERE project_id=? AND staff_id=?", (int(project_id), int(sid)))
-    return (not df.empty)
+    try:
+        tid=int(task_row.get("id"))
+    except Exception:
+        return False
+    # Creator
+    try:
+        if int(task_row.get("created_by_staff_id") or -1)==sid:
+            return True
+    except Exception:
+        pass
+    # Any assignee
+    return is_assigned_to_task(tid, sid)
+
+def can_download_task_files(task_row:dict)->bool:
+    # same as upload for now
+    return can_upload_task_files(task_row) or is_section_head()
+
+def can_upload_core_to_project(project_id:int)->bool:
+    # core docs: admin + sub-admin only
+    return can_upload_core_docs()
+
 
 def save_uploaded_file(uploaded_file, subfolder=""):
     if uploaded_file is None: return None
@@ -405,6 +491,9 @@ def page_projects():
             selected=projects.iloc[labels.index(selected_label)] if labels else None
     with right:
         st.subheader("Create / Update Project")
+        if not can_manage_projects():
+            st.info("Only Admin can create/update/delete projects.")
+
         staff=fetch_df("SELECT id,name FROM staff ORDER BY name")
         sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
         code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
@@ -417,7 +506,7 @@ def page_projects():
         sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key="proj_sup")
         colA,colB=st.columns(2)
         with colA:
-            if st.button("💾 Save / Update", key="proj_save"):
+            if can_manage_projects() and st.button("💾 Save / Update", key="proj_save"):
                 if selected is None:
                     sup_id=None
                     if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
@@ -484,7 +573,7 @@ def page_projects():
             with c1:
                 st.caption("Required categories: " + ", ".join(CORE_DOC_CATEGORIES))
             with c2:
-                allowed = can_upload_to_project(pid)
+                allowed = can_upload_core_to_project(pid)
                 st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if allowed:
                 cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
@@ -522,7 +611,7 @@ def page_projects():
             batch_needed = (ttype in ["steel","reinforcement"])
             batch_id = st.text_input("Batch ID (required for batch tests)", key="t_batch") if batch_needed else None
 
-            allowed = can_upload_to_project(pid)
+            allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
 
             up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="t_file")
@@ -568,7 +657,7 @@ def page_projects():
         # Biweekly Reports
         with tabs[3]:
             st.subheader("Biweekly Reports")
-            allowed = can_upload_to_project(pid)
+            allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             rdate = st.date_input("Report Date", value=date.today(), key="bw_date")
             up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
@@ -656,8 +745,15 @@ def page_leave():
 
     colA,colB=st.columns([2,1])
     with colA:
-        staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
-        srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
+        if is_admin():
+            staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
+            srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
+        else:
+            sid=current_staff_id()
+            if sid is None:
+                st.error("No staff profile linked to this account."); return
+            srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
+            st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
         start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
@@ -879,6 +975,10 @@ def page_tasks():
     st.subheader("Create / Edit Task")
     titles=fetch_df("SELECT id,title FROM tasks ORDER BY id DESC")
     mode=st.radio("Mode", ["Create new","Edit existing"], horizontal=True, key="tsk_mode")
+    if (not can_assign_tasks()) and mode=="Create new":
+        st.info("Only Admin and Sectional Heads can create/assign tasks. Switching to view/edit attachments mode.")
+        mode="Edit existing"
+
     if mode=="Edit existing" and titles.empty:
         st.info("No tasks to edit. Switch to 'Create new'.")
         mode="Create new"
@@ -887,6 +987,7 @@ def page_tasks():
         pick=st.selectbox("Select task", list(label_map.keys()), key="tsk_pick")
         tid=label_map[pick]
         trow=fetch_df("SELECT * FROM tasks WHERE id=?", (tid,)).iloc[0]
+        task_dict = dict(trow)
         title=st.text_input("Title", value=trow["title"], key="tsk_title")
         desc=st.text_area("Description", value=trow["description"] or "", key="tsk_desc")
         date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key="tsk_da")
@@ -903,7 +1004,7 @@ def page_tasks():
                                  default=fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist())
         colA,colB,colC=st.columns(3)
         with colA:
-            if st.button("💾 Save", key="tsk_save"):
+            if can_assign_tasks() and st.button("💾 Save", key="tsk_save"):
                 execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
                         (title, desc or None, str(date_assigned), int(da), str(due),
                          int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None, tid))
@@ -939,6 +1040,9 @@ def page_tasks():
                                         accept_multiple_files=True,
                                         key=f"tsk_attach_{tid}")
         if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
+            if not can_upload_task_files(task_dict):
+                st.error("You don't have permission to upload attachments for this task.")
+                st.stop()
             if not attach_files:
                 st.error("Select one or more files first.")
             else:
@@ -962,7 +1066,10 @@ def page_tasks():
                     nm = r["original_name"] if pd.notna(r["original_name"]) else os.path.basename(r["file_path"])
                     st.write(f"**{nm}**  \n*{r['uploaded_at']}*")
                 with c2:
-                    file_download_button("⬇️ Download", r["file_path"], key=f"tsk_adl_{tid}_{int(r['id'])}")
+                    if can_download_task_files(task_dict):
+                        file_download_button("⬇️ Download", r["file_path"], key=f"tsk_adl_{tid}_{int(r['id'])}")
+                    else:
+                        st.caption("🔒")
                 with c3:
                     if is_admin() and st.button("🗑️", key=f"tsk_adel_{tid}_{int(r['id'])}"):
                         execute("DELETE FROM task_documents WHERE id=?", (int(r["id"]),))
@@ -978,10 +1085,10 @@ def page_tasks():
         proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
         proj=st.selectbox("Project (optional)", proj_opt, key="tsk_proj_new")
         assignees=st.multiselect("Assignees", staff["name"].tolist(), key="tsk_asg_new")
-        if st.button("➕ Create Task", key="tsk_create"):
+        if can_assign_tasks() and st.button("➕ Create Task", key="tsk_create"):
             pid = int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None
-            tid=execute("INSERT INTO tasks (title,description,date_assigned,days_allotted,due_date,project_id) VALUES (?,?,?,?,?,?)",
-                        (title, desc or None, str(date_assigned), int(da), str(due), pid))
+            tid=execute("INSERT INTO tasks (title,description,date_assigned,days_allotted,due_date,project_id,created_by_staff_id) VALUES (?,?,?,?,?,?,?)",
+                        (title, desc or None, str(date_assigned), int(da), str(due), pid, current_staff_id()))
             for nm in assignees:
                 sid=int(staff[staff["name"]==nm]["id"].iloc[0])
                 execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
@@ -1105,6 +1212,12 @@ def page_import():
         path=os.path.join("data","staff_template.csv")
         if os.path.exists(path):
             df=pd.read_csv(path)
+        elif up_staff is not None:
+            df=pd.read_csv(up_staff)
+        else:
+            st.error("staff_template.csv not found. Upload it above or place it in data/.");
+            df=None
+        if df is not None:
             for _,r in df.iterrows():
                 if pd.isna(r.get("name")) or pd.isna(r.get("rank")): continue
                 email = r.get("email") if pd.notna(r.get("email")) else None
@@ -1120,20 +1233,32 @@ def page_import():
         else:
             st.error("data/staff_template.csv not found.")
 
-    if c2.button("Import nigeria_public_holidays_2025_2026.csv", key="imp_hol"):
+    if c3.button("Import nigeria_public_holidays_2025_2026.csv", key="imp_hol"):
         path=os.path.join("data","nigeria_public_holidays_2025_2026.csv")
         if os.path.exists(path):
             df=pd.read_csv(path)
+        elif up_holidays is not None:
+            df=pd.read_csv(up_holidays)
+        else:
+            st.error("nigeria_public_holidays_2025_2026.csv not found. Upload it above or place it in data/.");
+            df=None
+        if df is not None:
             for _,r in df.iterrows():
                 execute("INSERT INTO public_holidays (date,name) VALUES (?,?)", (str(r["date"]), r.get("name")))
             st.success("Public holidays imported.")
         else:
             st.error("data/nigeria_public_holidays_2025_2026.csv not found.")
 
-    if c3.button("Import structural_project_info_min.csv", key="imp_proj"):
+    if c2.button("Import structural_project_info_min.csv", key="imp_proj"):
         path=os.path.join("data","structural_project_info_min.csv")
         if os.path.exists(path):
             df=pd.read_csv(path)
+        elif up_projects is not None:
+            df=pd.read_csv(up_projects)
+        else:
+            st.error("structural_project_info_min.csv not found. Upload it above or place it in data/.");
+            df=None
+        if df is not None:
             staff_df=fetch_df("SELECT id,name,email FROM staff")
             def staff_id_from(row):
                 sup_email = row.get("supervisor_email") if isinstance(row.get("supervisor_email"), str) else None
@@ -1208,6 +1333,9 @@ def page_import():
 # ---------- Access Control (Admin) ----------
 def page_access_control():
     st.subheader("🔐 Access Control")
+    if not is_admin():
+        st.error("Only Admin can manage access control.")
+        return
     st.caption("Admin can define what staff see by assigning roles and enabling/disabling accounts. Default password for new staff accounts is 'fcda'.")
     if not is_admin():
         st.error("Admin only.")
