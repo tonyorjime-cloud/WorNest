@@ -702,12 +702,34 @@ def page_dashboard():
         return present, missing
 
     def project_next_due(pid, start_date):
-        if not start_date: return (True, None, None, "Start date missing — cannot track biweekly schedule")
-        start=dtparser.parse(start_date).date()
-        last=fetch_df("SELECT MAX(report_date) d FROM biweekly_reports WHERE project_id=?", (pid,))
-        last_d=dtparser.parse(last["d"].iloc[0]).date() if (not last.empty and pd.notna(last["d"].iloc[0])) else None
-        exp=(start+timedelta(days=14)) if (last_d is None) else (last_d+timedelta(days=14))
-        return (date.today()>exp, last_d, exp, None)
+        # start_date may come from pandas as NaN/None/empty; treat all as missing.
+        if start_date is None:
+            return (True, None, None, "Start date missing — cannot track biweekly schedule")
+        try:
+            if (isinstance(start_date, float) and pd.isna(start_date)):
+                return (True, None, None, "Start date missing — cannot track biweekly schedule")
+            sd = str(start_date).strip()
+            if sd == "" or sd.lower() in ("nan", "none", "null"):
+                return (True, None, None, "Start date missing — cannot track biweekly schedule")
+            start = dtparser.parse(sd).date()
+        except Exception:
+            return (True, None, None, f"Invalid start date '{start_date}' — cannot track biweekly schedule")
+
+        last = fetch_df("SELECT MAX(report_date) d FROM biweekly_reports WHERE project_id=?", (pid,))
+        last_raw = None
+        if (not last.empty) and ("d" in last.columns):
+            last_raw = last["d"].iloc[0]
+
+        last_d = None
+        try:
+            if last_raw is not None and not (isinstance(last_raw, float) and pd.isna(last_raw)) and str(last_raw).strip().lower() not in ("", "nan", "none", "null"):
+                last_d = dtparser.parse(str(last_raw)).date()
+        except Exception:
+            last_d = None  # if stored value is junk, ignore and compute from start date
+
+        exp = (start + timedelta(days=14)) if (last_d is None) else (last_d + timedelta(days=14))
+        return (date.today() > exp, last_d, exp, None)
+
 
     flags=[]
     for _,p in projects.iterrows():
