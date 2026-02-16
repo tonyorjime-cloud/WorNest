@@ -1672,7 +1672,7 @@ def main():
     except Exception:
         pass
 
-        page=sidebar_nav()
+    page = sidebar_nav() or "🏠 Dashboard"
     if page.startswith("🏠"): page_dashboard()
     elif page.startswith("🏗️"): page_projects()
     elif page.startswith("👥"): page_staff()
