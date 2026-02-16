@@ -398,7 +398,7 @@ def fetch_df(q, p=()):
         try: c.close()
         except Exception: pass
 
-def execute(q, p=()):
+def _execute_core(q, p=()):
     q=_adapt_query(q).strip()
     c=get_conn()
     try:
@@ -425,6 +425,19 @@ def execute(q, p=()):
         try: c.close()
         except Exception: pass
 
+
+# --- DB execution helpers (stable wrappers) ---
+def execute(q, p=None):
+    """Execute a write query (INSERT/UPDATE/DELETE/DDL)."""
+    return _execute_core(q, p)
+
+def execute_sql(q, p=None):
+    """Alias for execute()."""
+    return _execute_core(q, p)
+
+def exec_sql(q, p=None):
+    """Legacy alias used in some pages."""
+    return _execute_core(q, p)
 
 # ---------- Notifications (Email Reminders) ----------
 
