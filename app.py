@@ -106,10 +106,125 @@ def hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
 
 def init_db():
-    c=get_conn()
-    cur=c.cursor()
+    c = get_conn()
+    cur = c.cursor()
+
     if DB_IS_POSTGRES:
-        _exec_script(cur, "CREATE TABLE IF NOT EXISTS public_holidays (\n  id SERIAL PRIMARY KEY,\n  date TEXT NOT NULL,\n  name TEXT\n);\nCREATE TABLE IF NOT EXISTS staff (\n  id SERIAL PRIMARY KEY,\n  name TEXT NOT NULL,\n  rank TEXT NOT NULL,\n  email TEXT UNIQUE,\n  phone TEXT,\n  section TEXT,\n  role TEXT,\n  grade TEXT,\n  join_date TEXT,\n  dob TEXT\n);\nCREATE TABLE IF NOT EXISTS users (\n  id SERIAL PRIMARY KEY,\n  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  username TEXT UNIQUE NOT NULL,\n  password_hash TEXT NOT NULL,\n  is_admin INTEGER DEFAULT 0,\n  role TEXT DEFAULT 'staff',\n  is_active INTEGER DEFAULT 1\n);\nCREATE TABLE IF NOT EXISTS projects (\n  id SERIAL PRIMARY KEY,\n  code TEXT UNIQUE NOT NULL,\n  name TEXT NOT NULL,\n  client TEXT,\n  location TEXT,\n  rebar_strength DOUBLE PRECISION,\n  concrete_strength DOUBLE PRECISION,\n  target_slump_min DOUBLE PRECISION,\n  target_slump_max DOUBLE PRECISION,\n  supervisor_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,\n  start_date TEXT,\n  end_date TEXT\n);\nCREATE TABLE IF NOT EXISTS project_staff (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  role TEXT,\n  UNIQUE(project_id,staff_id)\n);\nCREATE TABLE IF NOT EXISTS buildings (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  name TEXT NOT NULL,\n  floors INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS documents (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,\n  category TEXT NOT NULL,\n  file_path TEXT NOT NULL,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS biweekly_reports (\n  id SERIAL PRIMARY KEY,\n  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  report_date TEXT NOT NULL,\n  file_path TEXT,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS tasks (\n  id SERIAL PRIMARY KEY,\n  title TEXT NOT NULL,\n  description TEXT,\n  date_assigned TEXT NOT NULL,\n  days_allotted INTEGER NOT NULL,\n  due_date TEXT NOT NULL,\n  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,\n  created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS task_assignments (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,\n  status TEXT DEFAULT 'In progress',\n  completed_date TEXT,\n  days_taken INTEGER\n);\nCREATE TABLE IF NOT EXISTS task_documents (\n  id SERIAL PRIMARY KEY,\n  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n  file_path TEXT NOT NULL,\n  original_name TEXT,\n  uploaded_at TEXT NOT NULL,\n  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL\n);\nCREATE TABLE IF NOT EXISTS reminders_sent (\n  id SERIAL PRIMARY KEY,\n  assignment_id INTEGER NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,\n  reminder_type TEXT NOT NULL,\n  sent_on TEXT NOT NULL,\n  UNIQUE(assignment_id, reminder_type, sent_on)\n);\nCREATE TABLE IF NOT EXISTS leaves (
+        pg_schema = """CREATE TABLE IF NOT EXISTS public_holidays (
+  id SERIAL PRIMARY KEY,
+  date TEXT NOT NULL,
+  name TEXT
+);
+
+CREATE TABLE IF NOT EXISTS staff (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  rank TEXT NOT NULL,
+  email TEXT UNIQUE,
+  phone TEXT,
+  section TEXT,
+  role TEXT,
+  grade TEXT,
+  join_date TEXT,
+  dob TEXT
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  is_admin INTEGER DEFAULT 0,
+  role TEXT DEFAULT 'staff',
+  is_active INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  id SERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  client TEXT,
+  location TEXT,
+  rebar_strength DOUBLE PRECISION,
+  concrete_strength DOUBLE PRECISION,
+  target_slump_min DOUBLE PRECISION,
+  target_slump_max DOUBLE PRECISION,
+  supervisor_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+  start_date TEXT,
+  end_date TEXT
+);
+
+CREATE TABLE IF NOT EXISTS project_staff (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  role TEXT,
+  UNIQUE(project_id, staff_id)
+);
+
+CREATE TABLE IF NOT EXISTS buildings (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  floors INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,
+  category TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS biweekly_reports (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  report_date TEXT NOT NULL,
+  file_path TEXT,
+  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  date_assigned TEXT NOT NULL,
+  days_allotted INTEGER NOT NULL,
+  due_date TEXT NOT NULL,
+  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_assignments (
+  id SERIAL PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  status TEXT DEFAULT 'In progress',
+  completed_date TEXT,
+  days_taken INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_documents (
+  id SERIAL PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  file_path TEXT NOT NULL,
+  original_name TEXT,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS reminders_sent (
+  id SERIAL PRIMARY KEY,
+  assignment_id INTEGER NOT NULL REFERENCES task_assignments(id) ON DELETE CASCADE,
+  reminder_type TEXT NOT NULL,
+  sent_on TEXT NOT NULL,
+  UNIQUE(assignment_id, reminder_type, sent_on)
+);
+
+CREATE TABLE IF NOT EXISTS leaves (
   id SERIAL PRIMARY KEY,
   staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
   leave_type TEXT NOT NULL,
@@ -122,99 +237,130 @@ def init_db():
   request_date TEXT,
   approved_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
 );
-CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT);
-CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0);
-CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
-CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
-CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
-CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER);
-CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT "In progress", completed_date TEXT, days_taken INTEGER);
-CREATE TABLE IF NOT EXISTS task_documents (    id INTEGER PRIMARY KEY,    task_id INTEGER NOT NULL,    file_path TEXT NOT NULL,    original_name TEXT,    uploaded_at TEXT NOT NULL,    uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS reminders_sent (    id INTEGER PRIMARY KEY,    assignment_id INTEGER NOT NULL,    reminder_type TEXT NOT NULL,    sent_on TEXT NOT NULL,    UNIQUE(assignment_id, reminder_type, sent_on));
-CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, leave_type TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, working_days INTEGER NOT NULL, relieving_staff_id INTEGER NOT NULL, status TEXT DEFAULT "Pending", reason TEXT);
+
 CREATE TABLE IF NOT EXISTS test_results (
-    id INTEGER PRIMARY KEY,
-    project_id INTEGER NOT NULL,
-    building_id INTEGER,
-    stage TEXT,
-    test_type TEXT NOT NULL,
-    batch_id TEXT,
-    file_path TEXT NOT NULL,
-    uploaded_at TEXT NOT NULL,
-    uploader_staff_id INTEGER
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,
+  stage TEXT,
+  test_type TEXT NOT NULL,
+  batch_id TEXT,
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
 );
+
 CREATE TABLE IF NOT EXISTS points (
-    id INTEGER PRIMARY KEY,
-    staff_id INTEGER NOT NULL,
-    source TEXT NOT NULL,          -- 'task' or 'biweekly'
-    source_id INTEGER NOT NULL,    -- task_assignment.id or biweekly_reports.id
-    points INTEGER NOT NULL,
-    awarded_at TEXT NOT NULL,
-    UNIQUE(staff_id, source, source_id)
+  id SERIAL PRIMARY KEY,
+  staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  source_id INTEGER NOT NULL,
+  points INTEGER NOT NULL,
+  awarded_at TEXT NOT NULL,
+  UNIQUE(staff_id, source, source_id)
 );
-""")
-    # SQLite migrations
-    
-    # --- Postgres schema migrations (idempotent) ---
-    if DB_IS_POSTGRES:
+"""
+        _exec_script(cur, pg_schema)
+
+        # --- Postgres schema migrations (idempotent) ---
         def _pg_has_column(table: str, column: str) -> bool:
             cur.execute(
                 """SELECT 1
                    FROM information_schema.columns
                   WHERE table_schema='public' AND table_name=%s AND column_name=%s
-                  LIMIT 1""", (table, column)
+                  LIMIT 1""",
+                (table, column),
             )
             return cur.fetchone() is not None
 
-        def _pg_add_column(table: str, ddl: str):
-            # ddl should be like: ALTER TABLE <table> ADD COLUMN ...
+        def _pg_add_column(ddl: str):
             cur.execute(ddl)
 
         # leaves: align old schema to new fields expected by UI
         if not _pg_has_column('leaves', 'relieving_staff_id'):
-            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN relieving_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+            _pg_add_column("ALTER TABLE leaves ADD COLUMN relieving_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
         if not _pg_has_column('leaves', 'status'):
-            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN status TEXT DEFAULT 'Pending'")
+            _pg_add_column("ALTER TABLE leaves ADD COLUMN status TEXT DEFAULT 'Pending'")
         if not _pg_has_column('leaves', 'reason'):
-            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN reason TEXT")
+            _pg_add_column("ALTER TABLE leaves ADD COLUMN reason TEXT")
         if not _pg_has_column('leaves', 'request_date'):
-            _pg_add_column('leaves', "ALTER TABLE leaves ADD COLUMN request_date TEXT")
-try:
-        cols=[r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
-        if "dob" not in cols:
-            cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
-    except Exception:
-        pass
-    try:
-        cols=[r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
-        if "role" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
-        if "is_active" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
-    except Exception:
-        pass
-    try:
-        tcols=[r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
-        if "created_by_staff_id" not in tcols:
-            cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
-    except Exception:
-        pass
-    c.commit(); c.close()
-    # Bootstrap admin
-    try:
-        ucnt=fetch_df("SELECT COUNT(1) AS n FROM users")
-        n=int(ucnt.iloc[0]["n"]) if not ucnt.empty else 0
-        if n==0:
-            sid=execute("INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date) VALUES (?,?,?,?,?,?,?,?)",
-                        ("Admin","Assistant Director","","","","admin","",""))
-            execute("INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (?,?,?,?,?,?)",
-                    (sid,"admin",hash_pwd("fcda"),1,"admin",1))
-    except Exception:
-        pass
+            _pg_add_column("ALTER TABLE leaves ADD COLUMN request_date TEXT")
 
+        # users: align fields
+        if not _pg_has_column('users', 'role'):
+            _pg_add_column("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
+        if not _pg_has_column('users', 'is_active'):
+            _pg_add_column("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
 
+        # staff: dob
+        if not _pg_has_column('staff', 'dob'):
+            _pg_add_column("ALTER TABLE staff ADD COLUMN dob TEXT")
+
+        # tasks: created_by_staff_id
+        if not _pg_has_column('tasks', 'created_by_staff_id'):
+            _pg_add_column("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+
+    else:
+        sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
+CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
+CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
+CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
+CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS reminders_sent (id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL, reminder_type TEXT NOT NULL, sent_on TEXT NOT NULL, UNIQUE(assignment_id, reminder_type, sent_on));
+CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, leave_type TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, working_days INTEGER DEFAULT 0, relieving_staff_id INTEGER, status TEXT DEFAULT 'Pending', reason TEXT, request_date TEXT, approved_by_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS test_results (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, stage TEXT, test_type TEXT NOT NULL, batch_id TEXT, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
+"""
+        _exec_script(cur, sqlite_schema)
+
+        # SQLite migrations
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
+            if "dob" not in cols:
+                cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
+        except Exception:
+            pass
+
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+            if "role" not in cols:
+                cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
+            if "is_active" not in cols:
+                cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
+        except Exception:
+            pass
+
+        try:
+            tcols = [r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
+            if "created_by_staff_id" not in tcols:
+                cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
+        except Exception:
+            pass
+
+    c.commit()
+    c.close()
+
+    # Bootstrap admin (only if users table is empty)
+    try:
+        ucnt = fetch_df("SELECT COUNT(1) AS n FROM users")
+        n = int(ucnt.iloc[0]["n"]) if not ucnt.empty else 0
+        if n == 0:
+            sid = execute(
+                "INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date) VALUES (?,?,?,?,?,?,?,?)",
+                ("Admin", "Assistant Director", "", "", "", "admin", "", ""),
+            )
+            execute(
+                "INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (?,?,?,?,?,?)",
+                (sid, "admin", hash_pwd("fcda"), 1, "admin", 1),
+            )
+    except Exception:
+        pass
 def fetch_df(q, p=()):
     q=_adapt_query(q)
     c=get_conn()
