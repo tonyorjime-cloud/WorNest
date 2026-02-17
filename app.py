@@ -5,8 +5,6 @@ from datetime import datetime, date, timedelta
 from dateutil import parser as dtparser
 import pandas as pd, numpy as np, streamlit as st
 import uuid
-import random
-import string
 
 try:
     import psycopg2
@@ -150,8 +148,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   is_admin INTEGER DEFAULT 0,
   role TEXT DEFAULT 'staff',
-  is_active INTEGER DEFAULT 1,
-  must_change_password INTEGER DEFAULT 0
+  is_active INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -270,25 +267,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
   message TEXT,
   image_path TEXT,
-  attachment_path TEXT,
-  attachment_mime TEXT,
-  attachment_name TEXT,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
-CREATE TABLE IF NOT EXISTS app_settings (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
-
-CREATE TABLE IF NOT EXISTS password_reset_requests (
-  id SERIAL PRIMARY KEY,
-  username TEXT NOT NULL,
-  requested_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  status TEXT DEFAULT 'open',
-  handled_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
-  handled_at TIMESTAMP
-);
-
 
 CREATE TABLE IF NOT EXISTS points (
   id SERIAL PRIMARY KEY,
@@ -331,140 +311,57 @@ CREATE TABLE IF NOT EXISTS points (
             _pg_add_column("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
         if not _pg_has_column('users', 'is_active'):
             _pg_add_column("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
-            # users: must_change_password
-            if not _pg_has_column('users', 'must_change_password'):
-                _pg_add_column("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
 
-            # chat_messages: attachments
-            if not _pg_has_column('chat_messages', 'attachment_path'):
-                _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT")
-            if not _pg_has_column('chat_messages', 'attachment_mime'):
-                _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_mime TEXT")
-            if not _pg_has_column('chat_messages', 'attachment_name'):
-                _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_name TEXT")
+        # staff: dob
+        if not _pg_has_column('staff', 'dob'):
+            _pg_add_column("ALTER TABLE staff ADD COLUMN dob TEXT")
 
-            # app_settings and password reset requests
-            execute_sql("""CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);""", ())
-            execute_sql("""CREATE TABLE IF NOT EXISTS password_reset_requests (
-                id SERIAL PRIMARY KEY,
-                username TEXT NOT NULL,
-                requested_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                status TEXT DEFAULT 'open',
-                handled_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
-                handled_at TIMESTAMP
-            );""", ())
+        # tasks: created_by_staff_id
+        if not _pg_has_column('tasks', 'created_by_staff_id'):
+            _pg_add_column("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
 
+    else:
+        sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
+CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
+CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
+CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
+CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS reminders_sent (id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL, reminder_type TEXT NOT NULL, sent_on TEXT NOT NULL, UNIQUE(assignment_id, reminder_type, sent_on));
+CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, leave_type TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, working_days INTEGER DEFAULT 0, relieving_staff_id INTEGER, status TEXT DEFAULT 'Pending', reason TEXT, request_date TEXT, approved_by_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS test_results (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, stage TEXT, test_type TEXT NOT NULL, batch_id TEXT, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
+"""
+        _exec_script(cur, sqlite_schema)
 
-            # staff: dob
-            if not _pg_has_column('staff', 'dob'):
-                _pg_add_column("ALTER TABLE staff ADD COLUMN dob TEXT")
+        # SQLite migrations
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
+            if "dob" not in cols:
+                cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
+        except Exception:
+            pass
 
-            # tasks: created_by_staff_id
-            if not _pg_has_column('tasks', 'created_by_staff_id'):
-                _pg_add_column("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+            if "role" not in cols:
+                cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
+            if "is_active" not in cols:
+                cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
+        except Exception:
+            pass
 
-        else:
-            sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
-    CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
-    CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
-    CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
-    CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
-    CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS reminders_sent (id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL, reminder_type TEXT NOT NULL, sent_on TEXT NOT NULL, UNIQUE(assignment_id, reminder_type, sent_on));
-    CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, leave_type TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, working_days INTEGER DEFAULT 0, relieving_staff_id INTEGER, status TEXT DEFAULT 'Pending', reason TEXT, request_date TEXT, approved_by_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS test_results (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, stage TEXT, test_type TEXT NOT NULL, batch_id TEXT, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-    CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
-
-    CREATE TABLE IF NOT EXISTS chat_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      staff_id INTEGER,
-      message TEXT,
-      image_path TEXT,
-      attachment_path TEXT,
-      attachment_mime TEXT,
-      attachment_name TEXT,
-      created_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS app_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS password_reset_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL,
-      requested_at TEXT NOT NULL,
-      status TEXT DEFAULT 'open',
-      handled_by_staff_id INTEGER,
-      handled_at TEXT
-    );
-    """
-            _exec_script(cur, sqlite_schema)
-
-            # SQLite migrations
-            try:
-                cols=set(r[1] for r in cur.execute("PRAGMA table_info('staff')").fetchall())
-                if "dob" not in cols:
-                    cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
-                    conn.commit()
-            except Exception:
-                pass
-
-            try:
-                cols=set(r[1] for r in cur.execute("PRAGMA table_info('users')").fetchall())
-                if "role" not in cols:
-                    cur.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
-                if "is_active" not in cols:
-                    cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
-                if "must_change_password" not in cols:
-                    cur.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
-                conn.commit()
-            except Exception:
-                pass
-
-            try:
-                cm_cols=set(r[1] for r in cur.execute("PRAGMA table_info('chat_messages')").fetchall())
-                if "attachment_path" not in cm_cols:
-                    cur.execute("ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT")
-                if "attachment_mime" not in cm_cols:
-                    cur.execute("ALTER TABLE chat_messages ADD COLUMN attachment_mime TEXT")
-                if "attachment_name" not in cm_cols:
-                    cur.execute("ALTER TABLE chat_messages ADD COLUMN attachment_name TEXT")
-                conn.commit()
-            except Exception:
-                pass
-
-            try:
-                cur.executescript("""
-CREATE TABLE IF NOT EXISTS app_settings (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
-CREATE TABLE IF NOT EXISTS password_reset_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT NOT NULL,
-  requested_at TEXT NOT NULL,
-  status TEXT DEFAULT 'open',
-  handled_by_staff_id INTEGER,
-  handled_at TEXT
-);
-""")
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                tcols = [r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
-                if "created_by_staff_id" not in tcols:
-                    cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
-                    conn.commit()
-            except Exception:
-                pass
+        try:
+            tcols = [r[1] for r in cur.execute("PRAGMA table_info(tasks)").fetchall()]
+            if "created_by_staff_id" not in tcols:
+                cur.execute("ALTER TABLE tasks ADD COLUMN created_by_staff_id INTEGER")
+        except Exception:
+            pass
 
     c.commit()
     c.close()
@@ -478,8 +375,9 @@ CREATE TABLE IF NOT EXISTS password_reset_requests (
                 "INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date) VALUES (?,?,?,?,?,?,?,?)",
                 ("Admin", "Assistant Director", "", "", "", "admin", "", ""),
             )
-            execute("INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active,must_change_password) VALUES (?,?,?,?,?,?,?)",
-                 (sid, "admin", hash_pwd("fcda"), 1, "admin", 1, 0),
+            execute(
+                "INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (?,?,?,?,?,?)",
+                (sid, "admin", hash_pwd("fcda"), 1, "admin", 1),
             )
     except Exception:
         pass
@@ -537,42 +435,6 @@ def execute_sql(q, p=None):
     """Alias for execute()."""
     return _execute_core(q, p)
 
-def fetch_one(q: str, p: tuple | None = None) -> dict | None:
-    df = fetch_df(q, p)
-    if df is None or df.empty:
-        return None
-    return df.iloc[0].to_dict()
-
-def get_setting(key: str, default: str | None = None) -> str | None:
-    row = fetch_one("SELECT value FROM app_settings WHERE key=?", (key,))
-    if row and row.get("value") is not None:
-        return str(row["value"])
-    return default
-
-def set_setting(key: str, value: str | None) -> None:
-    if value is None:
-        execute_sql("DELETE FROM app_settings WHERE key=?", (key,))
-        return
-    try:
-        execute_sql(
-            "INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-    except Exception:
-        execute_sql("INSERT OR REPLACE INTO app_settings (key,value) VALUES (?,?)", (key, value))
-
-def get_setting_date(key: str, default_date: str | None = None):
-    v = get_setting(key, default_date)
-    if not v:
-        return None
-    try:
-        return dtparser.parse(v).date()
-    except Exception:
-        return None
-    try:
-        return dtparser.parse(v).date()
-    except Exception:
-        return None
 def exec_sql(q, p=None):
     """Legacy alias used in some pages."""
     return _execute_core(q, p)
@@ -580,6 +442,9 @@ def exec_sql(q, p=None):
 # ---------- Notifications (Email Reminders) ----------
 
 
+def execute_sql(q, p=()):
+    """Backward-compatible alias used by some pages."""
+    return execute(q, p)
 def smtp_configured()->bool:
     return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
 
@@ -774,23 +639,12 @@ def login_ui():
                 ex=fetch_df("SELECT id FROM users WHERE username=?", (uname,))
                 if ex.empty:
                     adm=0  # new users are staff by default; Admin promotes via Access Control
-                    execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active, must_change_password) VALUES (?,?,?,?,?,?,?)", (sid, uname, hash_pwd("fcda"), adm, ("admin" if adm==1 else "staff"), 1, 0))
+                    execute("INSERT INTO users (staff_id, username, password_hash, is_admin, role, is_active) VALUES (?,?,?,?,?,?)", (sid, uname, hash_pwd("fcda"), adm, ("admin" if adm==1 else "staff"), 1))
                 u=fetch_df("SELECT * FROM users WHERE username=?", (uname,))
                 if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
                     st.session_state["user"]=dict(u.iloc[0]); st.rerun()
                 else:
                     st.error("Wrong password. Default is 'fcda' unless changed.")
-
-
-    with st.expander("Forgot password?"):
-        st.caption("Request a reset. Admin will issue a temporary password.")
-        req_user = st.text_input("Enter your email (preferred) or name", key="forgot_user")
-        if st.button("Request reset", key="forgot_btn"):
-            if not req_user.strip():
-                st.error("Please enter your email or name.")
-            else:
-                execute_sql("INSERT INTO password_reset_requests (username, requested_at, status) VALUES (?,?,?)", (req_user.strip(), dt.utcnow().isoformat(), "open"))
-                st.success("Reset request sent. Contact Admin if urgent.")
 
 def logout_button():
     if st.sidebar.button("🚪 Logout", key="logout_btn"):
@@ -803,7 +657,7 @@ def sidebar_nav():
     if u: st.sidebar.markdown(f"**User:** {u['username']}  \n**Role:** {user_role()}")
     logout_button()
 
-    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🛡️ Access Control"]
+    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat"]
     admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control"]
     pages = base_pages + (admin_pages if is_admin() else [])
 
@@ -1423,44 +1277,37 @@ def page_chat():
 
     with st.form('chat_send', clear_on_submit=True):
         msg=st.text_area('Message', height=90, placeholder='Type your message…')
-        up=st.file_uploader('Optional attachment (image/PDF)', type=['png','jpg','jpeg','webp','gif','pdf'])
+        img=st.file_uploader('Optional image', type=['png','jpg','jpeg','webp','gif'])
         sent=st.form_submit_button('Send')
         if sent:
             m=(msg or '').strip()
-            if not m and up is None:
-                st.warning('Type a message or attach a file.')
+            if not m and img is None:
+                st.warning('Type a message or attach an image.')
             else:
                 image_path=None
-                attach_path=None
-                attach_mime=None
-                attach_name=None
-                if up is not None:
-                    ext=os.path.splitext(up.name)[1].lower()
+                if img is not None:
+                    ext=os.path.splitext(img.name)[1].lower()
                     chat_dir=os.path.join(UPLOAD_DIR,'chat')
                     os.makedirs(chat_dir, exist_ok=True)
                     fname=f"{uuid.uuid4().hex}{ext}"
                     disk_path=os.path.join(chat_dir,fname)
-                    with open(disk_path,'wb') as f: f.write(up.getbuffer())
-                    if ext=='.pdf':
-                        attach_path=disk_path
-                        attach_mime='application/pdf'
-                        attach_name=up.name
-                    else:
-                        image_path=disk_path
-                        attach_path=disk_path
-                        attach_mime='image'
-                        attach_name=up.name
-                execute('INSERT INTO chat_messages (staff_id,message,image_path,attachment_path,attachment_mime,attachment_name) VALUES (?,?,?,?,?,?)', (sid, m if m else None, image_path, attach_path, attach_mime, attach_name))
+                    with open(disk_path,'wb') as f: f.write(img.getbuffer())
+                    image_path=disk_path
+                execute('INSERT INTO chat_messages (staff_id,message,image_path) VALUES (?,?,?)', (sid, m if m else None, image_path))
                 st.success('Sent')
                 st.rerun()
 
     df=fetch_df("""
-        SELECT C.id, C.message, C.image_path, C.attachment_path, C.attachment_mime, C.attachment_name, C.created_at, COALESCE(S.name,'(Unknown)') AS staff_name
+        SELECT C.id, C.message, C.image_path, C.created_at, COALESCE(S.name,'(Unknown)') AS staff_name
         FROM chat_messages C
         LEFT JOIN staff S ON S.id = C.staff_id
         ORDER BY C.created_at DESC
         LIMIT 80
     """)
+
+    if df.empty:
+        st.info('No messages yet. Say hi 👋')
+        return
 
     # show oldest -> newest
     for r in reversed(df.to_dict('records')):
@@ -1468,14 +1315,8 @@ def page_chat():
         st.markdown(f"**{r.get('staff_name','(Unknown)')}**  \n{ts}")
         if r.get('message'):
             st.write(r['message'])
-        # Attachment (PDF/image)
-        ap = r.get('attachment_path') or r.get('image_path')
-        if ap and os.path.exists(ap):
-            if str(r.get('attachment_mime') or '').startswith('application/pdf') or ap.lower().endswith('.pdf'):
-                with open(ap,'rb') as f: data=f.read()
-                st.download_button(label=f"📄 {r.get('attachment_name') or os.path.basename(ap)}", data=data, file_name=(r.get('attachment_name') or os.path.basename(ap)))
-            else:
-                st.image(ap)
+        if r.get('image_path') and os.path.exists(r['image_path']):
+            st.image(r['image_path'])
         st.divider()
 
 def page_leave_table():
@@ -1504,7 +1345,16 @@ def page_leave_table():
     if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
     st.dataframe(f.reset_index(drop=True), width='stretch')
 
-# ---------- Tasks & Scoreboard ----------
+# ---------- Tasks & Performance ----------
+def _build_expected_biweekly_windows(start_date:date, today:date)->list:
+    out=[]
+    if not isinstance(start_date, date): return out
+    cur=start_date
+    while cur + timedelta(days=14) <= today:
+        nxt=cur + timedelta(days=14)
+        out.append((cur, nxt))
+        cur=nxt
+    return out
 def page_projects():
     st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
     projects=fetch_df("""
@@ -1947,7 +1797,7 @@ def page_leave_table():
     if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
     st.dataframe(f.reset_index(drop=True), width='stretch')
 
-# ---------- Tasks & Scoreboard ----------
+# ---------- Tasks & Performance ----------
 def _build_expected_biweekly_windows(start_date:date, today:date)->list:
     out=[]
     if not isinstance(start_date, date): return out
@@ -1959,7 +1809,7 @@ def _build_expected_biweekly_windows(start_date:date, today:date)->list:
     return out
 
 def page_tasks():
-    st.markdown("<div class='worknest-header'><h2>🗂️ Tasks & Scoreboard</h2></div>", unsafe_allow_html=True)
+    st.markdown("<div class='worknest-header'><h2>🗂️ Tasks & Performance</h2></div>", unsafe_allow_html=True)
 
     st.markdown("### ⏰ Reminders")
     ass=fetch_df("""
@@ -2159,103 +2009,80 @@ def page_tasks():
         df["score"]=df.apply(score_row, axis=1)
         st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
-    st.subheader("🏅 Team Scoreboard")
-    st.caption("Points are computed from **Tasks** and **Bi-weekly Reports** only.")
-
-    # --- Task points (per assignee) ---
-    tdf = fetch_df("""SELECT ta.staff_id, t.date_assigned, t.due_date, t.days_allotted,
-                             ta.completed_date, ta.days_taken
-                      FROM task_assignments ta
-                      JOIN tasks t ON t.id = ta.task_id
-                      WHERE ta.status='Completed'""", ())
-    task_pts = {}
-    if tdf is not None and not tdf.empty:
-        for _, r in tdf.iterrows():
-            sid = int(r["staff_id"])
-            try:
-                due = dtparser.parse(str(r["due_date"])).date()
-                comp = dtparser.parse(str(r["completed_date"])).date()
-            except Exception:
-                continue
-            if comp <= due:
-                p = 3
-            else:
-                da = int(r["days_allotted"]) if pd.notna(r.get("days_allotted")) else None
-                if da is None:
-                    try:
-                        da = max((due - dtparser.parse(str(r["date_assigned"])).date()).days + 1, 1)
-                    except Exception:
-                        da = 1
-                # days taken
-                try:
-                    taken = int(r["days_taken"]) if pd.notna(r.get("days_taken")) else (comp - dtparser.parse(str(r["date_assigned"])).date()).days
-                except Exception:
-                    taken = (comp - due).days + da
-                p = 2 if taken <= 2 * da else 1
-            task_pts[sid] = task_pts.get(sid, 0) + p
-
-    # --- Report points (per uploader) ---
-    rdf = fetch_df("""SELECT uploader_staff_id AS staff_id, report_date
-                      FROM biweekly_reports
-                      WHERE uploader_staff_id IS NOT NULL""", ())
-    report_pts = {}
-    if rdf is not None and not rdf.empty:
-        # build a global due-date ladder from the configured start date
-        start_dt = get_setting_date("biweekly_start")
-        if start_dt is None:
-            start_dt = date.today()  # safe fallback; admin should set it
-        # build due dates up to today + 60 days
-        due_dates = []
-        cur = start_dt
-        horizon = date.today() + timedelta(days=60)
-        while cur <= horizon:
-            due_dates.append(cur)
-            cur = cur + timedelta(days=14)
-
-        for _, r in rdf.iterrows():
-            sid = int(r["staff_id"])
-            try:
-                submitted = dtparser.parse(str(r["report_date"])).date()
-            except Exception:
-                continue
-            # pick the first due date >= submitted, else last due date
-            due = None
-            for d0 in due_dates:
-                if d0 >= submitted:
-                    due = d0
-                    break
-            if due is None:
-                due = due_dates[-1]
-            late = (submitted - due).days
-            if late <= 0:
-                p = 3
-            elif late <= 7:
-                p = 2
-            else:
-                p = 1
-            report_pts[sid] = report_pts.get(sid, 0) + p
-
-    # Build scoreboard
-    sdir = fetch_df("SELECT id, name, email FROM staff ORDER BY name", ())
-    rows = []
-    if sdir is not None and not sdir.empty:
-        for _, s in sdir.iterrows():
-            sid = int(s["id"])
-            tp = int(task_pts.get(sid, 0))
-            rp = int(report_pts.get(sid, 0))
-            rows.append({
-                "Staff": s["name"],
-                "Email": s.get("email"),
-                "Task points": tp,
-                "Report points": rp,
-                "Total points": tp + rp,
-            })
-    score = pd.DataFrame(rows)
-    if score.empty:
-        st.info("No points to display yet.")
+    st.subheader("♟️ Chess Points (5 per completed task, 5 per bi-weekly report upload)")
+    pts=fetch_df("""
+        SELECT P.staff_id, S.name AS staff, SUM(P.points) AS total_points
+        FROM points P JOIN staff S ON S.id=P.staff_id
+        GROUP BY P.staff_id, S.name ORDER BY total_points DESC, staff
+    """)
+    if pts.empty:
+        st.info("No points yet. Complete tasks or upload bi-weekly reports to earn points.")
     else:
-        score = score.sort_values(["Total points","Task points","Report points"], ascending=False)
-        st.dataframe(score, width="stretch")
+        st.dataframe(pts, width='stretch')
+
+    st.subheader("Staff Performance (Task Scores + Report Compliance)")
+    if df.empty:
+        task_avg = pd.DataFrame(columns=["staff","task_avg_score"])
+    else:
+        comp = df[df["status"]=="Completed"].copy()
+        task_avg = comp.groupby("staff")["score"].mean().reset_index().rename(columns={"score":"task_avg_score"})
+    today=date.today()
+    proj_list=fetch_df("SELECT id, code, start_date FROM projects WHERE start_date IS NOT NULL")
+    reports=fetch_df("SELECT project_id, report_date FROM biweekly_reports")
+    project_staff=fetch_df("SELECT project_id, staff_id FROM project_staff")
+    staff_df=fetch_df("SELECT id, name FROM staff")
+    reports_by_project={}
+    if not reports.empty:
+        for _,r in reports.iterrows():
+            pid=int(r["project_id"])
+            try:
+                d=dtparser.parse(r["report_date"]).date()
+            except:
+                continue
+            reports_by_project.setdefault(pid, []).append(d)
+    expected_by_project={}
+    if not proj_list.empty:
+        for _,p in proj_list.iterrows():
+            try:
+                sd=dtparser.parse(p["start_date"]).date()
+            except:
+                continue
+            expected_by_project[int(p["id"])]=_build_expected_biweekly_windows(sd, today)
+    compliance_by_project={}
+    for pid, windows in expected_by_project.items():
+        rdates=reports_by_project.get(pid, [])
+        count_ok=0
+        for (ws,we) in windows:
+            ok=False
+            for rd in rdates:
+                if ws <= rd <= we:
+                    ok=True; break
+            if ok: count_ok+=1
+        compliance_by_project[pid]=(count_ok, len(windows))
+    rows=[]
+    if not project_staff.empty:
+        for _,ps in project_staff.iterrows():
+            pid=int(ps["project_id"]); sid=int(ps["staff_id"])
+            ok, tot = compliance_by_project.get(pid, (0,0))
+            rows.append({"staff_id":sid, "ok":ok, "tot":tot})
+    rep_df=pd.DataFrame(rows)
+    if rep_df.empty:
+        rep_comp = pd.DataFrame(columns=["staff","report_compliance_pct"])
+    else:
+        agg = rep_df.groupby("staff_id").sum(numeric_only=True).reset_index()
+        agg["report_compliance_pct"]=agg.apply(lambda r: (100.0*r["ok"]/r["tot"]) if r["tot"]>0 else np.nan, axis=1)
+        rep_comp = agg.merge(staff_df, left_on="staff_id", right_on="id", how="left")[["name","report_compliance_pct"]]
+        rep_comp = rep_comp.rename(columns={"name":"staff"})
+    perf = pd.merge(task_avg, rep_comp, on="staff", how="outer")
+    if perf.empty:
+        st.info("No performance data yet.")
+    else:
+        def combined(row):
+            vals=[v for v in [row.get("task_avg_score"), row.get("report_compliance_pct")] if pd.notna(v)]
+            return float(np.mean(vals)) if vals else np.nan
+        perf["combined_score"]=perf.apply(combined, axis=1).round(1)
+        perf = perf.sort_values(by=["combined_score","staff"], ascending=[False,True])
+        st.dataframe(perf, width='stretch')
 
 # ---------- Import CSVs ----------
 def page_import():
@@ -2393,7 +2220,7 @@ def page_import():
 
 # ---------- Access Control (Admin) ----------
 def page_access_control():
-    st.subheader("🛡️ Access Control")
+    st.subheader("🔐 Access Control")
     if not is_admin():
         st.error("Only Admin can manage access control.")
         return
@@ -2416,37 +2243,6 @@ def page_access_control():
 
     st.dataframe(df[["user_id","username","role","is_admin","is_active","name","email","rank"]], width='stretch')
 
-    st.divider()
-    st.subheader("Reporting cycle (bi-weekly)")
-    cur = get_setting_date("biweekly_start")
-    new_start = st.date_input("Bi-weekly report cycle start date", value=(cur if cur else date.today()), help="Used to compute due dates for bi-weekly reports.")
-    if st.button("Save reporting start date"):
-        set_setting("biweekly_start", new_start.isoformat())
-        st.success("Saved.")
-
-    st.divider()
-    st.subheader("Password reset requests")
-    req = fetch_df("SELECT id, username, requested_at, status FROM password_reset_requests WHERE status='open' ORDER BY requested_at DESC", ())
-    if req is None or req.empty:
-        st.info("No open reset requests.")
-    else:
-        st.dataframe(req, width="stretch")
-        rid = st.number_input("Request ID to handle", min_value=int(req["id"].min()), max_value=int(req["id"].max()), step=1)
-        if st.button("Generate temporary password and reset"):
-            temp = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
-            # find user by username (email or name) via staff lookup
-            s = fetch_df("SELECT id, name, email FROM staff WHERE lower(email)=lower(?) OR lower(name)=lower(?)", (str(req.loc[req["id"]==rid,"username"].iloc[0]), str(req.loc[req["id"]==rid,"username"].iloc[0])))
-            if s is None or s.empty:
-                st.error("No matching staff found for this request. Confirm the staff record exists.")
-            else:
-                sid = int(s.iloc[0]["id"])
-                uname = (s.iloc[0]["email"] if s.iloc[0]["email"] else s.iloc[0]["name"])
-                execute_sql("UPDATE users SET password_hash=?, must_change_password=1 WHERE staff_id=?", (hash_pwd(temp), sid))
-                execute_sql("UPDATE password_reset_requests SET status='handled', handled_by_staff_id=?, handled_at=? WHERE id=?", (current_user()["staff_id"], dt.utcnow().isoformat(), int(rid)))
-                st.success(f"Temporary password for {uname}: {temp}")
-                st.caption("Ask the user to log in and change password immediately.")
-
-
     st.markdown("### Update a user")
     user_id=st.number_input("User ID", min_value=1, step=1)
     col1,col2,col3=st.columns(3)
@@ -2459,57 +2255,18 @@ def page_access_control():
     if st.button("Apply changes"):
         isadm = 1 if new_role=="admin" else 0
         if new_pwd.strip():
-            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=?, must_change_password=? WHERE id=?",
-                    (role, is_admin, is_active, hash_pwd(new_pwd), (1 if new_pwd else 0), uid))
+            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=? WHERE id=?",
+                    (new_role, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
         else:
             execute("UPDATE users SET role=?, is_admin=?, is_active=? WHERE id=?",
                     (new_role, isadm, int(active), int(user_id)))
         st.success("Updated.")
         st.rerun()
 
-
-def page_account(force: bool = False):
-    st.subheader("🔐 Account")
-    u = current_user() or {}
-    st.write(f"Signed in as: **{u.get('name','')}** ({u.get('email','') or u.get('username','')})")
-    st.caption("Change your password anytime. If you're using a temporary password, please change it now.")
-
-    old = st.text_input("Current password", type="password")
-    new1 = st.text_input("New password", type="password")
-    new2 = st.text_input("Confirm new password", type="password")
-
-    if st.button("Change password"):
-        if not old or not new1:
-            st.error("Please enter your current password and a new password.")
-            return
-        if new1 != new2:
-            st.error("New passwords do not match.")
-            return
-        # verify old
-        row = fetch_one("SELECT id, password_hash FROM users WHERE id=?", (u.get("user_id"),))
-        if not row or row.get("password_hash") != hash_pwd(old):
-            st.error("Current password is incorrect.")
-            return
-        execute_sql("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?", (hash_pwd(new1), int(u.get("user_id"))))
-        st.success("Password updated.")
-        if force:
-            st.info("You're good to go. Please use the menu to continue.")
-
 def main():
     init_db(); apply_styles()
     if not current_user():
         login_ui(); return
-
-    # Force password change if flagged
-    try:
-        u = current_user() or {}
-        if int(u.get("must_change_password") or 0) == 1:
-            st.warning("Please change your password to continue.")
-            page_account(force=True)
-            return
-    except Exception:
-        pass
-
 
     # Run task reminder checks at most once per day per session (emails only if SMTP_* is configured)
     try:
@@ -2529,8 +2286,7 @@ def main():
     elif page.startswith("📄"): page_leave_table()
     elif page.startswith("🗂️"): page_tasks()
     elif page.startswith("⬆️"): page_import()
-    elif page.startswith("🛡️"): page_access_control()
-    elif page.startswith("🔐"): page_account()
+    elif page.startswith("🔐"): page_access_control()
     else: page_dashboard()
 
 
