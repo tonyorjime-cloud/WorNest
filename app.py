@@ -832,12 +832,30 @@ def logout_button():
 def sidebar_nav():
     u=current_user()
     st.sidebar.title("📚 Navigation")
-    if u: st.sidebar.markdown(f"**User:** {u['username']}  \n**Role:** {user_role()}")
+    if u:
+        st.sidebar.markdown(f"**User:** {u['username']}  
+**Role:** {user_role()}")
     logout_button()
 
-    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat"]
-    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control"]
-    pages = base_pages + (admin_pages if is_admin() else [])
+    # Everyone can view these
+    base_pages=[
+        "🏠 Dashboard",
+        "🏗️ Projects",
+        "🗂️ Tasks & Performance",
+        "👥 Staff",
+        "🧳 Leave",
+        "📄 Leave Table",
+        "💬 Chat",
+        "⚙️ Account",
+    ]
+
+    # Admin-only (highest privilege)
+    admin_pages=["⬆️ Import CSVs"]
+
+    # Admin/Sub‑Admin tools
+    elevated_pages=["🛠️ Staff Admin","🔐 Access Control"]
+
+    pages = base_pages + (admin_pages if is_admin() else []) + (elevated_pages if is_sub_admin() else [])
 
     return st.sidebar.radio("Go to", pages, key="nav_radio")
 
@@ -1255,7 +1273,10 @@ def page_dashboard():
 
 # ---------- Staff ----------
 def page_staff():
-    st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
+    st.markdown("<div class='worknest-header'><h2>🛠️ Staff Admin</h2></div>", unsafe_allow_html=True)
+    if not is_sub_admin():
+        st.error("Only Admin / Sub‑Admin can manage staff records.")
+        return
     staff=fetch_df("SELECT id,name,rank,email,section FROM staff ORDER BY name")
     if staff.empty:
         st.info("No staff yet. Import from CSVs or add directly via DB.")
@@ -2187,7 +2208,7 @@ def page_tasks():
         df["score"]=df.apply(score_row, axis=1)
         st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
-    st.subheader("🏅 Activity Points (Transparent)")
+    st.subheader("📊 Performance (Activity Points)")
     st.caption("Points are calculated from task completion timeliness + bi‑weekly report timeliness. No hidden math.")
     sdf = fetch_df("SELECT id, name, rank, section FROM staff ORDER BY name")
     rows=[]
@@ -2345,15 +2366,34 @@ def page_import():
 
 
 # ---------- Access Control (Admin) ----------
+
 def page_access_control():
     st.subheader("🔐 Access Control")
-    if not is_admin():
-        st.error("Only Admin can manage access control.")
+    if not is_sub_admin():
+        st.error("Only Admin / Sub‑Admin can manage access control.")
         return
-    st.caption("Admin can define what staff see by assigning roles and enabling/disabling accounts. Default password for new staff accounts is 'fcda'.")
-    if not is_admin():
-        st.error("Admin only.")
-        return
+
+    is_admin_user = is_admin()
+    st.caption("Manage roles & accounts. Default password for new staff accounts is **fcda**. Sub‑Admins cannot grant **Admin**.")
+
+    # ---- Global settings ----
+    st.markdown("### 🗓️ Bi‑weekly report cycle")
+    current = _biweekly_start_date()
+    # allow Admin/Sub‑Admin to reset the anchor date that defines the org cycle
+    new_anchor = st.date_input("Cycle anchor date (Tuesday)", value=current, help="This date defines the bi‑weekly schedule for all projects.")
+    if st.button("Save bi‑weekly cycle date"):
+        set_setting("BIWEEKLY_START_DATE", str(new_anchor))
+        st.success(f"Saved. Next due Tuesday is now anchored to {new_anchor.isoformat()}.")
+        st.rerun()
+
+    # quick display of next due date from today
+    try:
+        nxt = next_biweekly_due_date(current)
+        st.info(f"Next bi‑weekly report due date (global): **{nxt.strftime('%A, %d %b %Y')}**")
+    except Exception:
+        pass
+
+    st.divider()
 
     df=fetch_df("""SELECT u.id as user_id,u.username,
                           COALESCE(u.role, CASE WHEN u.is_admin=1 THEN 'admin' ELSE 'staff' END) as role,
@@ -2371,23 +2411,36 @@ def page_access_control():
 
     st.markdown("### Update a user")
     user_id=st.number_input("User ID", min_value=1, step=1)
+
+    # role options
+    if is_admin_user:
+        role_options = ["staff","section_head","sub_admin","admin"]
+    else:
+        role_options = ["staff","section_head","sub_admin"]
+
     col1,col2,col3=st.columns(3)
     with col1:
-        new_role=st.selectbox("Role", ["staff","admin"], index=0)
+        new_role=st.selectbox("Role", role_options, index=0)
     with col2:
         active=st.selectbox("Status", [1,0], index=0, format_func=lambda x: "Active" if x==1 else "Disabled")
     with col3:
         new_pwd=st.text_input("Reset password (optional)", type="password", help="Leave blank to keep existing password.")
+
     if st.button("Apply changes"):
+        # enforce: Sub‑Admin cannot grant Admin
+        if (not is_admin_user) and new_role=="admin":
+            st.error("Sub‑Admins cannot grant Admin role.")
+            return
         isadm = 1 if new_role=="admin" else 0
         if new_pwd.strip():
-            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=? WHERE id=?",
+            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=?, must_change_password=1 WHERE id=?",
                     (new_role, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
         else:
             execute("UPDATE users SET role=?, is_admin=?, is_active=? WHERE id=?",
                     (new_role, isadm, int(active), int(user_id)))
         st.success("Updated.")
         st.rerun()
+
 
 def page_staff_directory():
     st.title("👥 Staff Directory")
@@ -2466,7 +2519,7 @@ def main():
     elif page.startswith("👥"): page_staff_directory()
     elif page.startswith("⚙️"): page_account()
     elif page.startswith("📄"): page_leave_table()
-    elif page.startswith("🧾"): page_tasks()
+    elif page.startswith("🗂️"): page_tasks()
     elif page.startswith("⬆️"): page_import()
     elif page.startswith("🔐"): page_access_control()
     else: page_dashboard()
