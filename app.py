@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS biweekly_reports (
   id SERIAL PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   report_date TEXT NOT NULL,
+  uploaded_at TEXT,
   file_path TEXT,
   uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
 );
@@ -373,6 +374,16 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
         if not _pg_has_column('projects', 'next_due_date'):
             _pg_add_column("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
 
+        # biweekly_reports: uploaded_at (submission timestamp)
+        if not _pg_has_column('biweekly_reports', 'uploaded_at'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
+        # Backfill uploaded_at where missing so recent backlog uploads can score correctly
+        try:
+            cur.execute("UPDATE biweekly_reports SET uploaded_at = NOW()::text WHERE uploaded_at IS NULL")
+        except Exception:
+            pass
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
+
         # chat_messages: allow pdf and other attachments
         if not _pg_has_column('chat_messages', 'attachment_path'):
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT")
@@ -389,7 +400,7 @@ CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NO
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, uploaded_at TEXT, file_path TEXT, uploader_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
 CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
@@ -437,6 +448,14 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(projects)").fetchall()]
             if "next_due_date" not in cols:
                 cur.execute("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
+            try:
+                bcols = [r[1] for r in cur.execute("PRAGMA table_info(biweekly_reports)").fetchall()]
+                if "uploaded_at" not in bcols:
+                    cur.execute("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
+                # Backfill uploaded_at where missing so backlog uploads can score in the current month.
+                cur.execute("UPDATE biweekly_reports SET uploaded_at = datetime('now') WHERE uploaded_at IS NULL")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -770,16 +789,29 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
         (str(ms), str(me)),
     )
 
-    # Prefetch test results in month (per uploader)
-    testdf = fetch_df(
-        """SELECT uploader_staff_id AS staff_id, COUNT(1) AS n
+    # Prefetch test results in month.
+    # IMPORTANT: credit goes to ALL staff posted to the project (not only the uploader).
+    tproj = fetch_df(
+        """SELECT project_id, uploaded_at
              FROM test_results
-            WHERE uploader_staff_id IS NOT NULL
-              AND date(uploaded_at) BETWEEN date(?) AND date(?)
-            GROUP BY uploader_staff_id""",
+            WHERE date(uploaded_at) BETWEEN date(?) AND date(?)""",
         (str(ms), str(me)),
     )
-    testmap={int(r["staff_id"]): int(r["n"]) for _,r in testdf.iterrows()} if not testdf.empty else {}
+    # project -> [staff_id,...]
+    ps_map:dict[int,list[int]] = {}
+    psdf = fetch_df("SELECT project_id, staff_id FROM project_staff")
+    if not psdf.empty:
+        for _,pr in psdf.iterrows():
+            pid=int(pr.get("project_id") or 0)
+            sid=int(pr.get("staff_id") or 0)
+            if pid and sid:
+                ps_map.setdefault(pid, []).append(sid)
+    testmap:dict[int,int] = {}
+    if not tproj.empty:
+        for _,tr in tproj.iterrows():
+            pid=int(tr.get("project_id") or 0)
+            for sid in ps_map.get(pid, []):
+                testmap[sid] = testmap.get(sid, 0) + 1
 
     # Biweekly reports scoring: due dates within month
     start=_biweekly_start_date()
@@ -795,15 +827,20 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
     # Prefetch all reports for month +/- buffer (to match windows)
     buf_start = ms - dt.timedelta(days=13)
     buf_end   = me + dt.timedelta(days=30)
+    # IMPORTANT: scoring is based on when the report was SUBMITTED.
+    # `uploaded_at` is the submission timestamp; fall back to `report_date` for older rows.
     rdf = fetch_df(
-        "SELECT project_id, report_date FROM biweekly_reports WHERE date(report_date) BETWEEN date(?) AND date(?)",
+        """SELECT project_id,
+                  COALESCE(uploaded_at, report_date) AS submitted_on
+             FROM biweekly_reports
+            WHERE date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)""",
         (str(buf_start), str(buf_end)),
     )
     # Map project -> sorted list of report dates
     proj_reports:dict[int,list[dt.date]]={}
     for _,rr in rdf.iterrows():
         pid=int(rr.get("project_id") or 0)
-        rd=_parse_date_safe(rr.get("report_date"))
+        rd=_parse_date_safe(rr.get("submitted_on"))
         if pid and rd:
             proj_reports.setdefault(pid, []).append(rd)
     for pid in list(proj_reports.keys()):
@@ -821,8 +858,12 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
                 task_pts += _task_points(r.get("date_assigned"), int(r.get("days_allotted") or 0), r.get("completed_date"))
 
         # Reports (per posted project)
-        pdf = fetch_df("SELECT project_id FROM project_staff WHERE staff_id=?", (sid,))
-        proj_ids=[int(x) for x in (pdf["project_id"].tolist() if not pdf.empty else [])]
+        # Use prefetched project-staff map when available.
+        if ps_map:
+            proj_ids=[pid for pid,staffs in ps_map.items() if sid in staffs]
+        else:
+            pdf = fetch_df("SELECT project_id FROM project_staff WHERE staff_id=?", (sid,))
+            proj_ids=[int(x) for x in (pdf["project_id"].tolist() if not pdf.empty else [])]
         for pid in proj_ids:
             used=set()  # prevent double-counting the same report across cycles
             rdates=proj_reports.get(pid, [])
@@ -1646,8 +1687,8 @@ def page_dashboard():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
-                                      (pid, str(rdate), path, current_staff_id()))
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
+                                      (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id()))
                         try:
                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
                         except Exception:
@@ -1719,26 +1760,30 @@ def add_working_days(start, n, holidays, cap_dec31=True):
 
 def page_leave():
     st.markdown("<div class='worknest-header'><h2>🧳 Leave</h2></div>", unsafe_allow_html=True)
-    staff_df=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
+    staff_df=fetch_df("SELECT id,name,rank,section FROM staff ORDER BY name")
     hol_df=fetch_df("SELECT date FROM public_holidays")
     holidays=[dtparser.parse(x).date() for x in hol_df["date"].tolist()] if not hol_df.empty else []
 
     if staff_df.empty:
         st.info("Add staff first."); return
 
-    colA,colB=st.columns([2,1])
-    with colA:
-        if is_admin():
-            staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
-            srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
-        else:
-            sid=current_staff_id()
-            if sid is None:
-                st.error("No staff profile linked to this account."); return
-            srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
-            st.write(f"Applicant: **{srow['name']}**")
-        ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=date.today(), key="lv_start")
+    tab_my, tab_roster = st.tabs(["My Leave", "Leave Roster"])
+
+    with tab_my:
+        colA,colB=st.columns([2,1])
+        with colA:
+            if is_admin():
+                staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
+                srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
+            else:
+                # Staff should only manage their own leave privately
+                sid=current_staff_id()
+                if sid is None:
+                    st.error("No staff profile linked to this account."); return
+                srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
+                st.write(f"Applicant: **{srow['name']}**")
+            ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
+            start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -1767,12 +1812,12 @@ def page_leave():
                                 max_value=max_days if (max_days and max_days>0) else 60,
                                 value=min(5, max_days or 5), key="lv_req")
 
-        end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
-        st.write(f"Computed End Date: **{end}**")
+            end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
+            st.write(f"Computed End Date: **{end}**")
 
-    with colB:
-        st.markdown("**Casual Balance**")
-        st.metric(label=f"{start.year} casual remaining", value=f"{casual_remaining} days")
+        with colB:
+            st.markdown("**Casual Balance**")
+            st.metric(label=f"{start.year} casual remaining", value=f"{casual_remaining} days")
 
     # --- Reliever enforcement (relaxed for future-year planning and unknown ranks) ---
     all_staff=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
@@ -1862,14 +1907,78 @@ def page_leave():
             if is_on_leave(ch_id, start, end): can_submit=False; msg="Relieving officer is on leave in the requested period."
             if is_already_relieving(ch_id, start, end): can_submit=False; msg="Relieving officer is already assigned to relieve another staff in the requested period."
 
-    if st.button("📝 Submit Leave Application", key="lv_submit"):
-        if can_submit:
-            reliever_id=int([p for p in pool if p[1]==reliever][0][0])
-            execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
-                    (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
-            st.success("Leave application submitted.")
-        else:
-            st.error(msg or "Validation failed.")
+        if st.button("📝 Submit Leave Application", key="lv_submit"):
+            if can_submit:
+                reliever_id=int([p for p in pool if p[1]==reliever][0][0])
+                execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
+                        (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
+                st.success("Leave application submitted.")
+            else:
+                st.error(msg or "Validation failed.")
+
+        # Staff should see only their own applications here (private)
+        if not is_admin():
+            my = fetch_df("""
+                SELECT L.id, L.leave_type, L.start_date, L.end_date, L.working_days,
+                       R.name AS reliever, L.status
+                FROM leaves L
+                LEFT JOIN staff R ON R.id = L.relieving_staff_id
+                WHERE L.staff_id = ?
+                ORDER BY date(L.start_date) DESC
+            """, (int(srow["id"]),))
+            st.markdown("---")
+            st.subheader("My Leave Requests")
+            if my.empty:
+                st.info("No leave applications yet.")
+            else:
+                st.dataframe(my.reset_index(drop=True), width='stretch')
+
+    with tab_roster:
+        _render_leave_roster()
+
+
+def _render_leave_roster():
+    """Leave roster is visible to all staff, but sensitive fields (reason/ids) are admin-only."""
+    df=fetch_df("""
+        SELECT L.id,
+               S.name AS staff,
+               S.section,
+               S.rank,
+               L.leave_type,
+               L.start_date,
+               L.end_date,
+               L.working_days,
+               R.name AS reliever,
+               L.status,
+               L.reason
+        FROM leaves L
+        JOIN staff S ON S.id = L.staff_id
+        LEFT JOIN staff R ON R.id = L.relieving_staff_id
+        ORDER BY date(L.start_date) DESC, S.name
+    """)
+    if df.empty:
+        st.info("No leave applications yet.")
+        return
+
+    c1,c2,c3=st.columns(3)
+    with c1:
+        staff_filter = st.selectbox("Filter by staff", ["All"] + sorted(df["staff"].unique().tolist()), key="lvf1_roster")
+    with c2:
+        type_filter = st.selectbox("Filter by type", ["All"] + sorted(df["leave_type"].unique().tolist()), key="lvf2_roster")
+    with c3:
+        years = sorted({dtparser.parse(d).year for d in df["start_date"]})
+        year_filter = st.selectbox("Filter by year", ["All"] + [str(y) for y in years], key="lvf3_roster")
+
+    f=df.copy()
+    if staff_filter!="All": f=f[f["staff"]==staff_filter]
+    if type_filter!="All": f=f[f["leave_type"]==type_filter]
+    if year_filter!="All": f=f[f["start_date"].str.startswith(year_filter)]
+
+    if is_admin():
+        view=f[["staff","section","rank","leave_type","start_date","end_date","working_days","reliever","status","reason"]]
+    else:
+        view=f[["staff","section","rank","leave_type","start_date","end_date","working_days","status"]]
+    st.dataframe(view.reset_index(drop=True), width='stretch')
 
 
 def page_chat():
@@ -1928,29 +2037,8 @@ def page_chat():
 
 def page_leave_table():
     st.markdown("<div class='worknest-header'><h2>📄 Leave Table</h2></div>", unsafe_allow_html=True)
-    df=fetch_df("""
-        SELECT L.id, S.name AS staff, S.rank, L.leave_type, L.start_date, L.end_date, L.working_days,
-               R.name AS reliever, L.status, L.reason
-        FROM leaves L
-        JOIN staff S ON S.id = L.staff_id
-        LEFT JOIN staff R ON R.id = L.relieving_staff_id
-        ORDER BY date(L.start_date) DESC, S.name
-    """)
-    if df.empty:
-        st.info("No leave applications yet."); return
-    c1,c2,c3=st.columns(3)
-    with c1:
-        staff_filter = st.selectbox("Filter by staff", ["All"] + sorted(df["staff"].unique().tolist()), key="lvf1")
-    with c2:
-        type_filter = st.selectbox("Filter by type", ["All"] + sorted(df["leave_type"].unique().tolist()), key="lvf2")
-    with c3:
-        years = sorted({dtparser.parse(d).year for d in df["start_date"]})
-        year_filter = st.selectbox("Filter by year", ["All"] + [str(y) for y in years], key="lvf3")
-    f = df.copy()
-    if staff_filter!="All": f = f[f["staff"]==staff_filter]
-    if type_filter!="All": f = f[f["leave_type"]==type_filter]
-    if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
-    st.dataframe(f.reset_index(drop=True), width='stretch')
+    # Keep this page as a pure roster view with proper privacy rules
+    _render_leave_roster()
 
 # ---------- Tasks & Performance ----------
 def _build_expected_biweekly_windows(start_date:date, today:date)->list:
@@ -2170,8 +2258,8 @@ def page_projects():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
-                                      (pid, str(rdate), path, current_staff_id()))
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
+                                      (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id()))
                         try:
                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
                         except Exception:
@@ -2730,10 +2818,13 @@ def page_tasks():
             st.caption(f"Soft factors: {'ON' if inc_soft else 'OFF'}")
 
     with c3:
-        if st.button("🔄 Compute/Refresh month", help="Recompute monthly points and store to Performance Index."):
-            compute_and_store_monthly_performance(ms)
-            st.success("Monthly performance updated.")
-            st.rerun()
+        if is_admin():
+            if st.button("🔄 Compute/Refresh month", help="Recompute monthly points and store to Performance Index."):
+                compute_and_store_monthly_performance(ms)
+                st.success("Monthly performance updated.")
+                st.rerun()
+        else:
+            st.button("🔄 Compute/Refresh month", disabled=True, help="Only Admin can recompute/store monthly performance.")
 
     lb = get_monthly_leaderboard(ms, include_soft=inc_soft)
     if lb.empty:
@@ -2780,6 +2871,10 @@ def page_tasks():
 
 
 def page_import():
+    if not is_admin():
+        st.markdown("<div class='worknest-header'><h2>⬆️ Import CSVs</h2></div>", unsafe_allow_html=True)
+        st.warning("Only **Admin** can import CSV files.")
+        return
     st.markdown("<div class='worknest-header'><h2>⬆️ Import CSVs</h2></div>", unsafe_allow_html=True)
     st.caption("Upload your CSV templates below (recommended for Render), or place them inside a local <b>data</b> folder next to app.py.", unsafe_allow_html=True)
 
