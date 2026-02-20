@@ -196,7 +196,6 @@ CREATE TABLE IF NOT EXISTS biweekly_reports (
   id SERIAL PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   report_date TEXT NOT NULL,
-  uploaded_at TEXT,
   file_path TEXT,
   uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
 );
@@ -374,16 +373,6 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
         if not _pg_has_column('projects', 'next_due_date'):
             _pg_add_column("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
 
-        # biweekly_reports: uploaded_at (submission timestamp)
-        if not _pg_has_column('biweekly_reports', 'uploaded_at'):
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
-        # Backfill uploaded_at where missing so recent backlog uploads can score correctly
-        try:
-            cur.execute("UPDATE biweekly_reports SET uploaded_at = NOW()::text WHERE uploaded_at IS NULL")
-        except Exception:
-            pass
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
-
         # chat_messages: allow pdf and other attachments
         if not _pg_has_column('chat_messages', 'attachment_path'):
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT")
@@ -400,7 +389,7 @@ CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NO
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, uploaded_at TEXT, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
 CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
@@ -448,14 +437,6 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(projects)").fetchall()]
             if "next_due_date" not in cols:
                 cur.execute("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
-            try:
-                bcols = [r[1] for r in cur.execute("PRAGMA table_info(biweekly_reports)").fetchall()]
-                if "uploaded_at" not in bcols:
-                    cur.execute("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
-                # Backfill uploaded_at where missing so backlog uploads can score in the current month.
-                cur.execute("UPDATE biweekly_reports SET uploaded_at = datetime('now') WHERE uploaded_at IS NULL")
-            except Exception:
-                pass
         except Exception:
             pass
 
@@ -789,29 +770,16 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
         (str(ms), str(me)),
     )
 
-    # Prefetch test results in month.
-    # IMPORTANT: credit goes to ALL staff posted to the project (not only the uploader).
-    tproj = fetch_df(
-        """SELECT project_id, uploaded_at
+    # Prefetch test results in month (per uploader)
+    testdf = fetch_df(
+        """SELECT uploader_staff_id AS staff_id, COUNT(1) AS n
              FROM test_results
-            WHERE date(uploaded_at) BETWEEN date(?) AND date(?)""",
+            WHERE uploader_staff_id IS NOT NULL
+              AND date(uploaded_at) BETWEEN date(?) AND date(?)
+            GROUP BY uploader_staff_id""",
         (str(ms), str(me)),
     )
-    # project -> [staff_id,...]
-    ps_map:dict[int,list[int]] = {}
-    psdf = fetch_df("SELECT project_id, staff_id FROM project_staff")
-    if not psdf.empty:
-        for _,pr in psdf.iterrows():
-            pid=int(pr.get("project_id") or 0)
-            sid=int(pr.get("staff_id") or 0)
-            if pid and sid:
-                ps_map.setdefault(pid, []).append(sid)
-    testmap:dict[int,int] = {}
-    if not tproj.empty:
-        for _,tr in tproj.iterrows():
-            pid=int(tr.get("project_id") or 0)
-            for sid in ps_map.get(pid, []):
-                testmap[sid] = testmap.get(sid, 0) + 1
+    testmap={int(r["staff_id"]): int(r["n"]) for _,r in testdf.iterrows()} if not testdf.empty else {}
 
     # Biweekly reports scoring: due dates within month
     start=_biweekly_start_date()
@@ -827,20 +795,15 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
     # Prefetch all reports for month +/- buffer (to match windows)
     buf_start = ms - dt.timedelta(days=13)
     buf_end   = me + dt.timedelta(days=30)
-    # IMPORTANT: scoring is based on when the report was SUBMITTED.
-    # `uploaded_at` is the submission timestamp; fall back to `report_date` for older rows.
     rdf = fetch_df(
-        """SELECT project_id,
-                  COALESCE(uploaded_at, report_date) AS submitted_on
-             FROM biweekly_reports
-            WHERE date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)""",
+        "SELECT project_id, report_date FROM biweekly_reports WHERE date(report_date) BETWEEN date(?) AND date(?)",
         (str(buf_start), str(buf_end)),
     )
     # Map project -> sorted list of report dates
     proj_reports:dict[int,list[dt.date]]={}
     for _,rr in rdf.iterrows():
         pid=int(rr.get("project_id") or 0)
-        rd=_parse_date_safe(rr.get("submitted_on"))
+        rd=_parse_date_safe(rr.get("report_date"))
         if pid and rd:
             proj_reports.setdefault(pid, []).append(rd)
     for pid in list(proj_reports.keys()):
@@ -858,12 +821,8 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
                 task_pts += _task_points(r.get("date_assigned"), int(r.get("days_allotted") or 0), r.get("completed_date"))
 
         # Reports (per posted project)
-        # Use prefetched project-staff map when available.
-        if ps_map:
-            proj_ids=[pid for pid,staffs in ps_map.items() if sid in staffs]
-        else:
-            pdf = fetch_df("SELECT project_id FROM project_staff WHERE staff_id=?", (sid,))
-            proj_ids=[int(x) for x in (pdf["project_id"].tolist() if not pdf.empty else [])]
+        pdf = fetch_df("SELECT project_id FROM project_staff WHERE staff_id=?", (sid,))
+        proj_ids=[int(x) for x in (pdf["project_id"].tolist() if not pdf.empty else [])]
         for pid in proj_ids:
             used=set()  # prevent double-counting the same report across cycles
             rdates=proj_reports.get(pid, [])
@@ -1687,8 +1646,8 @@ def page_dashboard():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
-                                      (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id()))
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
+                                      (pid, str(rdate), path, current_staff_id()))
                         try:
                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
                         except Exception:
@@ -2258,8 +2217,8 @@ def page_projects():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
-                                      (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id()))
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
+                                      (pid, str(rdate), path, current_staff_id()))
                         try:
                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
                         except Exception:
