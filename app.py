@@ -2878,12 +2878,17 @@ def page_account():
         st.warning("You must change your password before continuing.")
 
     st.subheader("Change password")
-    c1, c2 = st.columns(2)
-    old = c1.text_input("Current password", type="password")
-    new1 = c2.text_input("New password", type="password")
-    new2 = c2.text_input("Confirm new password", type="password")
+    st.caption("After a successful change, we’ll take you back to the dashboard.")
 
-    if st.button("Update password", type="primary"):
+    # Use a form so Streamlit clears inputs on submit and prevents accidental double-clicks.
+    with st.form("change_password_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        old = c1.text_input("Current password", type="password", key="pwd_old")
+        new1 = c2.text_input("New password", type="password", key="pwd_new1")
+        new2 = c2.text_input("Confirm new password", type="password", key="pwd_new2")
+        submitted = st.form_submit_button("Update password", type="primary")
+
+    if submitted:
         if not new1 or len(new1) < 4:
             st.error("Password is too short.")
         elif new1 != new2:
@@ -2894,9 +2899,15 @@ def page_account():
             if row.empty or (hash_pwd(old) != str(row.iloc[0]["password_hash"])):
                 st.error("Current password is incorrect.")
             else:
-                execute("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?", (hash_pwd(new1), uid))
-                st.success("Password updated.")
-                st.session_state["user"]["must_change_password"]=0
+                execute(
+                    "UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+                    (hash_pwd(new1), uid),
+                )
+                st.session_state["user"]["must_change_password"] = 0
+                # One-time flash on next render
+                st.session_state["flash_success"] = "Password updated successfully."
+                # Navigate away so user doesn't keep clicking
+                st.session_state["nav_radio"] = "🏠 Dashboard"
                 st.rerun()
 
 
@@ -2938,6 +2949,14 @@ def main():
     init_db(); apply_styles()
     if not current_user():
         login_ui(); return
+
+    # One-time flash messages
+    try:
+        msg = st.session_state.pop("flash_success", None)
+        if msg:
+            st.success(msg)
+    except Exception:
+        pass
 
     # Run task reminder checks at most once per day per session (emails only if SMTP_* is configured)
     try:
