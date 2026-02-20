@@ -441,6 +441,21 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
     c.commit()
     c.close()
 
+
+    # Ensure forward-compatible columns exist (older DBs may not have them yet)
+    try:
+        if DB_IS_POSTGRES:
+            execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password INTEGER DEFAULT 0")
+            execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT")
+        else:
+            # SQLite: IF NOT EXISTS for columns is not supported; ignore errors
+            try: execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+            except Exception: pass
+            try: execute("ALTER TABLE users ADD COLUMN password_changed_at TEXT")
+            except Exception: pass
+    except Exception:
+        pass
+
     # Bootstrap admin (only if users table is empty)
     try:
         ucnt = fetch_df("SELECT COUNT(1) AS n FROM users")
@@ -486,19 +501,29 @@ def execute(q, p=()):
                         if " on conflict" not in q.lower():
                             q = q.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
                     low=q.lower()
+
+                    # For INSERTs, we *optionally* try to fetch the new id (common for SERIAL PK tables).
+                    # We must use a SAVEPOINT because a failed RETURNING attempt aborts the transaction in Postgres.
                     if low.startswith("insert") and "returning" not in low:
+                        cur.execute("SAVEPOINT sp_worknest_insert")
                         q2=q.rstrip().rstrip(";")+" RETURNING id"
                         try:
                             cur.execute(q2, p)
                             row=cur.fetchone()
+                            cur.execute("RELEASE SAVEPOINT sp_worknest_insert")
                             return int(row[0]) if row else None
                         except Exception as e:
+                            cur.execute("ROLLBACK TO SAVEPOINT sp_worknest_insert")
+                            cur.execute("RELEASE SAVEPOINT sp_worknest_insert")
                             # Some tables (e.g., app_settings) don't have an 'id' column.
                             msg=str(e)
-                            if "does not exist" in msg and "id" in msg.lower():
+                            if ("does not exist" in msg.lower()) and ("id" in msg.lower()):
                                 cur.execute(q, p)
                                 return None
-                            raise
+                            # Fall back to plain execute for other RETURNING failures too.
+                            cur.execute(q, p)
+                            return None
+
                     cur.execute(q, p)
                     if "returning" in low:
                         row=cur.fetchone()
@@ -512,10 +537,6 @@ def execute(q, p=()):
     finally:
         try: c.close()
         except Exception: pass
-
-
-# ---------- Notifications (Email Reminders) ----------
-
 
 def execute_sql(q, p=()):
     """Backward-compatible alias used by some pages."""
@@ -1101,7 +1122,20 @@ def login_ui():
     username=st.text_input("Username (email or name)", key="login_user")
     password=st.text_input("Password", type="password", key="login_pwd")
     if st.button("Login", key="login_btn"):
-        u=fetch_df("SELECT * FROM users WHERE username=?", (username,))
+        u_in = (username or "").strip()
+        if not u_in:
+            st.error("Enter your email or name.")
+            return
+
+        # Allow login using:
+        #  - users.username (stored as email for most staff)
+        #  - staff.email
+        #  - staff.name
+        u=fetch_df("""SELECT u.* FROM users u
+                       LEFT JOIN staff s ON s.id=u.staff_id
+                       WHERE LOWER(u.username)=LOWER(?) OR LOWER(COALESCE(s.email,''))=LOWER(?) OR LOWER(COALESCE(s.name,''))=LOWER(?)
+                       LIMIT 1""", (u_in, u_in, u_in))
+
         if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
             st.session_state["user"]=dict(u.iloc[0])
             try:
@@ -2597,20 +2631,79 @@ def page_import():
             st.error("staff_template.csv not found. Upload it above or place it in data/.");
             df=None
         if df is not None:
+            created_users=0
+            updated_users=0
             for _,r in df.iterrows():
-                if pd.isna(r.get("name")) or pd.isna(r.get("rank")): continue
-                email = r.get("email") if pd.notna(r.get("email")) else None
-                ex = fetch_df("SELECT id FROM staff WHERE email=? OR name=?", (email, r["name"]))
+                if pd.isna(r.get("name")) or pd.isna(r.get("rank")): 
+                    continue
+                name = str(r.get("name")).strip()
+                email = r.get("email") if pd.notna(r.get("email")) and str(r.get("email")).strip() else None
+                email = str(email).strip().lower() if email else None
+
+                ex = fetch_df("SELECT id FROM staff WHERE (email IS NOT NULL AND email=? ) OR LOWER(name)=LOWER(?)", (email, name))
                 if ex.empty:
                     execute("""INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date)
                                VALUES (?,?,?,?,?,?,?,?)""",
-                            (r["name"], r.get("rank"), email, r.get("phone"), r.get("section"), r.get("role"), r.get("grade"), r.get("join_date")))
+                            (name, r.get("rank"), email, r.get("phone"), r.get("section"), r.get("role"), r.get("grade"), r.get("join_date")))
+                    ex = fetch_df("SELECT id FROM staff WHERE (email IS NOT NULL AND email=? ) OR LOWER(name)=LOWER(?)", (email, name))
                 else:
-                    execute("""UPDATE staff SET rank=?, phone=?, section=?, role=?, grade=?, join_date=? WHERE id=?""",
-                            (r.get("rank"), r.get("phone"), r.get("section"), r.get("role"), r.get("grade"), r.get("join_date"), int(ex["id"].iloc[0])))
-            st.success("Staff imported/updated.")
+                    execute("""UPDATE staff SET rank=?, email=COALESCE(?,email), phone=?, section=?, role=?, grade=?, join_date=? WHERE id=?""",
+                            (r.get("rank"), email, r.get("phone"), r.get("section"), r.get("role"), r.get("grade"), r.get("join_date"), int(ex["id"].iloc[0])))
+
+                if ex.empty:
+                    continue
+                staff_id=int(ex["id"].iloc[0])
+
+                # --- Ensure there is a login account for every staff ---
+                # username priority: email (preferred) else name
+                uname = email if email else name
+                raw_role = str(r.get("role") or "staff").strip().lower()
+                is_admin_flag = 1 if raw_role=="admin" else 0
+
+                # normalize roles to what the app expects
+                # (admin, section_head, sub_admin, staff)
+                if raw_role in ("admin","section_head","sub_admin","staff"):
+                    role_norm = raw_role
+                elif raw_role in ("head","section head","section-head","sectionhead","supervisor"):
+                    role_norm = "section_head"
+                else:
+                    role_norm = "staff"
+
+                uex = fetch_df("SELECT id, password_hash FROM users WHERE staff_id=? OR LOWER(username)=LOWER(?)", (staff_id, uname))
+                if uex.empty:
+                    # Default password is fcda; force change on first login
+                    try:
+                        execute("""INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active,must_change_password)
+                                   VALUES (?,?,?,?,?,?,?)""",
+                                (staff_id, uname, hash_pwd("fcda"), is_admin_flag, role_norm, 1, 1))
+                    except Exception:
+                        # Backward compatibility if column doesn't exist yet
+                        execute("""INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active)
+                                   VALUES (?,?,?,?,?,?)""",
+                                (staff_id, uname, hash_pwd("fcda"), is_admin_flag, role_norm, 1))
+                    created_users += 1
+                else:
+                    # Keep existing password unless it's blank; update username/role linkage
+                    pw = uex["password_hash"].iloc[0]
+                    if pw is None or str(pw).strip()=="":
+                        pw = hash_pwd("fcda")
+                        try:
+                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, is_admin=?, role=?, is_active=1, must_change_password=1 WHERE id=?""",
+                                    (staff_id, uname, pw, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                        except Exception:
+                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, is_admin=?, role=?, is_active=1 WHERE id=?""",
+                                    (staff_id, uname, pw, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                    else:
+                        try:
+                            execute("""UPDATE users SET staff_id=?, username=?, is_admin=?, role=?, is_active=1 WHERE id=?""",
+                                    (staff_id, uname, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                        except Exception:
+                            pass
+                    updated_users += 1
+
+            st.success(f"Staff imported/updated. Users created: {created_users}, users updated: {updated_users}.")
         else:
-            st.error("data/staff_template.csv not found.")
+            st.error("data/ staff_template.csv could not be read.")
 
     if c3.button("Import nigeria_public_holidays_2025_2026.csv", key="imp_hol"):
         path=os.path.join("data","nigeria_public_holidays_2025_2026.csv")
