@@ -1159,7 +1159,7 @@ def sidebar_nav():
     if u: st.sidebar.markdown(f"**User:** {u['username']}  \n**Role:** {user_role()}")
     logout_button()
 
-    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat"]
+    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
     admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control"]
     pages = base_pages + (admin_pages if is_admin() else [])
 
@@ -2900,6 +2900,39 @@ def page_account():
                 st.rerun()
 
 
+def _read_help_md(fname:str)->str:
+    path=os.path.join(BASE_DIR, "help", fname)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "(Help file missing: help/%s)" % fname
+
+
+def page_help():
+    st.title("❓ Help")
+    st.caption("Quick guides for staff and admins. If something is unclear, we’ll tighten it up as we go.")
+
+    tabs = st.tabs(["Quick Start", "Tasks", "Leave", "Passwords", "Admin"])
+    with tabs[0]:
+        st.markdown(_read_help_md("quick_start.md"))
+        st.download_button("Download Quick Start (MD)", _read_help_md("quick_start.md"), file_name="WorkNest_Quick_Start.md")
+    with tabs[1]:
+        st.markdown(_read_help_md("tasks.md"))
+        st.download_button("Download Tasks Guide (MD)", _read_help_md("tasks.md"), file_name="WorkNest_Tasks_Guide.md")
+    with tabs[2]:
+        st.markdown(_read_help_md("leave.md"))
+        st.download_button("Download Leave Guide (MD)", _read_help_md("leave.md"), file_name="WorkNest_Leave_Guide.md")
+    with tabs[3]:
+        st.markdown(_read_help_md("passwords.md"))
+        st.download_button("Download Passwords Guide (MD)", _read_help_md("passwords.md"), file_name="WorkNest_Passwords_Guide.md")
+    with tabs[4]:
+        if is_admin() or is_sub_admin() or is_section_head():
+            st.markdown(_read_help_md("admin.md"))
+            st.download_button("Download Admin Guide (MD)", _read_help_md("admin.md"), file_name="WorkNest_Admin_Guide.md")
+        else:
+            st.info("Admin help is restricted.")
+
+
 
 def main():
     init_db(); apply_styles()
@@ -2923,6 +2956,7 @@ def main():
     elif page.startswith("💬"): page_chat()
     elif page.startswith("📇"): page_staff_directory()
     elif page.startswith("⚙️"): page_account()
+    elif page.startswith("❓"): page_help()
     elif page.startswith("📄"): page_leave_table()
     elif page.startswith("🗂️"): page_tasks()
     elif page.startswith("⬆️"): page_import()
