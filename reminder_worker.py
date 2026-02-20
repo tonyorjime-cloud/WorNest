@@ -1,5 +1,6 @@
 import os, smtplib, ssl
-from datetime import date
+import math
+from datetime import date, timedelta
 from email.message import EmailMessage
 from dateutil import parser as dtparser
 import pandas as pd
@@ -41,6 +42,12 @@ def fetch_df(q, p=()):
 
 def execute(q, p=()):
     q=_adapt_query(q).strip()
+    # Postgres compatibility: SQLite uses INSERT OR IGNORE
+    if DB_IS_POSTGRES and q.lower().startswith("insert or ignore"):
+        q = "INSERT" + q[len("INSERT OR IGNORE"):]
+        # Best-effort: rely on unique constraints; do nothing on conflict
+        if " on conflict" not in q.lower():
+            q = q.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
     c=get_conn()
     try:
         if DB_IS_POSTGRES:
@@ -54,6 +61,148 @@ def execute(q, p=()):
     finally:
         try: c.close()
         except Exception: pass
+
+
+def _get_setting(key:str, default:str="") -> str:
+    try:
+        df = fetch_df("SELECT value FROM app_settings WHERE key=?", (key,))
+        if not df.empty:
+            v = df.iloc[0].get("value")
+            return "" if v is None else str(v)
+    except Exception:
+        pass
+    return default
+
+def _month_start(d:date) -> date:
+    return date(d.year, d.month, 1)
+
+def _month_end(d:date) -> date:
+    ms=_month_start(d)
+    if ms.month==12:
+        nxt=date(ms.year+1,1,1)
+    else:
+        nxt=date(ms.year, ms.month+1, 1)
+    return nxt - timedelta(days=1)
+
+def _is_last_day_of_month(d:date)->bool:
+    try:
+        return d == _month_end(d)
+    except Exception:
+        return False
+
+def run_staff_of_month_post(today:date|None=None)->dict:
+    if today is None:
+        today=date.today()
+    if not _is_last_day_of_month(today):
+        return {"posted":0, "reason":"not_last_day"}
+
+    ms=_month_start(today)
+    mstr=str(ms)
+
+    # Prevent duplicates
+    try:
+        already=fetch_df("SELECT 1 FROM staff_of_month_posts WHERE month=?", (mstr,))
+        if not already.empty:
+            return {"posted":0, "reason":"already_posted"}
+    except Exception:
+        return {"posted":0, "reason":"missing_tables"}
+
+    # Ensure monthly base is stored (best-effort: compute minimal base and upsert)
+    try:
+        staff=fetch_df("SELECT id FROM staff")
+        if staff.empty:
+            return {"posted":0, "reason":"no_staff"}
+        # Tasks completed in month
+        me=pd.Timestamp(today).to_period('M').end_time.date()
+        tdf=fetch_df("""SELECT A.staff_id, T.date_assigned, T.days_allotted, A.completed_date
+                        FROM task_assignments A JOIN tasks T ON T.id=A.task_id
+                       WHERE A.status='Completed'
+                         AND date(A.completed_date) BETWEEN date(?) AND date(?)""", (str(ms), str(me)))
+        # Test results in month
+        testdf=fetch_df("""SELECT uploader_staff_id AS staff_id, COUNT(1) AS n
+                           FROM test_results
+                          WHERE uploader_staff_id IS NOT NULL
+                            AND date(uploaded_at) BETWEEN date(?) AND date(?)
+                          GROUP BY uploader_staff_id""", (str(ms), str(me)))
+        testmap={int(r['staff_id']): int(r['n']) for _,r in testdf.iterrows()} if not testdf.empty else {}
+
+        def task_points(da, allotted, cd):
+            try:
+                da=dtparser.parse(str(da)).date()
+                cd=dtparser.parse(str(cd)).date()
+                allotted=int(allotted or 0)
+                if allotted<=0: return 0
+                days=(cd-da).days+1
+                if days<=allotted: return 3
+                if days<=int(math.ceil(1.5*allotted)): return 2
+                return 1
+            except Exception:
+                return 0
+
+        for _,sr in staff.iterrows():
+            sid=int(sr['id'])
+            srows=tdf[tdf['staff_id']==sid] if not tdf.empty else pd.DataFrame()
+            tp=sum(task_points(r['date_assigned'], r['days_allotted'], r['completed_date']) for _,r in srows.iterrows())
+            # Reports are skipped in worker for simplicity; the app UI can compute/refresh monthly.
+            rp=0
+            tsp=testmap.get(sid,0)*3
+            # Upsert (requires unique constraint)
+            if DB_IS_POSTGRES:
+                execute("""INSERT INTO performance_index (staff_id, month, task_points, report_points, test_points)
+                           VALUES (?,?,?,?,?)
+                           ON CONFLICT (staff_id, month) DO UPDATE
+                           SET task_points=EXCLUDED.task_points,
+                               report_points=EXCLUDED.report_points,
+                               test_points=EXCLUDED.test_points""", (sid, mstr, int(tp), int(rp), int(tsp)))
+            else:
+                execute("INSERT OR REPLACE INTO performance_index (staff_id, month, task_points, report_points, test_points) VALUES (?,?,?,?,?)",
+                        (sid, mstr, int(tp), int(rp), int(tsp)))
+    except Exception:
+        # If this fails, still try to post based on existing performance_index
+        pass
+
+    # Determine include-soft toggle
+    inc_soft = _get_setting("PERF_INCLUDE_SOFT", "0").strip().lower() in ("1","true","yes")
+
+    lb=fetch_df("""SELECT PI.staff_id, S.name, S.rank, PI.task_points, PI.report_points, PI.test_points,
+                        PI.reliability_score, PI.attention_to_detail_score
+                   FROM performance_index PI JOIN staff S ON S.id=PI.staff_id
+                  WHERE PI.month=?""", (mstr,))
+    if lb.empty:
+        return {"posted":0, "reason":"no_performance"}
+
+    if inc_soft:
+        lb['total'] = lb[['task_points','report_points','test_points','reliability_score','attention_to_detail_score']].fillna(0).sum(axis=1)
+    else:
+        lb['total'] = lb[['task_points','report_points','test_points']].fillna(0).sum(axis=1)
+    lb=lb.sort_values(['total','test_points','report_points','task_points','name'], ascending=[False,False,False,False,True])
+    top=lb.iloc[0]
+    month_label=ms.strftime('%B %Y')
+    msg=(
+        f"🏆 Staff of the Month — {month_label}\n\n"
+        f"🥇 {top['name']} ({top.get('rank','')})\n"
+        f"Total Score: {int(top['total'])} points\n\n"
+        f"Breakdown: Tasks {int(top['task_points'])} | Biweekly Reports {int(top['report_points'])} | Test Reports {int(top['test_points'])}"
+    )
+    if inc_soft:
+        msg += f" | Reliability {int(top.get('reliability_score') or 0)} | Attention to Detail {int(top.get('attention_to_detail_score') or 0)}"
+    msg += "\n\n— WorkNest (Performance Index)"
+
+    nowiso=pd.Timestamp.utcnow().isoformat(timespec='seconds')
+    # post as Admin (staff_id=1) fallback
+    poster_id=1
+    try:
+        if DB_IS_POSTGRES:
+            execute("INSERT INTO chat_messages (staff_id, message) VALUES (?,?)", (poster_id, msg))
+            execute("INSERT INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)",
+                    (mstr, int(top['staff_id']), int(top['total']), nowiso))
+        else:
+            execute("INSERT INTO chat_messages (staff_id, message, posted_at) VALUES (?,?,?)", (poster_id, msg, nowiso))
+            execute("INSERT OR REPLACE INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)",
+                    (mstr, int(top['staff_id']), int(top['total']), nowiso))
+        return {"posted":1, "reason":"ok"}
+    except Exception as e:
+        return {"posted":0, "reason":f"error:{type(e).__name__}"}
 
 def send_email(to_email:str, subject:str, body:str)->tuple[bool,str]:
     if not to_email:
@@ -169,4 +318,5 @@ def run_task_reminders(today:date|None=None, horizon_days:int=2)->dict:
 
 if __name__=="__main__":
     stats=run_task_reminders()
-    print(stats)
+    som=run_staff_of_month_post()
+    print({"reminders":stats, "staff_of_month":som})
