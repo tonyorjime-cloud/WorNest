@@ -361,6 +361,18 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
           used INTEGER DEFAULT 0
         );""")
 
+        # user_permissions: per-user capability toggles (feature flags)
+        cur.execute("""CREATE TABLE IF NOT EXISTS user_permissions (
+          user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          can_assign_tasks INTEGER DEFAULT 0,
+          can_confirm_task_completion INTEGER DEFAULT 0,
+          can_upload_project_docs INTEGER DEFAULT 0
+        );""")
+
+        # projects: next_due_date for bi-weekly reporting schedule
+        if not _pg_has_column('projects', 'next_due_date'):
+            _pg_add_column("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
+
         # chat_messages: allow pdf and other attachments
         if not _pg_has_column('chat_messages', 'attachment_path'):
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT")
@@ -373,7 +385,7 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
         sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT);
+CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT, next_due_date TEXT);
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
@@ -416,6 +428,21 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
             if "must_change_password" not in cols:
                 cur.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+
+        # projects: next_due_date
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(projects)").fetchall()]
+            if "next_due_date" not in cols:
+                cur.execute("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
+        except Exception:
+            pass
+
+        # user_permissions
+        try:
+            cur.execute("CREATE TABLE IF NOT EXISTS user_permissions (user_id INTEGER PRIMARY KEY, can_assign_tasks INTEGER DEFAULT 0, can_confirm_task_completion INTEGER DEFAULT 0, can_upload_project_docs INTEGER DEFAULT 0)")
         except Exception:
             pass
 
@@ -1085,10 +1112,10 @@ def is_admin():
     return user_role()=='admin' or int((current_user() or {}).get('is_admin',0) or 0)==1
 
 def is_sub_admin():
-    return user_role() in ('admin','sub_admin')
+    return user_role()=='sub_admin' or is_admin()
 
 def is_section_head():
-    return user_role() in ('admin','sub_admin','section_head')
+    return user_role()=='section_head' or is_admin()
 
 def can_import_csv():
     return is_admin()
@@ -1098,12 +1125,22 @@ def can_manage_projects():
     return is_admin()
 
 def can_upload_core_docs():
-    # "core" project documents (drawings, approvals, etc.)
-    return is_sub_admin()
+    # Core project documents (drawings, approvals, etc.)
+    # Admin always. Sub-admin only when explicitly enabled.
+    if is_admin():
+        return True
+    return (user_role()=='sub_admin') and has_perm('can_upload_project_docs')
 
 def can_assign_tasks():
-    # create/assign tasks
-    return is_section_head()
+    # Create/assign tasks
+    if is_admin():
+        return True
+    return (user_role()=='section_head') and has_perm('can_assign_tasks')
+
+def can_confirm_task_completion():
+    if is_admin():
+        return True
+    return (user_role()=='section_head') and has_perm('can_confirm_task_completion')
 
 def can_approve_leave():
     return is_admin()
@@ -1114,6 +1151,39 @@ def current_staff_id():
     sid=u.get("staff_id")
     try: return int(sid) if sid is not None else None
     except: return None
+
+
+def _get_user_permissions(user_id:int)->dict:
+    if user_id is None:
+        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
+    df = fetch_df("SELECT can_assign_tasks, can_confirm_task_completion, can_upload_project_docs FROM user_permissions WHERE user_id=?", (int(user_id),))
+    if df.empty:
+        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
+    r = df.iloc[0].to_dict()
+    return {
+        "can_assign_tasks": int(r.get("can_assign_tasks") or 0),
+        "can_confirm_task_completion": int(r.get("can_confirm_task_completion") or 0),
+        "can_upload_project_docs": int(r.get("can_upload_project_docs") or 0),
+    }
+
+def has_perm(flag:str)->bool:
+    u = current_user()
+    if not u:
+        return False
+    if is_admin():
+        return True
+    perms = _get_user_permissions(int(u.get("id")))
+    return int(perms.get(flag) or 0)==1
+
+def current_staff_section()->str|None:
+    sid = current_staff_id()
+    if sid is None:
+        return None
+    df = fetch_df("SELECT section FROM staff WHERE id=?", (int(sid),))
+    if df.empty:
+        return None
+    sec = df["section"].iloc[0]
+    return str(sec).strip() if sec is not None else None
 
 # ---------- Auth ----------
 def login_ui():
@@ -1182,8 +1252,14 @@ def is_assigned_to_project(project_id:int, staff_id:int|None=None)->bool:
     return (not df.empty)
 
 def can_upload_project_outputs(project_id:int)->bool:
-    # reports + test results: admin can upload anywhere; staff only where assigned
-    if is_admin(): return True
+    # Reports + test results + other project outputs
+    # Admin anywhere.
+    if is_admin():
+        return True
+    # Sub-admin can upload project documents if explicitly permitted.
+    if user_role()=='sub_admin' and has_perm('can_upload_project_docs'):
+        return True
+    # Otherwise, only staff posted to the project.
     return is_assigned_to_project(project_id)
 
 def can_upload_task_files(task_row:dict)->bool:
@@ -1251,7 +1327,29 @@ def page_dashboard():
         missing=[c for c in CORE_DOC_CATEGORIES if c not in present]
         return present, missing
 
-    def project_next_due(pid, start_date):
+    def project_next_due(pid, start_date, next_due_date=None):
+        # If a next_due_date is set on the project, it becomes the authoritative schedule anchor.
+        try:
+            nd = None
+            if next_due_date is not None and not (isinstance(next_due_date, float) and pd.isna(next_due_date)):
+                s = str(next_due_date).strip()
+                if s and s.lower() not in ("nan","none","null"):
+                    nd = dtparser.parse(s).date()
+            if nd is not None:
+                # Still fetch last submitted report date for context
+                last = fetch_df("SELECT MAX(report_date) d FROM biweekly_reports WHERE project_id=?", (pid,))
+                last_d = None
+                try:
+                    if (not last.empty) and ("d" in last.columns):
+                        raw = last["d"].iloc[0]
+                        if raw is not None and str(raw).strip().lower() not in ("", "nan", "none", "null"):
+                            last_d = dtparser.parse(str(raw)).date()
+                except Exception:
+                    last_d = None
+                return (date.today() > nd, last_d, nd, None)
+        except Exception:
+            pass
+
         # start_date may come from pandas as NaN/None/empty; treat all as missing.
         if start_date is None:
             return (True, None, None, "Start date missing — cannot track biweekly schedule")
@@ -1289,13 +1387,13 @@ def page_dashboard():
 
     # 1) Bi-weekly reports / project outputs due for projects you are posted to
     if admin:
-        proj_due=fetch_df("SELECT id,code,name,start_date FROM projects ORDER BY code")
+        proj_due=fetch_df("SELECT id,code,name,start_date,next_due_date FROM projects ORDER BY code")
     else:
-        proj_due=fetch_df("SELECT P.id,P.code,P.name,P.start_date FROM projects P JOIN project_staff PS ON PS.project_id=P.id WHERE PS.staff_id=? ORDER BY P.code", (sid,))
+        proj_due=fetch_df("SELECT P.id,P.code,P.name,P.start_date,P.next_due_date FROM projects P JOIN project_staff PS ON PS.project_id=P.id WHERE PS.staff_id=? ORDER BY P.code", (sid,))
 
     for _,p in proj_due.iterrows():
         pid=int(p["id"])
-        overdue,last_d,exp,reason = project_next_due(pid, p.get("start_date"))
+        overdue,last_d,exp,reason = project_next_due(pid, p.get("start_date"), p.get("next_due_date"))
         if exp is None: continue
         if overdue or (exp - today).days <= 7:
             status = "Overdue" if overdue else "Due soon"
@@ -1550,6 +1648,10 @@ def page_dashboard():
                     if path:
                         rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
                                       (pid, str(rdate), path, current_staff_id()))
+                        try:
+                            execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
+                        except Exception:
+                            pass
                         st.success("Report uploaded.")
                         sid = current_staff_id()
                         if sid is not None:
@@ -1863,10 +1965,23 @@ def _build_expected_biweekly_windows(start_date:date, today:date)->list:
 def page_projects():
     st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
     projects=fetch_df("""
-        SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.supervisor_staff_id,
+        SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
                (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
         FROM projects p ORDER BY p.code
     """)
+
+    # Admin control: global reset of next bi-weekly due dates
+    if is_admin():
+        with st.expander("🛠️ Admin: Reset bi-weekly next due date (global)", expanded=False):
+            st.caption("This overwrites **projects.next_due_date** for all projects. Use it when you want everyone aligned to the same reporting cycle.")
+            reset_date = st.date_input("Set NEXT due date for all projects", value=date(2026,2,26), key="global_due_reset")
+            if st.button("Apply global reset", key="btn_global_due_reset"):
+                execute("UPDATE projects SET next_due_date=?", (str(reset_date),))
+                execute("""INSERT INTO app_settings(key,value) VALUES(?,?)
+                           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", ("GLOBAL_BIWEEKLY_NEXT_DUE", str(reset_date)))
+                st.success(f"Updated all projects: next due date set to {reset_date}.")
+                st.rerun()
+
     left,right=st.columns([1,2])
     with left:
         st.subheader("Project List")
@@ -1882,7 +1997,7 @@ def page_projects():
         if not can_manage_projects():
             st.info("Only Admin can create/update/delete projects.")
 
-        staff=fetch_df("SELECT id,name FROM staff ORDER BY name")
+        staff=fetch_df("SELECT id,name,section FROM staff ORDER BY name")
         sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
         code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
         name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
@@ -2057,6 +2172,10 @@ def page_projects():
                     if path:
                         rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
                                       (pid, str(rdate), path, current_staff_id()))
+                        try:
+                            execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
+                        except Exception:
+                            pass
                         st.success("Report uploaded.")
                         sid = current_staff_id()
                         if sid is not None:
@@ -2358,13 +2477,14 @@ def page_tasks():
                     st.success(f"Checked {stats['checked']} assignments. Sent {stats['sent']} emails. Skipped {stats['skipped']}. Errors {stats['errors']}.")
                 else:
                     st.warning("SMTP is not configured, so no emails were sent. In-app reminders above still work.")
-    staff=fetch_df("SELECT id,name FROM staff ORDER BY name")
-    projects=fetch_df("SELECT id,code,name,start_date FROM projects ORDER BY code")
-    st.subheader("Create / Edit Task")
+    staff=fetch_df("SELECT id,name,section FROM staff ORDER BY name")
+    projects=fetch_df("SELECT id,code,name,start_date,next_due_date FROM projects ORDER BY code")
+    st.subheader("Tasks")
     titles=fetch_df("SELECT id,title FROM tasks ORDER BY id DESC")
-    mode=st.radio("Mode", ["Create new","Edit existing"], horizontal=True, key="tsk_mode")
+    mode_options = ["Edit existing"] if not can_assign_tasks() else ["Create new","Edit existing"]
+    mode=st.radio("Mode", mode_options, horizontal=True, key="tsk_mode")
+
     if (not can_assign_tasks()) and mode=="Create new":
-        st.info("Only Admin and Sectional Heads can create/assign tasks. Switching to view/edit attachments mode.")
         mode="Edit existing"
 
     if mode=="Edit existing" and titles.empty:
@@ -2376,10 +2496,29 @@ def page_tasks():
         tid=label_map[pick]
         trow=fetch_df("SELECT * FROM tasks WHERE id=?", (tid,)).iloc[0]
         task_dict = dict(trow)
-        title=st.text_input("Title", value=trow["title"], key="tsk_title")
-        desc=st.text_area("Description", value=trow["description"] or "", key="tsk_desc")
-        date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key="tsk_da")
-        due=st.date_input("Due date", value=dtparser.parse(trow["due_date"]).date(), key="tsk_due")
+        can_edit = can_assign_tasks()
+        # Section Heads are restricted to their section only
+        if (not is_admin()) and user_role()=='section_head':
+            sec = current_staff_section()
+            if sec:
+                staff_allowed = staff[staff["section"].fillna("").str.strip()==sec].copy()
+            else:
+                staff_allowed = staff.iloc[0:0].copy()
+        else:
+            staff_allowed = staff.copy()
+
+        # If this task already includes assignees outside section, section head cannot edit it.
+        if (not is_admin()) and user_role()=='section_head':
+            existing_ass = fetch_df("SELECT s.section FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))
+            if (not existing_ass.empty):
+                sec = current_staff_section() or ""
+                bad = existing_ass["section"].fillna("").str.strip().apply(lambda x: x!=sec).any()
+                if bad:
+                    can_edit = False
+                title=st.text_input("Title", value=trow["title"], key="tsk_title", disabled=not can_edit)
+        desc=st.text_area("Description", value=trow["description"] or "", key="tsk_desc", disabled=not can_edit)
+        date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key="tsk_da", disabled=not can_edit)
+        due=st.date_input("Due date", value=dtparser.parse(trow["due_date"]).date(), key="tsk_due", disabled=not can_edit)
         da=int(max((due - date_assigned).days + 1, 1))
         st.write(f"Days allotted (auto): **{da}**")
         proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
@@ -2387,23 +2526,41 @@ def page_tasks():
         if pd.notna(trow["project_id"]):
             pr=projects[projects["id"]==int(trow["project_id"])]
             if not pr.empty: proj_value=f"{pr['code'].iloc[0]} — {pr['name'].iloc[0]}"
-        proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key="tsk_proj")
-        assignees=st.multiselect("Assignees", staff["name"].tolist(), key="tsk_asg",
+        proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key="tsk_proj", disabled=not can_edit)
+        assignees=st.multiselect("Assignees", staff_allowed["name"].tolist(), key="tsk_asg",
                                  default=fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist())
         colA,colB,colC=st.columns(3)
         with colA:
-            if can_assign_tasks() and st.button("💾 Save", key="tsk_save"):
-                execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
+            if st.button("💾 Save", key="tsk_save", disabled=not can_edit):
+                if not can_edit:
+                    st.warning("You don't have permission to edit this task.")
+                else:
+                    execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
                         (title, desc or None, str(date_assigned), int(da), str(due),
                          int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None, tid))
-                execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
-                for nm in assignees:
-                    sid=int(staff[staff["name"]==nm]["id"].iloc[0])
-                    execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
-                st.success("Task updated."); st.rerun()
+                    execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
+                    for nm in assignees:
+                        sid=int(staff[staff["name"]==nm]["id"].iloc[0])
+                        execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
+                    st.success("Task updated."); st.rerun()
         with colB:
-            if is_admin():
-                if st.button("✅ Admin: Certify Completed (today)", key="tsk_done"):
+            # Completion workflow: only Admin or permitted Section Heads can confirm completion.
+            can_confirm = can_confirm_task_completion()
+            btn_label = "✅ Confirm Completed (today)" if not is_admin() else "✅ Admin: Certify Completed (today)"
+            if st.button(btn_label, key="tsk_done", disabled=not can_confirm):
+                if not can_confirm:
+                    st.warning("You don't have permission to confirm completion.")
+                else:
+                    # Section heads may only confirm tasks within their section
+                    if (not is_admin()) and user_role()=='section_head':
+                        sec = current_staff_section() or ""
+                        chk = fetch_df("""SELECT s.section FROM task_assignments ta
+                                           JOIN staff s ON s.id=ta.staff_id
+                                           WHERE ta.task_id=?""", (tid,))
+                        if (not chk.empty) and chk["section"].fillna("").str.strip().apply(lambda x: x!=sec).any():
+                            st.error("You can only confirm completion for tasks assigned within your section.")
+                            st.stop()
+
                     today_d=date.today()
                     today=str(today_d)
                     da=_parse_date_safe(trow["date_assigned"]) or today_d
@@ -2412,20 +2569,22 @@ def page_tasks():
                         days_taken=int((today_d - da).days)
                         execute("UPDATE task_assignments SET status='Completed', completed_date=?, days_taken=? WHERE id=?",
                                 (today, days_taken, int(ar["id"])))
-                        # Legacy points table (kept for backward compatibility; Performance Index uses task_assignments)
+                        # Legacy points table (kept for backward compatibility)
                         try:
                             execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
                                     (int(ar["staff_id"]), "task", int(ar["id"]), 5, datetime.now().isoformat(timespec="seconds")))
                         except Exception:
                             pass
-                    st.success("Admin certified completion for all assignees."); st.rerun()
+                    st.success("Completion confirmed for all assignees."); st.rerun()
 
+            # Delete remains Admin-only
+            if is_admin():
                 if st.button("🗑️ Admin: Delete Task", key="tsk_del"):
                     execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
                     execute("DELETE FROM tasks WHERE id=?", (tid,))
                     st.success("Task deleted."); st.rerun()
             else:
-                st.info("Only **Admin** can certify task completion or delete tasks.")
+                st.caption("Delete is Admin-only.")
         with colC:
             st.caption("Scores only computed for **Completed** tasks. Overdue **In progress** tasks are flagged below.")
 
@@ -2472,6 +2631,16 @@ def page_tasks():
                         st.success("Attachment removed."); st.rerun()
     
     else:
+        # Create new task (Admin or permitted Section Heads). Section Heads are restricted to their section only.
+        if (not is_admin()) and user_role()=='section_head':
+            sec = current_staff_section()
+            if sec:
+                staff_allowed_new = staff[staff["section"].fillna("").str.strip()==sec].copy()
+            else:
+                staff_allowed_new = staff.iloc[0:0].copy()
+        else:
+            staff_allowed_new = staff.copy()
+
         title=st.text_input("Title", key="tsk_title_new")
         desc=st.text_area("Description", key="tsk_desc_new")
         date_assigned=st.date_input("Date assigned", value=date.today(), key="tsk_da_new")
@@ -2480,7 +2649,7 @@ def page_tasks():
         st.write(f"Days allotted (auto): **{da}**")
         proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
         proj=st.selectbox("Project (optional)", proj_opt, key="tsk_proj_new")
-        assignees=st.multiselect("Assignees", staff["name"].tolist(), key="tsk_asg_new")
+        assignees=st.multiselect("Assignees", staff_allowed_new["name"].tolist(), key="tsk_asg_new")
         if can_assign_tasks() and st.button("➕ Create Task", key="tsk_create"):
             pid = int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None
             tid=execute("INSERT INTO tasks (title,description,date_assigned,days_allotted,due_date,project_id,created_by_staff_id) VALUES (?,?,?,?,?,?,?)",
@@ -2827,23 +2996,63 @@ def page_access_control():
 
     st.dataframe(df[["user_id","username","role","is_admin","is_active","name","email","rank"]], width='stretch')
 
+    
     st.markdown("### Update a user")
-    user_id=st.number_input("User ID", min_value=1, step=1)
-    col1,col2,col3=st.columns(3)
-    with col1:
-        new_role=st.selectbox("Role", ["staff","admin"], index=0)
-    with col2:
-        active=st.selectbox("Status", [1,0], index=0, format_func=lambda x: "Active" if x==1 else "Disabled")
-    with col3:
-        new_pwd=st.text_input("Reset password (optional)", type="password", help="Leave blank to keep existing password.")
-    if st.button("Apply changes"):
-        isadm = 1 if new_role=="admin" else 0
+    # Pick user by name/email (no more confusing numeric IDs)
+    user_labels = []
+    label_to_id = {}
+    for _,r in df.iterrows():
+        label = f"{r.get('name') or r.get('username')} — {r.get('username')} (role: {r.get('role')})"
+        user_labels.append(label)
+        label_to_id[label] = int(r["user_id"])
+
+    pick = st.selectbox("Select user", user_labels, key="ac_pick_user")
+    user_id = label_to_id[pick]
+    cur_row = df[df["user_id"]==user_id].iloc[0].to_dict()
+
+    # Load current toggles
+    perms = _get_user_permissions(user_id)
+
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        new_role = st.selectbox("Role", ["staff","section_head","sub_admin","admin"],
+                                index=["staff","section_head","sub_admin","admin"].index(str(cur_row.get("role") or "staff")))
+    with c2:
+        active = st.selectbox("Status", [1,0], index=0 if int(cur_row.get("is_active") or 1)==1 else 1,
+                              format_func=lambda x: "Active" if x==1 else "Disabled")
+    with c3:
+        new_pwd = st.text_input("Reset password (optional)", type="password",
+                                help="Leave blank to keep existing password.")
+
+    st.markdown("#### Capability toggles (Admin-controlled)")
+    t1,t2,t3 = st.columns(3)
+    with t1:
+        can_assign = st.checkbox("Can assign tasks (Section Head)", value=perms["can_assign_tasks"]==1, key="perm_assign")
+    with t2:
+        can_confirm = st.checkbox("Can confirm completion (Section Head)", value=perms["can_confirm_task_completion"]==1, key="perm_confirm")
+    with t3:
+        can_upload_docs = st.checkbox("Can upload project documents (Sub-admin)", value=perms["can_upload_project_docs"]==1, key="perm_upload_docs")
+
+    if st.button("Apply changes", key="ac_apply"):
+        role_norm = new_role
+        isadm = 1 if role_norm=="admin" else 0
+
         if new_pwd.strip():
             execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=? WHERE id=?",
-                    (new_role, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
+                    (role_norm, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
         else:
             execute("UPDATE users SET role=?, is_admin=?, is_active=? WHERE id=?",
-                    (new_role, isadm, int(active), int(user_id)))
+                    (role_norm, isadm, int(active), int(user_id)))
+
+        # Upsert permissions
+        execute("""INSERT INTO user_permissions (user_id, can_assign_tasks, can_confirm_task_completion, can_upload_project_docs)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT (user_id) DO UPDATE SET
+                     can_assign_tasks=EXCLUDED.can_assign_tasks,
+                     can_confirm_task_completion=EXCLUDED.can_confirm_task_completion,
+                     can_upload_project_docs=EXCLUDED.can_upload_project_docs
+                """, (int(user_id), 1 if can_assign else 0, 1 if can_confirm else 0, 1 if can_upload_docs else 0))
+
         st.success("Updated.")
         st.rerun()
 
