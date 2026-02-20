@@ -1719,30 +1719,26 @@ def add_working_days(start, n, holidays, cap_dec31=True):
 
 def page_leave():
     st.markdown("<div class='worknest-header'><h2>🧳 Leave</h2></div>", unsafe_allow_html=True)
-    staff_df=fetch_df("SELECT id,name,rank,section FROM staff ORDER BY name")
+    staff_df=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
     hol_df=fetch_df("SELECT date FROM public_holidays")
     holidays=[dtparser.parse(x).date() for x in hol_df["date"].tolist()] if not hol_df.empty else []
 
     if staff_df.empty:
         st.info("Add staff first."); return
 
-    tab_my, tab_roster = st.tabs(["My Leave", "Leave Roster"])
-
-    with tab_my:
-        colA,colB=st.columns([2,1])
-        with colA:
-            if is_admin():
-                staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
-                srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
-            else:
-                # Staff should only manage their own leave privately
-                sid=current_staff_id()
-                if sid is None:
-                    st.error("No staff profile linked to this account."); return
-                srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
-                st.write(f"Applicant: **{srow['name']}**")
-            ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-            start=st.date_input("Start Date", value=date.today(), key="lv_start")
+    colA,colB=st.columns([2,1])
+    with colA:
+        if is_admin():
+            staff_opt=st.selectbox("Applicant", staff_df["name"].tolist(), key="lv_app")
+            srow=staff_df[staff_df["name"]==staff_opt].iloc[0]
+        else:
+            sid=current_staff_id()
+            if sid is None:
+                st.error("No staff profile linked to this account."); return
+            srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
+            st.write(f"Applicant: **{srow['name']}**")
+        ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -1771,12 +1767,12 @@ def page_leave():
                                 max_value=max_days if (max_days and max_days>0) else 60,
                                 value=min(5, max_days or 5), key="lv_req")
 
-            end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
-            st.write(f"Computed End Date: **{end}**")
+        end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
+        st.write(f"Computed End Date: **{end}**")
 
-        with colB:
-            st.markdown("**Casual Balance**")
-            st.metric(label=f"{start.year} casual remaining", value=f"{casual_remaining} days")
+    with colB:
+        st.markdown("**Casual Balance**")
+        st.metric(label=f"{start.year} casual remaining", value=f"{casual_remaining} days")
 
     # --- Reliever enforcement (relaxed for future-year planning and unknown ranks) ---
     all_staff=fetch_df("SELECT id,name,rank FROM staff ORDER BY name")
@@ -1866,78 +1862,14 @@ def page_leave():
             if is_on_leave(ch_id, start, end): can_submit=False; msg="Relieving officer is on leave in the requested period."
             if is_already_relieving(ch_id, start, end): can_submit=False; msg="Relieving officer is already assigned to relieve another staff in the requested period."
 
-        if st.button("📝 Submit Leave Application", key="lv_submit"):
-            if can_submit:
-                reliever_id=int([p for p in pool if p[1]==reliever][0][0])
-                execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
-                        (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
-                st.success("Leave application submitted.")
-            else:
-                st.error(msg or "Validation failed.")
-
-        # Staff should see only their own applications here (private)
-        if not is_admin():
-            my = fetch_df("""
-                SELECT L.id, L.leave_type, L.start_date, L.end_date, L.working_days,
-                       R.name AS reliever, L.status
-                FROM leaves L
-                LEFT JOIN staff R ON R.id = L.relieving_staff_id
-                WHERE L.staff_id = ?
-                ORDER BY date(L.start_date) DESC
-            """, (int(srow["id"]),))
-            st.markdown("---")
-            st.subheader("My Leave Requests")
-            if my.empty:
-                st.info("No leave applications yet.")
-            else:
-                st.dataframe(my.reset_index(drop=True), width='stretch')
-
-    with tab_roster:
-        _render_leave_roster()
-
-
-def _render_leave_roster():
-    """Leave roster is visible to all staff, but sensitive fields (reason/ids) are admin-only."""
-    df=fetch_df("""
-        SELECT L.id,
-               S.name AS staff,
-               S.section,
-               S.rank,
-               L.leave_type,
-               L.start_date,
-               L.end_date,
-               L.working_days,
-               R.name AS reliever,
-               L.status,
-               L.reason
-        FROM leaves L
-        JOIN staff S ON S.id = L.staff_id
-        LEFT JOIN staff R ON R.id = L.relieving_staff_id
-        ORDER BY date(L.start_date) DESC, S.name
-    """)
-    if df.empty:
-        st.info("No leave applications yet.")
-        return
-
-    c1,c2,c3=st.columns(3)
-    with c1:
-        staff_filter = st.selectbox("Filter by staff", ["All"] + sorted(df["staff"].unique().tolist()), key="lvf1_roster")
-    with c2:
-        type_filter = st.selectbox("Filter by type", ["All"] + sorted(df["leave_type"].unique().tolist()), key="lvf2_roster")
-    with c3:
-        years = sorted({dtparser.parse(d).year for d in df["start_date"]})
-        year_filter = st.selectbox("Filter by year", ["All"] + [str(y) for y in years], key="lvf3_roster")
-
-    f=df.copy()
-    if staff_filter!="All": f=f[f["staff"]==staff_filter]
-    if type_filter!="All": f=f[f["leave_type"]==type_filter]
-    if year_filter!="All": f=f[f["start_date"].str.startswith(year_filter)]
-
-    if is_admin():
-        view=f[["staff","section","rank","leave_type","start_date","end_date","working_days","reliever","status","reason"]]
-    else:
-        view=f[["staff","section","rank","leave_type","start_date","end_date","working_days","status"]]
-    st.dataframe(view.reset_index(drop=True), width='stretch')
+    if st.button("📝 Submit Leave Application", key="lv_submit"):
+        if can_submit:
+            reliever_id=int([p for p in pool if p[1]==reliever][0][0])
+            execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
+                    (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
+            st.success("Leave application submitted.")
+        else:
+            st.error(msg or "Validation failed.")
 
 
 def page_chat():
@@ -1996,8 +1928,29 @@ def page_chat():
 
 def page_leave_table():
     st.markdown("<div class='worknest-header'><h2>📄 Leave Table</h2></div>", unsafe_allow_html=True)
-    # Keep this page as a pure roster view with proper privacy rules
-    _render_leave_roster()
+    df=fetch_df("""
+        SELECT L.id, S.name AS staff, S.rank, L.leave_type, L.start_date, L.end_date, L.working_days,
+               R.name AS reliever, L.status, L.reason
+        FROM leaves L
+        JOIN staff S ON S.id = L.staff_id
+        LEFT JOIN staff R ON R.id = L.relieving_staff_id
+        ORDER BY date(L.start_date) DESC, S.name
+    """)
+    if df.empty:
+        st.info("No leave applications yet."); return
+    c1,c2,c3=st.columns(3)
+    with c1:
+        staff_filter = st.selectbox("Filter by staff", ["All"] + sorted(df["staff"].unique().tolist()), key="lvf1")
+    with c2:
+        type_filter = st.selectbox("Filter by type", ["All"] + sorted(df["leave_type"].unique().tolist()), key="lvf2")
+    with c3:
+        years = sorted({dtparser.parse(d).year for d in df["start_date"]})
+        year_filter = st.selectbox("Filter by year", ["All"] + [str(y) for y in years], key="lvf3")
+    f = df.copy()
+    if staff_filter!="All": f = f[f["staff"]==staff_filter]
+    if type_filter!="All": f = f[f["leave_type"]==type_filter]
+    if year_filter!="All": f = f[f["start_date"].str.startswith(year_filter)]
+    st.dataframe(f.reset_index(drop=True), width='stretch')
 
 # ---------- Tasks & Performance ----------
 def _build_expected_biweekly_windows(start_date:date, today:date)->list:
