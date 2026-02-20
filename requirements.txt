@@ -3,3 +3,5 @@ pandas
 numpy
 python-dateutil
 psycopg2-binary
+scikit-learn
+joblib

@@ -7,6 +7,28 @@ from dateutil import parser as dtparser
 import pandas as pd, numpy as np, streamlit as st
 import uuid
 
+# ML (optional)
+try:
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import RandomForestRegressor
+    import joblib
+except Exception:
+    train_test_split = None
+    OneHotEncoder = None
+    ColumnTransformer = None
+    Pipeline = None
+    accuracy_score = None
+    roc_auc_score = None
+    mean_absolute_error = None
+    LogisticRegression = None
+    RandomForestRegressor = None
+    joblib = None
+
 try:
     import psycopg2
     import psycopg2.extras
@@ -196,6 +218,7 @@ CREATE TABLE IF NOT EXISTS biweekly_reports (
   id SERIAL PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   report_date TEXT NOT NULL,
+  uploaded_at TEXT,
   file_path TEXT,
   uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
 );
@@ -300,6 +323,30 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
   total_score INTEGER DEFAULT 0,
   posted_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ml_runs (
+  id SERIAL PRIMARY KEY,
+  model_name TEXT NOT NULL,
+  trained_at TEXT NOT NULL,
+  train_rows INTEGER,
+  metrics_json TEXT,
+  model_path TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ml_predictions (
+  id SERIAL PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+  assignment_id INTEGER REFERENCES task_assignments(id) ON DELETE SET NULL,
+  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+  predicted_overdue_prob REAL,
+  predicted_days_taken REAL,
+  features_json TEXT,
+  actual_overdue INTEGER,
+  actual_days_taken REAL
+);
+
 """
         _exec_script(cur, pg_schema)
 
@@ -322,6 +369,10 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (
             _pg_add_column("ALTER TABLE leaves ADD COLUMN relieving_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
         if not _pg_has_column('leaves', 'status'):
             _pg_add_column("ALTER TABLE leaves ADD COLUMN status TEXT DEFAULT 'Pending'")
+
+        # biweekly_reports: add uploaded_at for true submission timestamp
+        if not _pg_has_column('biweekly_reports', 'uploaded_at'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
         if not _pg_has_column('leaves', 'reason'):
             _pg_add_column("ALTER TABLE leaves ADD COLUMN reason TEXT")
         if not _pg_has_column('leaves', 'request_date'):
@@ -389,7 +440,7 @@ CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NO
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, uploaded_at TEXT, file_path TEXT, uploader_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
 CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
@@ -412,6 +463,13 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(staff)").fetchall()]
             if "dob" not in cols:
                 cur.execute("ALTER TABLE staff ADD COLUMN dob TEXT")
+        except Exception:
+            pass
+
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(biweekly_reports)").fetchall()]
+            if "uploaded_at" not in cols:
+                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
         except Exception:
             pass
 
@@ -770,16 +828,16 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
         (str(ms), str(me)),
     )
 
-    # Prefetch test results in month (per uploader)
+    # Prefetch test results in month (per project) — shared points for all staff posted to the project
     testdf = fetch_df(
-        """SELECT uploader_staff_id AS staff_id, COUNT(1) AS n
+        """SELECT project_id, COUNT(1) AS n
              FROM test_results
-            WHERE uploader_staff_id IS NOT NULL
+            WHERE project_id IS NOT NULL
               AND date(uploaded_at) BETWEEN date(?) AND date(?)
-            GROUP BY uploader_staff_id""",
+            GROUP BY project_id""",
         (str(ms), str(me)),
     )
-    testmap={int(r["staff_id"]): int(r["n"]) for _,r in testdf.iterrows()} if not testdf.empty else {}
+    testproj = {int(r["project_id"]): int(r["n"]) for _, r in testdf.iterrows()} if not testdf.empty else {}
 
     # Biweekly reports scoring: due dates within month
     start=_biweekly_start_date()
@@ -796,14 +854,14 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
     buf_start = ms - dt.timedelta(days=13)
     buf_end   = me + dt.timedelta(days=30)
     rdf = fetch_df(
-        "SELECT project_id, report_date FROM biweekly_reports WHERE date(report_date) BETWEEN date(?) AND date(?)",
+        "SELECT project_id, COALESCE(uploaded_at, report_date) AS submitted_at FROM biweekly_reports WHERE date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)",
         (str(buf_start), str(buf_end)),
     )
     # Map project -> sorted list of report dates
     proj_reports:dict[int,list[dt.date]]={}
     for _,rr in rdf.iterrows():
         pid=int(rr.get("project_id") or 0)
-        rd=_parse_date_safe(rr.get("report_date"))
+        rd=_parse_date_safe(rr.get("submitted_at"))
         if pid and rd:
             proj_reports.setdefault(pid, []).append(rd)
     for pid in list(proj_reports.keys()):
@@ -836,7 +894,7 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
                 used.add(submitted)
                 report_pts += _report_points(due, submitted)
 
-        test_pts = testmap.get(sid, 0) * _test_points()
+        test_pts = sum((testproj.get(pid, 0) for pid in proj_ids), 0) * _test_points()
         base_total = int(task_pts) + int(report_pts) + int(test_pts)
         rows.append({
             "staff_id": sid,
@@ -1230,7 +1288,7 @@ def sidebar_nav():
     logout_button()
 
     base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
-    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control"]
+    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights"]
     pages = base_pages + (admin_pages if is_admin() else [])
 
     return st.sidebar.radio("Go to", pages, key="nav_radio")
@@ -1337,7 +1395,7 @@ def page_dashboard():
                     nd = dtparser.parse(s).date()
             if nd is not None:
                 # Still fetch last submitted report date for context
-                last = fetch_df("SELECT MAX(report_date) d FROM biweekly_reports WHERE project_id=?", (pid,))
+                last = fetch_df("SELECT MAX(COALESCE(uploaded_at, report_date)) d FROM biweekly_reports WHERE project_id=?", (pid,))
                 last_d = None
                 try:
                     if (not last.empty) and ("d" in last.columns):
@@ -1363,7 +1421,7 @@ def page_dashboard():
         except Exception:
             return (True, None, None, f"Invalid start date '{start_date}' — cannot track biweekly schedule")
 
-        last = fetch_df("SELECT MAX(report_date) d FROM biweekly_reports WHERE project_id=?", (pid,))
+        last = fetch_df("SELECT MAX(COALESCE(uploaded_at, report_date)) d FROM biweekly_reports WHERE project_id=?", (pid,))
         last_raw = None
         if (not last.empty) and ("d" in last.columns):
             last_raw = last["d"].iloc[0]
@@ -1638,7 +1696,8 @@ def page_dashboard():
             st.subheader("Biweekly Reports")
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-            rdate = st.date_input("Report Date", value=date.today(), key="bw_date")
+            rdate = st.date_input("Report Period Date", value=date.today(), key="bw_date")
+            st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
             if st.button("⬆️ Upload Report", key="bw_up"):
                 if not allowed:
@@ -1646,8 +1705,8 @@ def page_dashboard():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,file_path,uploader_staff_id) VALUES (?,?,?,?)",
-                                      (pid, str(rdate), path, current_staff_id()))
+                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
+                                      (pid, str(rdate), datetime.now().isoformat(timespec='seconds'), path, current_staff_id()))
                         try:
                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
                         except Exception:
@@ -2162,7 +2221,8 @@ def page_projects():
             st.subheader("Biweekly Reports")
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-            rdate = st.date_input("Report Date", value=date.today(), key="bw_date")
+            rdate = st.date_input("Report Period Date", value=date.today(), key="bw_date")
+            st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
             if st.button("⬆️ Upload Report", key="bw_up"):
                 if not allowed:
@@ -3161,6 +3221,222 @@ def page_help():
 
 
 
+
+# =========================
+# ML helpers (v0 demo)
+# =========================
+def _models_dir()->str:
+    d = os.path.join(DATA_DIR, "models")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _ml_enabled()->bool:
+    return (Pipeline is not None) and (joblib is not None)
+
+def _ml_fetch_training_df()->pd.DataFrame:
+    """
+    Build a training dataset from historical task assignments.
+    Columns:
+      - days_allotted
+      - assignee_section, assignee_rank
+      - title_len
+      - label_overdue (0/1)
+      - label_days_taken (float)
+    """
+    q = """
+    SELECT
+        A.id AS assignment_id,
+        A.staff_id,
+        T.id AS task_id,
+        T.title,
+        T.date_assigned,
+        T.days_allotted,
+        T.due_date,
+        A.status,
+        A.completed_date,
+        S.section AS staff_section,
+        S.rank AS staff_rank
+    FROM task_assignments A
+    JOIN tasks T ON T.id = A.task_id
+    LEFT JOIN staff S ON S.id = A.staff_id
+    WHERE A.staff_id IS NOT NULL
+    """
+    df = fetch_df(q)
+    if df.empty:
+        return df
+    # Feature engineering
+    def _safe_len(x):
+        try: return len(str(x or "").strip())
+        except Exception: return 0
+
+    df["days_allotted"] = pd.to_numeric(df.get("days_allotted"), errors="coerce").fillna(0).astype(int)
+    df["title_len"] = df["title"].apply(_safe_len)
+    df["staff_section"] = df["staff_section"].fillna("unknown").astype(str)
+    df["staff_rank"] = df["staff_rank"].fillna("unknown").astype(str)
+
+    # Labels
+    def _parse_dt(x):
+        try:
+            if x is None or (isinstance(x,float) and pd.isna(x)): return None
+            s=str(x).strip()
+            if s=="" or s.lower() in ("nan","none","null"): return None
+            return dtparser.parse(s)
+        except Exception:
+            return None
+
+    due = df["due_date"].apply(_parse_dt)
+    comp = df["completed_date"].apply(_parse_dt)
+
+    overdue = []
+    days_taken = []
+    for i in range(len(df)):
+        d = due.iloc[i]
+        c = comp.iloc[i]
+        if c is None or d is None:
+            overdue.append(np.nan)
+        else:
+            overdue.append(1 if c.date() > d.date() else 0)
+        # duration label (only when completed)
+        if c is None:
+            days_taken.append(np.nan)
+        else:
+            a = _parse_dt(df.iloc[i].get("date_assigned"))
+            if a is None:
+                days_taken.append(np.nan)
+            else:
+                days_taken.append(max((c.date()-a.date()).days, 0))
+    df["label_overdue"] = overdue
+    df["label_days_taken"] = days_taken
+    return df
+
+def _ml_train_overdue_model(df:pd.DataFrame):
+    d = df.dropna(subset=["label_overdue"]).copy()
+    if d.empty:
+        return None, {}
+    X = d[["days_allotted","title_len","staff_section","staff_rank"]]
+    y = d["label_overdue"].astype(int)
+    cat = ["staff_section","staff_rank"]
+    num = ["days_allotted","title_len"]
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat),
+            ("num", "passthrough", num),
+        ]
+    )
+    model = LogisticRegression(max_iter=1000)
+    pipe = Pipeline(steps=[("pre", pre), ("model", model)])
+    # Train/test split if possible
+    metrics={}
+    try:
+        Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,random_state=42,stratify=y if y.nunique()>1 else None)
+        pipe.fit(Xtr,ytr)
+        yp = pipe.predict(Xte)
+        metrics["accuracy"] = float(accuracy_score(yte, yp))
+        try:
+            if hasattr(pipe, "predict_proba") and y.nunique()>1:
+                pr = pipe.predict_proba(Xte)[:,1]
+                metrics["auc"] = float(roc_auc_score(yte, pr))
+        except Exception:
+            pass
+    except Exception:
+        pipe.fit(X,y)
+    return pipe, metrics
+
+def _ml_train_duration_model(df:pd.DataFrame):
+    d = df.dropna(subset=["label_days_taken"]).copy()
+    if d.empty:
+        return None, {}
+    X = d[["days_allotted","title_len","staff_section","staff_rank"]]
+    y = pd.to_numeric(d["label_days_taken"], errors="coerce").fillna(0.0)
+    cat = ["staff_section","staff_rank"]
+    num = ["days_allotted","title_len"]
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat),
+            ("num", "passthrough", num),
+        ]
+    )
+    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    pipe = Pipeline(steps=[("pre", pre), ("model", model)])
+    metrics={}
+    try:
+        Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.25,random_state=42)
+        pipe.fit(Xtr,ytr)
+        pred = pipe.predict(Xte)
+        metrics["mae"] = float(mean_absolute_error(yte, pred))
+    except Exception:
+        pipe.fit(X,y)
+    return pipe, metrics
+
+def _ml_save_run(model_name:str, pipe, metrics:dict, model_path:str, train_rows:int):
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        execute(
+            "INSERT INTO ml_runs (model_name, trained_at, train_rows, metrics_json, model_path) VALUES (?,?,?,?,?)",
+            (model_name, now, int(train_rows), json.dumps(metrics or {}), model_path),
+        )
+    except Exception:
+        pass
+
+def _ml_log_prediction(model_name:str, task_id:int|None, assignment_id:int|None, staff_id:int|None, p_overdue:float|None, p_days:float|None, features:dict):
+    try:
+        execute(
+            "INSERT INTO ml_predictions (created_at, model_name, task_id, assignment_id, staff_id, predicted_overdue_prob, predicted_days_taken, features_json) VALUES (?,?,?,?,?,?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), model_name, task_id, assignment_id, staff_id, p_overdue, p_days, json.dumps(features or {})),
+        )
+    except Exception:
+        pass
+
+def _ml_load(model_name:str):
+    try:
+        path = os.path.join(_models_dir(), f"{model_name}.joblib")
+        if os.path.exists(path) and joblib is not None:
+            return joblib.load(path)
+    except Exception:
+        pass
+    return None
+
+def page_ml():
+    st.header("🤖 ML / Insights")
+    if not is_admin():
+        st.info("Admin only.")
+        return
+    if not _ml_enabled():
+        st.error("ML dependencies not available. Ensure scikit-learn and joblib are installed.")
+        return
+
+    df = _ml_fetch_training_df()
+    st.caption(f"Training rows available: {len(df)}")
+    with st.expander("Preview training data"):
+        st.dataframe(df.head(50), use_container_width=True)
+
+    col1,col2 = st.columns(2)
+    with col1:
+        if st.button("Train Overdue Risk Model"):
+            pipe, metrics = _ml_train_overdue_model(df)
+            if pipe is None:
+                st.warning("Not enough labeled data to train overdue model.")
+            else:
+                path = os.path.join(_models_dir(), "overdue_risk_v0.joblib")
+                joblib.dump(pipe, path)
+                _ml_save_run("overdue_risk_v0", pipe, metrics, path, len(df))
+                st.success(f"Trained and saved: {path}")
+                st.json(metrics)
+    with col2:
+        if st.button("Train Duration Model"):
+            pipe, metrics = _ml_train_duration_model(df)
+            if pipe is None:
+                st.warning("Not enough completed tasks to train duration model.")
+            else:
+                path = os.path.join(_models_dir(), "duration_v0.joblib")
+                joblib.dump(pipe, path)
+                _ml_save_run("duration_v0", pipe, metrics, path, len(df))
+                st.success(f"Trained and saved: {path}")
+                st.json(metrics)
+
 def main():
     init_db(); apply_styles()
     if not current_user():
@@ -3196,6 +3472,7 @@ def main():
     elif page.startswith("🗂️"): page_tasks()
     elif page.startswith("⬆️"): page_import()
     elif page.startswith("🔐"): page_access_control()
+    elif page.startswith("🤖"): page_ml()
     else: page_dashboard()
 
 
