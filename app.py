@@ -43,8 +43,10 @@ DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(('postgres://','postgres
 
 st.set_page_config(page_title="WorkNest Mini v3.2.4", layout="wide")
 
+
 def inject_mobile_drawer():
     """Enable a slide-in/slide-out sidebar drawer on small screens (mobile)."""
+    # CSS (inject via markdown with unsafe HTML)
     st.markdown(
         """
         <style>
@@ -88,19 +90,41 @@ def inject_mobile_drawer():
           }
         }
         </style>
-        <div class="worknest-drawer-backdrop" id="wn_backdrop" onclick="window.__wnCloseDrawer && window.__wnCloseDrawer()"></div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # HTML + JS (use components.html so script executes, not printed)
+    import streamlit.components.v1 as components
+    components.html(
+        """
+        <div class="worknest-drawer-backdrop" id="wn_backdrop"></div>
         <div class="worknest-drawer-btn" id="wn_drawer_btn">☰</div>
         <script>
         (function(){
           function setOpen(v){
             document.body.classList.toggle('worknest-drawer-open', !!v);
           }
+          function isOpen(){
+            return document.body.classList.contains('worknest-drawer-open');
+          }
+
           window.__wnOpenDrawer = function(){ setOpen(true); };
           window.__wnCloseDrawer = function(){ setOpen(false); };
-          window.__wnToggleDrawer = function(){ setOpen(!document.body.classList.contains('worknest-drawer-open')); };
+          window.__wnToggleDrawer = function(){ setOpen(!isOpen()); };
 
           var btn = document.getElementById('wn_drawer_btn');
-          if(btn){ btn.addEventListener('click', function(e){ e.preventDefault(); window.__wnToggleDrawer(); }); }
+          if(btn){
+            btn.addEventListener('click', function(e){
+              e.preventDefault(); window.__wnToggleDrawer();
+            });
+          }
+          var backdrop = document.getElementById('wn_backdrop');
+          if(backdrop){
+            backdrop.addEventListener('click', function(e){
+              e.preventDefault(); window.__wnCloseDrawer();
+            });
+          }
 
           // Swipe handling: swipe right from left edge opens; swipe left closes
           var touchStartX=null, touchStartY=null;
@@ -109,30 +133,36 @@ def inject_mobile_drawer():
             touchStartX=e.touches[0].clientX;
             touchStartY=e.touches[0].clientY;
           }, {passive:true});
+
           document.addEventListener('touchmove', function(e){
-            if(touchStartX===null) return;
+            if(touchStartX===null || !e.touches || !e.touches.length) return;
             var x=e.touches[0].clientX, y=e.touches[0].clientY;
             var dx=x-touchStartX, dy=y-touchStartY;
+
+            // Ignore small moves or vertical swipes
             if(Math.abs(dx) < 35 || Math.abs(dx) < Math.abs(dy)) return;
 
-            var open=document.body.classList.contains('worknest-drawer-open');
             // open gesture: start near left edge and swipe right
-            if(!open && touchStartX < 25 && dx > 60){
+            if(!isOpen() && touchStartX < 25 && dx > 60){
               setOpen(true); touchStartX=null; return;
             }
             // close gesture: swipe left when open
-            if(open && dx < -60){
+            if(isOpen() && dx < -60){
               setOpen(false); touchStartX=null; return;
             }
           }, {passive:true});
-          document.addEventListener('touchend', function(){ touchStartX=null; touchStartY=null; }, {passive:true});
+
+          document.addEventListener('touchend', function(){
+            touchStartX=null; touchStartY=null;
+          }, {passive:true});
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
+        width=0
     )
 
-inject_mobile_drawer()
+
 
 def safe_parse_date(v):
     """Parse a date string safely; returns datetime.date or None."""
