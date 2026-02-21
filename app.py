@@ -1901,7 +1901,7 @@ def page_dashboard():
                         st.success("Report uploaded and queued for Admin approval.")
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
@@ -2483,7 +2483,7 @@ def page_projects():
                                     pass
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
