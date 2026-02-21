@@ -2056,19 +2056,23 @@ def page_projects():
         if not can_manage_projects():
             st.info("Only Admin can create/update/delete projects.")
 
+        # Streamlit widgets keep values by key; so ensure keys vary by selected project.
+        # This makes the right-side panel instantly reflect the selected project.
+        suffix = f"_{int(selected['id'])}" if selected is not None else "_new"
+
         staff=fetch_df("SELECT id,name,section FROM staff ORDER BY name")
         sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
-        code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
-        name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
-        client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key="proj_client")
-        location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key="proj_loc")
-        start=st.date_input("Start Date", value=(dtparser.parse(selected["start_date"]).date() if selected is not None and pd.notna(selected["start_date"]) else date.today()), key="proj_start")
-        end=st.date_input("End Date", value=(dtparser.parse(selected["end_date"]).date() if selected is not None and pd.notna(selected["end_date"]) else date.today()), key="proj_end")
+        code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key=f"proj_code{suffix}")
+        name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key=f"proj_name{suffix}")
+        client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key=f"proj_client{suffix}")
+        location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key=f"proj_loc{suffix}")
+        start=st.date_input("Start Date", value=(dtparser.parse(selected["start_date"]).date() if selected is not None and pd.notna(selected["start_date"]) else date.today()), key=f"proj_start{suffix}")
+        end=st.date_input("End Date", value=(dtparser.parse(selected["end_date"]).date() if selected is not None and pd.notna(selected["end_date"]) else date.today()), key=f"proj_end{suffix}")
         sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
-        sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key="proj_sup")
+        sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key=f"proj_sup{suffix}")
         colA,colB=st.columns(2)
         with colA:
-            if can_manage_projects() and st.button("💾 Save / Update", key="proj_save"):
+            if can_manage_projects() and st.button("💾 Save / Update", key=f"proj_save{suffix}"):
                 if selected is None:
                     sup_id=None
                     if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
@@ -2083,7 +2087,7 @@ def page_projects():
                     st.success("Project updated.")
                 st.rerun()
         with colB:
-            if (selected is not None) and st.button("🗑️ Delete", key="proj_del"):
+            if (selected is not None) and st.button("🗑️ Delete", key=f"proj_del{suffix}"):
                 execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
                 st.success("Project deleted."); st.rerun()
 
@@ -2556,6 +2560,8 @@ def page_tasks():
         tid=label_map[pick]
         trow=fetch_df("SELECT * FROM tasks WHERE id=?", (tid,)).iloc[0]
         task_dict = dict(trow)
+        # Ensure widget keys vary by selected task so the form reflects the selected task immediately.
+        tkey = f"_{int(tid)}"
         can_edit = can_assign_tasks()
         # Section Heads are restricted to their section only
         if (not is_admin()) and user_role()=='section_head':
@@ -2575,10 +2581,10 @@ def page_tasks():
                 bad = existing_ass["section"].fillna("").str.strip().apply(lambda x: x!=sec).any()
                 if bad:
                     can_edit = False
-                title=st.text_input("Title", value=trow["title"], key="tsk_title", disabled=not can_edit)
-        desc=st.text_area("Description", value=trow["description"] or "", key="tsk_desc", disabled=not can_edit)
-        date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key="tsk_da", disabled=not can_edit)
-        due=st.date_input("Due date", value=dtparser.parse(trow["due_date"]).date(), key="tsk_due", disabled=not can_edit)
+        title=st.text_input("Title", value=trow["title"], key=f"tsk_title{tkey}", disabled=not can_edit)
+        desc=st.text_area("Description", value=trow["description"] or "", key=f"tsk_desc{tkey}", disabled=not can_edit)
+        date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key=f"tsk_da{tkey}", disabled=not can_edit)
+        due=st.date_input("Due date", value=dtparser.parse(trow["due_date"]).date(), key=f"tsk_due{tkey}", disabled=not can_edit)
         da=int(max((due - date_assigned).days + 1, 1))
         st.write(f"Days allotted (auto): **{da}**")
         proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
@@ -2586,12 +2592,17 @@ def page_tasks():
         if pd.notna(trow["project_id"]):
             pr=projects[projects["id"]==int(trow["project_id"])]
             if not pr.empty: proj_value=f"{pr['code'].iloc[0]} — {pr['name'].iloc[0]}"
-        proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key="tsk_proj", disabled=not can_edit)
-        assignees=st.multiselect("Assignees", staff_allowed["name"].tolist(), key="tsk_asg",
-                                 default=fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist())
+        proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key=f"tsk_proj{tkey}", disabled=not can_edit)
+        assignees=st.multiselect(
+            "Assignees",
+            staff_allowed["name"].tolist(),
+            key=f"tsk_asg{tkey}",
+            default=fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist(),
+            disabled=not can_edit,
+        )
         colA,colB,colC=st.columns(3)
         with colA:
-            if st.button("💾 Save", key="tsk_save", disabled=not can_edit):
+            if st.button("💾 Save", key=f"tsk_save{tkey}", disabled=not can_edit):
                 if not can_edit:
                     st.warning("You don't have permission to edit this task.")
                 else:
@@ -2607,7 +2618,7 @@ def page_tasks():
             # Completion workflow: only Admin or permitted Section Heads can confirm completion.
             can_confirm = can_confirm_task_completion()
             btn_label = "✅ Confirm Completed (today)" if not is_admin() else "✅ Admin: Certify Completed (today)"
-            if st.button(btn_label, key="tsk_done", disabled=not can_confirm):
+            if st.button(btn_label, key=f"tsk_done{tkey}", disabled=not can_confirm):
                 if not can_confirm:
                     st.warning("You don't have permission to confirm completion.")
                 else:
@@ -2639,7 +2650,7 @@ def page_tasks():
 
             # Delete remains Admin-only
             if is_admin():
-                if st.button("🗑️ Admin: Delete Task", key="tsk_del"):
+                if st.button("🗑️ Admin: Delete Task", key=f"tsk_del{tkey}"):
                     execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
                     execute("DELETE FROM tasks WHERE id=?", (tid,))
                     st.success("Task deleted."); st.rerun()
@@ -2751,31 +2762,10 @@ def page_tasks():
         df["score"]=df.apply(score_row, axis=1)
         st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
-    st.subheader("📊 Performance Index (Transparent)")
-    st.caption("Points are calculated from task completion timeliness + bi‑weekly report timeliness + test report submissions. No hidden math.")
-    sdf = fetch_df("SELECT id, name, rank, section FROM staff ORDER BY name")
-    rows=[]
-    for _,sr in sdf.iterrows():
-        sid=int(sr["id"])
-        pts=compute_staff_activity_points(sid)
-        rows.append({
-            "Name": sr.get("name"),
-            "Rank": sr.get("rank"),
-            "Section": sr.get("section"),
-            "Task Points": pts["task_points"],
-            "Report Points": pts["report_points"],
-            "Test Points": pts["test_points"],
-            "Total Points": pts["total"],
-        })
-    df_pts = pd.DataFrame(rows).sort_values(["Total Points","Test Points","Report Points","Task Points","Name"], ascending=[False,False,False,False,True])
-    st.dataframe(df_pts, use_container_width=True)
-    with st.expander("How points are calculated"):
-        st.markdown("""- **Tasks**: completed within allotted days = **3 pts**; within **1.5×** allotted days = **2 pts**; beyond **1.5×** = **1 pt**.  
-- **Bi‑weekly reports (per project you are posted to)**: submitted on/before due date = **3 pts**; within 7 days late = **2 pts**; after 7 days = **1 pt**.  
-- **Test reports**: any submitted test report = **3 pts**.""")
-
     st.divider()
-    st.subheader("🏆 Staff of the Month")
+    st.subheader("📊 Monthly Performance Scoreboard")
+    st.caption("This scoreboard is the single source of truth for monthly points. Staff of the Month is simply the top scorer for the selected month.")
+
     c1,c2,c3=st.columns([2,2,3])
     with c1:
         sel_month = st.date_input("Month", value=_month_start(_today()), help="Select any date in the month.")
@@ -2799,12 +2789,17 @@ def page_tasks():
             st.button("🔄 Compute/Refresh month", disabled=True, help="Only Admin can recompute/store monthly performance.")
 
     lb = get_monthly_leaderboard(ms, include_soft=inc_soft)
+    with st.expander("How points are calculated", expanded=False):
+        st.markdown("""- **Tasks (completed in the selected month)**: within allotted days = **3 pts**; within **1.5×** allotted days = **2 pts**; beyond **1.5×** = **1 pt**.  
+- **Bi‑weekly reports (per project you are posted to; due dates within the selected month)**: on/before due date = **3 pts**; within 7 days late = **2 pts**; after 7 days = **1 pt**.  
+- **Test results (submitted in the selected month)**: each submission = **3 pts** (shared across staff posted to the project).""")
+
     if lb.empty:
-        st.info("No monthly records yet. Click **Compute/Refresh month**.")
+        st.info("No monthly records yet. Admin should click **Compute/Refresh month**.")
     else:
         st.dataframe(lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Reliability","Attention to Detail","Total Score"]] if inc_soft else lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]], use_container_width=True)
         top = lb.iloc[0]
-        st.success(f"Current Staff of the Month: **{top['Name']}** — {int(top['Total Score'])} points")
+        st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
 
     if is_admin():
         st.markdown("#### Admin: soft-factor scoring")
