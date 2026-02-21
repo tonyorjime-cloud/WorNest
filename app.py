@@ -593,7 +593,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 cur.execute("ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT")
             if "is_backlog" not in cols:
                 cur.execute("ALTER TABLE biweekly_reports ADD COLUMN is_backlog INTEGER DEFAULT 0")
-except Exception:
+        except Exception:
             pass
 
 
