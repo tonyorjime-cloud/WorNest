@@ -469,30 +469,7 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
         if not _pg_has_column('leaves', 'request_date'):
             _pg_add_column("ALTER TABLE leaves ADD COLUMN request_date TEXT")
 
-        
-        # biweekly_reports: approvals + backlog
-        if not _pg_has_column('biweekly_reports', 'status'):
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN status TEXT DEFAULT 'PENDING'")
-        if not _pg_has_column('biweekly_reports', 'reviewed_by_staff_id'):
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
-        if not _pg_has_column('biweekly_reports', 'reviewed_at'):
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT")
-        if not _pg_has_column('biweekly_reports', 'is_backlog'):
-            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN is_backlog INTEGER DEFAULT 0")
-
-        # test_results: approvals + backlog + test_date
-        if not _pg_has_column('test_results', 'status'):
-            _pg_add_column("ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'")
-        if not _pg_has_column('test_results', 'reviewed_by_staff_id'):
-            _pg_add_column("ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
-        if not _pg_has_column('test_results', 'reviewed_at'):
-            _pg_add_column("ALTER TABLE test_results ADD COLUMN reviewed_at TEXT")
-        if not _pg_has_column('test_results', 'is_backlog'):
-            _pg_add_column("ALTER TABLE test_results ADD COLUMN is_backlog INTEGER DEFAULT 0")
-        if not _pg_has_column('test_results', 'test_date'):
-            _pg_add_column("ALTER TABLE test_results ADD COLUMN test_date TEXT")
-
-# users: align fields
+        # users: align fields
         if not _pg_has_column('users', 'role'):
             _pg_add_column("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
         if not _pg_has_column('users', 'is_active'):
@@ -584,31 +561,6 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(biweekly_reports)").fetchall()]
             if "uploaded_at" not in cols:
                 cur.execute("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
-        
-            if "status" not in cols:
-                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN status TEXT DEFAULT 'PENDING'")
-            if "reviewed_by_staff_id" not in cols:
-                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER")
-            if "reviewed_at" not in cols:
-                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT")
-            if "is_backlog" not in cols:
-                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN is_backlog INTEGER DEFAULT 0")
-except Exception:
-            pass
-
-
-        try:
-            cols = [r[1] for r in cur.execute("PRAGMA table_info(test_results)").fetchall()]
-            if "status" not in cols:
-                cur.execute("ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'")
-            if "reviewed_by_staff_id" not in cols:
-                cur.execute("ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER")
-            if "reviewed_at" not in cols:
-                cur.execute("ALTER TABLE test_results ADD COLUMN reviewed_at TEXT")
-            if "is_backlog" not in cols:
-                cur.execute("ALTER TABLE test_results ADD COLUMN is_backlog INTEGER DEFAULT 0")
-            if "test_date" not in cols:
-                cur.execute("ALTER TABLE test_results ADD COLUMN test_date TEXT")
         except Exception:
             pass
 
@@ -1004,12 +956,7 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
              FROM test_results
             WHERE project_id IS NOT NULL
               AND COALESCE(status,'APPROVED')='APPROVED'
-              AND date(
-                    CASE
-                      WHEN COALESCE(is_backlog,0)=1 AND test_date IS NOT NULL THEN test_date
-                      ELSE COALESCE(reviewed_at, uploaded_at)
-                    END
-                  ) BETWEEN date(?) AND date(?)
+              AND date(uploaded_at) BETWEEN date(?) AND date(?)
             GROUP BY project_id""",
         (str(ms), str(me)),
     )
@@ -1030,7 +977,7 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
     buf_start = ms - dt.timedelta(days=13)
     buf_end   = me + dt.timedelta(days=30)
     rdf = fetch_df(
-        "SELECT project_id, CASE WHEN COALESCE(is_backlog,0)=1 THEN report_date ELSE COALESCE(reviewed_at, uploaded_at, report_date) END AS submitted_at FROM biweekly_reports WHERE COALESCE(status,'APPROVED')='APPROVED' AND date(CASE WHEN COALESCE(is_backlog,0)=1 THEN report_date ELSE COALESCE(reviewed_at, uploaded_at, report_date) END) BETWEEN date(?) AND date(?)",
+        "SELECT project_id, COALESCE(uploaded_at, report_date) AS submitted_at FROM biweekly_reports WHERE COALESCE(status,'APPROVED')='APPROVED' AND date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)",
         (str(buf_start), str(buf_end)),
     )
     # Map project -> sorted list of report dates
@@ -1133,7 +1080,7 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
     if (not already.empty) and (not force):
         return (False, "Already posted for this month")
 
-    lb = get_monthly_sotm_delta(ms, include_soft=None)
+    lb = get_monthly_leaderboard(ms, include_soft=None)
     if lb.empty:
         return (False, "No performance records for month")
     top = lb.iloc[0]
@@ -1144,7 +1091,7 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
     msg=(
         f"🏆 Staff of the Month — {month_label}\n\n"
         f"🥇 {top['Name']} ({top.get('Rank','')})\n"
-        f"Delta Score: {int(top.get('Delta',0))} points (this month {total}, last month {int(top.get('Prev Total',0))})\n\n"
+        f"Total Score: {total} points\n\n"
         f"Breakdown: Tasks {int(top['Task Points'])} | Biweekly Reports {int(top['Report Points'])} | Test Reports {int(top['Test Points'])}"
     )
     if inc:
@@ -1170,31 +1117,6 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
         execute("INSERT OR REPLACE INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)", (mstr, top_sid, total, nowiso))
 
     return (True, "Posted")
-
-
-def get_monthly_sotm_delta(month:dt.date, include_soft:bool|None=None)->pd.DataFrame:
-    """Return leaderboard with month-on-month delta (this month total - previous month total).
-    If previous month record is missing for a staff, treat previous total as 0.
-    """
-    ms=_month_start(month)
-    prev=_month_start(ms - dt.timedelta(days=1))
-    cur = get_monthly_leaderboard(ms, include_soft=include_soft)
-    if cur.empty:
-        return cur
-    prev_df = get_monthly_leaderboard(prev, include_soft=include_soft)
-    prev_map = {}
-    if not prev_df.empty:
-        for _,r in prev_df.iterrows():
-            prev_map[int(r.get("staff_id") or r.get("staff_id",0) or 0)] = int(r.get("Total Score") or 0)
-
-    # cur returned by get_monthly_leaderboard doesn't include staff_id column after rename? It does. We'll keep.
-    cur = cur.copy()
-    cur["Prev Total"] = cur["staff_id"].apply(lambda x: int(prev_map.get(int(x),0)))
-    cur["Delta"] = cur["Total Score"].fillna(0).astype(int) - cur["Prev Total"].fillna(0).astype(int)
-    cur = cur.sort_values(["Delta","Total Score"], ascending=[False,False])
-    return cur
-
-
 
 def smtp_configured()->bool:
     return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
@@ -1864,13 +1786,6 @@ def page_dashboard():
             batch_needed = (ttype in ["steel","reinforcement"])
             batch_id = st.text_input("Batch ID (required for batch tests)", key="t_batch") if batch_needed else None
 
-            # Backlog upload controls (Admin only): score tests in the month of the test_date
-            is_backlog = False
-            test_date = None
-            if is_admin():
-                is_backlog = st.checkbox("Backlog upload (score by Test Date)", value=False, key="t_backlog")
-                test_date = st.date_input("Test Date (for backlog scoring)", value=date.today(), key="t_test_date") if is_backlog else None
-
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
 
@@ -1884,8 +1799,8 @@ def page_dashboard():
                     else:
                         path=save_uploaded_file(up, f"project_{pid}/tests")
                         if path:
-                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,status,is_backlog,test_date)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id(), "PENDING", 1 if is_backlog else 0, str(test_date) if test_date else None))
+                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,status)
+                                       VALUES (?,?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id(), "PENDING"))
                             st.success("Test uploaded.")
                         else:
                             st.error("Select a file first.")
@@ -1941,10 +1856,6 @@ def page_dashboard():
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             rdate = st.date_input("Report Period Date", value=date.today(), key="bw_date")
-            # Backlog upload controls (Admin only): score reports in the month of the period date
-            is_backlog = False
-            if is_admin():
-                is_backlog = st.checkbox("Backlog upload (score by Period Date)", value=False, key="bw_backlog")
             st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
             if st.button("⬆️ Upload Report", key="bw_up"):
@@ -1954,13 +1865,13 @@ def page_dashboard():
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
                         rid = execute(
-                            "INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id,status,is_backlog) VALUES (?,?,?,?,?,?,?)",
-                            (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id(), "PENDING", 1 if is_backlog else 0),
+                            "INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id,status) VALUES (?,?,?,?,?,?)",
+                            (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id(), "PENDING"),
                         )
                         st.success("Report uploaded and queued for Admin approval.")
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, COALESCE(is_backlog,0) AS is_backlog FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
@@ -1981,7 +1892,7 @@ def page_dashboard():
                                             (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
                                     try:
                                         pdue = _parse_date_safe(r.get('report_date'))
-                                        if pdue and int(r.get('is_backlog') or 0)==0:
+                                        if pdue:
                                             execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(pdue + timedelta(days=14)), int(pid)))
                                     except Exception:
                                         pass
@@ -3113,13 +3024,8 @@ def page_tasks():
         st.info("No monthly records yet. Admin should click **Compute/Refresh month**.")
     else:
         st.dataframe(lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Reliability","Attention to Detail","Total Score"]] if inc_soft else lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]], use_container_width=True)
-        # Staff of the Month: month-on-month delta (this month total - previous month total)
-        delta_lb = get_monthly_sotm_delta(ms, include_soft=inc_soft)
-        top = delta_lb.iloc[0] if not delta_lb.empty else lb.iloc[0]
-        if not delta_lb.empty:
-            st.success(f"Staff of the Month (delta): **{top['Name']}** — Δ{int(top['Delta'])} (this month {int(top['Total Score'])}, last month {int(top['Prev Total'])})")
-        else:
-            st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
+        top = lb.iloc[0]
+        st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
 
     if is_admin():
         st.markdown("#### Admin: soft-factor scoring")
