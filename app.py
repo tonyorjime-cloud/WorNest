@@ -2408,7 +2408,7 @@ def page_projects():
                 WHERE tr.project_id=?
                   AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=?)
                 ORDER BY tr.uploaded_at DESC
-            """,(pid,))
+            """,(pid, current_staff_id() or -1,))
             if tdf.empty:
                 st.info("No tests uploaded yet.")
             else:
