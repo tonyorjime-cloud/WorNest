@@ -43,6 +43,97 @@ DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(('postgres://','postgres
 
 st.set_page_config(page_title="WorkNest Mini v3.2.4", layout="wide")
 
+def inject_mobile_drawer():
+    """Enable a slide-in/slide-out sidebar drawer on small screens (mobile)."""
+    st.markdown(
+        """
+        <style>
+        /* Drawer behavior only on narrow screens */
+        @media (max-width: 900px){
+          [data-testid="stSidebar"]{
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: 82vw;
+            max-width: 340px;
+            transform: translateX(-105%);
+            transition: transform .25s ease;
+            z-index: 1002;
+          }
+          body.worknest-drawer-open [data-testid="stSidebar"]{
+            transform: translateX(0);
+          }
+          .worknest-drawer-backdrop{
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,.35);
+            z-index: 1001;
+          }
+          body.worknest-drawer-open .worknest-drawer-backdrop{display:block;}
+          .worknest-drawer-btn{
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 1003;
+            border-radius: 10px;
+            padding: 8px 10px;
+            background: rgba(20,20,20,.55);
+            border: 1px solid rgba(255,255,255,.12);
+            color: #fff;
+            font-weight: 700;
+            cursor: pointer;
+            user-select: none;
+          }
+        }
+        </style>
+        <div class="worknest-drawer-backdrop" id="wn_backdrop" onclick="window.__wnCloseDrawer && window.__wnCloseDrawer()"></div>
+        <div class="worknest-drawer-btn" id="wn_drawer_btn">☰</div>
+        <script>
+        (function(){
+          function setOpen(v){
+            document.body.classList.toggle('worknest-drawer-open', !!v);
+          }
+          window.__wnOpenDrawer = function(){ setOpen(true); };
+          window.__wnCloseDrawer = function(){ setOpen(false); };
+          window.__wnToggleDrawer = function(){ setOpen(!document.body.classList.contains('worknest-drawer-open')); };
+
+          var btn = document.getElementById('wn_drawer_btn');
+          if(btn){ btn.addEventListener('click', function(e){ e.preventDefault(); window.__wnToggleDrawer(); }); }
+
+          // Swipe handling: swipe right from left edge opens; swipe left closes
+          var touchStartX=null, touchStartY=null;
+          document.addEventListener('touchstart', function(e){
+            if(!e.touches || !e.touches.length) return;
+            touchStartX=e.touches[0].clientX;
+            touchStartY=e.touches[0].clientY;
+          }, {passive:true});
+          document.addEventListener('touchmove', function(e){
+            if(touchStartX===null) return;
+            var x=e.touches[0].clientX, y=e.touches[0].clientY;
+            var dx=x-touchStartX, dy=y-touchStartY;
+            if(Math.abs(dx) < 35 || Math.abs(dx) < Math.abs(dy)) return;
+
+            var open=document.body.classList.contains('worknest-drawer-open');
+            // open gesture: start near left edge and swipe right
+            if(!open && touchStartX < 25 && dx > 60){
+              setOpen(true); touchStartX=null; return;
+            }
+            // close gesture: swipe left when open
+            if(open && dx < -60){
+              setOpen(false); touchStartX=null; return;
+            }
+          }, {passive:true});
+          document.addEventListener('touchend', function(){ touchStartX=null; touchStartY=null; }, {passive:true});
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+inject_mobile_drawer()
+
 def safe_parse_date(v):
     """Parse a date string safely; returns datetime.date or None."""
     if v is None: return None
@@ -378,7 +469,30 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
         if not _pg_has_column('leaves', 'request_date'):
             _pg_add_column("ALTER TABLE leaves ADD COLUMN request_date TEXT")
 
-        # users: align fields
+        
+        # biweekly_reports: approvals + backlog
+        if not _pg_has_column('biweekly_reports', 'status'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN status TEXT DEFAULT 'PENDING'")
+        if not _pg_has_column('biweekly_reports', 'reviewed_by_staff_id'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+        if not _pg_has_column('biweekly_reports', 'reviewed_at'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT")
+        if not _pg_has_column('biweekly_reports', 'is_backlog'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN is_backlog INTEGER DEFAULT 0")
+
+        # test_results: approvals + backlog + test_date
+        if not _pg_has_column('test_results', 'status'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'")
+        if not _pg_has_column('test_results', 'reviewed_by_staff_id'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL")
+        if not _pg_has_column('test_results', 'reviewed_at'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN reviewed_at TEXT")
+        if not _pg_has_column('test_results', 'is_backlog'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN is_backlog INTEGER DEFAULT 0")
+        if not _pg_has_column('test_results', 'test_date'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN test_date TEXT")
+
+# users: align fields
         if not _pg_has_column('users', 'role'):
             _pg_add_column("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
         if not _pg_has_column('users', 'is_active'):
@@ -470,6 +584,31 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             cols = [r[1] for r in cur.execute("PRAGMA table_info(biweekly_reports)").fetchall()]
             if "uploaded_at" not in cols:
                 cur.execute("ALTER TABLE biweekly_reports ADD COLUMN uploaded_at TEXT")
+        
+            if "status" not in cols:
+                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN status TEXT DEFAULT 'PENDING'")
+            if "reviewed_by_staff_id" not in cols:
+                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER")
+            if "reviewed_at" not in cols:
+                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT")
+            if "is_backlog" not in cols:
+                cur.execute("ALTER TABLE biweekly_reports ADD COLUMN is_backlog INTEGER DEFAULT 0")
+except Exception:
+            pass
+
+
+        try:
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(test_results)").fetchall()]
+            if "status" not in cols:
+                cur.execute("ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'")
+            if "reviewed_by_staff_id" not in cols:
+                cur.execute("ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER")
+            if "reviewed_at" not in cols:
+                cur.execute("ALTER TABLE test_results ADD COLUMN reviewed_at TEXT")
+            if "is_backlog" not in cols:
+                cur.execute("ALTER TABLE test_results ADD COLUMN is_backlog INTEGER DEFAULT 0")
+            if "test_date" not in cols:
+                cur.execute("ALTER TABLE test_results ADD COLUMN test_date TEXT")
         except Exception:
             pass
 
@@ -532,12 +671,43 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
         if DB_IS_POSTGRES:
             execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password INTEGER DEFAULT 0")
             execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT")
+            # Governance: approvals for uploads (reports/tests)
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS reviewed_by_staff_id INTEGER")
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS review_note TEXT")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_by_staff_id INTEGER")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS review_note TEXT")
+            # Backfill NULL statuses to APPROVED for legacy rows (so existing history doesn't vanish)
+            execute("UPDATE biweekly_reports SET status='APPROVED' WHERE status IS NULL")
+            execute("UPDATE test_results SET status='APPROVED' WHERE status IS NULL")
+
         else:
             # SQLite: IF NOT EXISTS for columns is not supported; ignore errors
             try: execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
             except Exception: pass
             try: execute("ALTER TABLE users ADD COLUMN password_changed_at TEXT")
             except Exception: pass
+            # Governance: approvals for uploads (reports/tests)
+            for q in [
+                "ALTER TABLE biweekly_reports ADD COLUMN status TEXT DEFAULT 'PENDING'",
+                "ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER",
+                "ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT",
+                "ALTER TABLE biweekly_reports ADD COLUMN review_note TEXT",
+                "ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'",
+                "ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER",
+                "ALTER TABLE test_results ADD COLUMN reviewed_at TEXT",
+                "ALTER TABLE test_results ADD COLUMN review_note TEXT",
+            ]:
+                try: execute(q)
+                except Exception: pass
+            try: execute("UPDATE biweekly_reports SET status='APPROVED' WHERE status IS NULL")
+            except Exception: pass
+            try: execute("UPDATE test_results SET status='APPROVED' WHERE status IS NULL")
+            except Exception: pass
+
     except Exception:
         pass
 
@@ -833,7 +1003,13 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
         """SELECT project_id, COUNT(1) AS n
              FROM test_results
             WHERE project_id IS NOT NULL
-              AND date(uploaded_at) BETWEEN date(?) AND date(?)
+              AND COALESCE(status,'APPROVED')='APPROVED'
+              AND date(
+                    CASE
+                      WHEN COALESCE(is_backlog,0)=1 AND test_date IS NOT NULL THEN test_date
+                      ELSE COALESCE(reviewed_at, uploaded_at)
+                    END
+                  ) BETWEEN date(?) AND date(?)
             GROUP BY project_id""",
         (str(ms), str(me)),
     )
@@ -854,7 +1030,7 @@ def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
     buf_start = ms - dt.timedelta(days=13)
     buf_end   = me + dt.timedelta(days=30)
     rdf = fetch_df(
-        "SELECT project_id, COALESCE(uploaded_at, report_date) AS submitted_at FROM biweekly_reports WHERE date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)",
+        "SELECT project_id, CASE WHEN COALESCE(is_backlog,0)=1 THEN report_date ELSE COALESCE(reviewed_at, uploaded_at, report_date) END AS submitted_at FROM biweekly_reports WHERE COALESCE(status,'APPROVED')='APPROVED' AND date(CASE WHEN COALESCE(is_backlog,0)=1 THEN report_date ELSE COALESCE(reviewed_at, uploaded_at, report_date) END) BETWEEN date(?) AND date(?)",
         (str(buf_start), str(buf_end)),
     )
     # Map project -> sorted list of report dates
@@ -957,7 +1133,7 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
     if (not already.empty) and (not force):
         return (False, "Already posted for this month")
 
-    lb = get_monthly_leaderboard(ms, include_soft=None)
+    lb = get_monthly_sotm_delta(ms, include_soft=None)
     if lb.empty:
         return (False, "No performance records for month")
     top = lb.iloc[0]
@@ -968,7 +1144,7 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
     msg=(
         f"🏆 Staff of the Month — {month_label}\n\n"
         f"🥇 {top['Name']} ({top.get('Rank','')})\n"
-        f"Total Score: {total} points\n\n"
+        f"Delta Score: {int(top.get('Delta',0))} points (this month {total}, last month {int(top.get('Prev Total',0))})\n\n"
         f"Breakdown: Tasks {int(top['Task Points'])} | Biweekly Reports {int(top['Report Points'])} | Test Reports {int(top['Test Points'])}"
     )
     if inc:
@@ -994,6 +1170,31 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
         execute("INSERT OR REPLACE INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)", (mstr, top_sid, total, nowiso))
 
     return (True, "Posted")
+
+
+def get_monthly_sotm_delta(month:dt.date, include_soft:bool|None=None)->pd.DataFrame:
+    """Return leaderboard with month-on-month delta (this month total - previous month total).
+    If previous month record is missing for a staff, treat previous total as 0.
+    """
+    ms=_month_start(month)
+    prev=_month_start(ms - dt.timedelta(days=1))
+    cur = get_monthly_leaderboard(ms, include_soft=include_soft)
+    if cur.empty:
+        return cur
+    prev_df = get_monthly_leaderboard(prev, include_soft=include_soft)
+    prev_map = {}
+    if not prev_df.empty:
+        for _,r in prev_df.iterrows():
+            prev_map[int(r.get("staff_id") or r.get("staff_id",0) or 0)] = int(r.get("Total Score") or 0)
+
+    # cur returned by get_monthly_leaderboard doesn't include staff_id column after rename? It does. We'll keep.
+    cur = cur.copy()
+    cur["Prev Total"] = cur["staff_id"].apply(lambda x: int(prev_map.get(int(x),0)))
+    cur["Delta"] = cur["Total Score"].fillna(0).astype(int) - cur["Prev Total"].fillna(0).astype(int)
+    cur = cur.sort_values(["Delta","Total Score"], ascending=[False,False])
+    return cur
+
+
 
 def smtp_configured()->bool:
     return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
@@ -1287,6 +1488,21 @@ def sidebar_nav():
     if u: st.sidebar.markdown(f"**User:** {u['username']}  \n**Role:** {user_role()}")
     logout_button()
 
+    # ---- Navigation control (avoid modifying widget state after creation) ----
+    # If another page requested a redirect, apply it *before* the radio widget is instantiated.
+    _pending_nav = st.session_state.pop("_pending_nav", None)
+    if _pending_nav:
+        st.session_state["nav_radio"] = _pending_nav
+
+    # If user must change password, force navigation to Account and limit pages.
+    try:
+        if u and int(u.get("must_change_password") or 0) == 1:
+            st.session_state["nav_radio"] = "⚙️ Account"
+            forced_pages=["⚙️ Account","❓ Help"]
+            return st.sidebar.radio("Go to", forced_pages, key="nav_radio")
+    except Exception:
+        pass
+
     base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
     admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights"]
     pages = base_pages + (admin_pages if is_admin() else [])
@@ -1380,7 +1596,7 @@ def page_dashboard():
     col3.metric("Open Tasks", len(open_tasks))
 
     def project_core_docs_status(pid):
-        df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid,))
+        df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid, current_staff_id() or -1,))
         present=set(df["category"]) if not df.empty else set()
         missing=[c for c in CORE_DOC_CATEGORIES if c not in present]
         return present, missing
@@ -1648,6 +1864,13 @@ def page_dashboard():
             batch_needed = (ttype in ["steel","reinforcement"])
             batch_id = st.text_input("Batch ID (required for batch tests)", key="t_batch") if batch_needed else None
 
+            # Backlog upload controls (Admin only): score tests in the month of the test_date
+            is_backlog = False
+            test_date = None
+            if is_admin():
+                is_backlog = st.checkbox("Backlog upload (score by Test Date)", value=False, key="t_backlog")
+                test_date = st.date_input("Test Date (for backlog scoring)", value=date.today(), key="t_test_date") if is_backlog else None
+
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
 
@@ -1661,20 +1884,21 @@ def page_dashboard():
                     else:
                         path=save_uploaded_file(up, f"project_{pid}/tests")
                         if path:
-                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id)
-                                       VALUES (?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id()))
+                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,status,is_backlog,test_date)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id(), "PENDING", 1 if is_backlog else 0, str(test_date) if test_date else None))
                             st.success("Test uploaded.")
                         else:
                             st.error("Select a file first.")
 
             # List
             tdf=fetch_df("""
-                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at
+                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at, COALESCE(tr.status,'APPROVED') AS status
                 FROM test_results tr
                 LEFT JOIN buildings b ON b.id=tr.building_id
                 WHERE tr.project_id=?
+                  AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=?)
                 ORDER BY tr.uploaded_at DESC
-            """,(pid,))
+            """,(pid, current_staff_id() or -1,))
             if tdf.empty:
                 st.info("No tests uploaded yet.")
             else:
@@ -1687,9 +1911,29 @@ def page_dashboard():
                     with colA: st.write(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n*{r['uploaded_at']}*")
                     with colB: file_download_button("⬇️ Download", r["file_path"], key=f"tdl{r['id']}")
                     with colC:
-                        if is_admin() and st.button("🗑️", key=f"tdel{r['id']}"):
-                            execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
-                            st.experimental_rerun()
+                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
+                        if is_admin():
+                            a1,a2,a3 = st.columns([1,1,1])
+                            with a1:
+                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"tapp{r['id']}"):
+                                    execute("UPDATE test_results SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
+                                    st.rerun()
+                            with a2:
+                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"trej{r['id']}"):
+                                    execute("UPDATE test_results SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
+                                    st.rerun()
+                            with a3:
+                                if st.button("🗑️ Delete", key=f"tdel{r['id']}"):
+                                    # remove file too
+                                    try:
+                                        fp=str(r.get("file_path") or "")
+                                        if fp and os.path.exists(fp): os.remove(fp)
+                                    except Exception:
+                                        pass
+                                    execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
+                                    st.rerun()
 
         # Biweekly Reports
         with tabs[3]:
@@ -1697,6 +1941,10 @@ def page_dashboard():
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             rdate = st.date_input("Report Period Date", value=date.today(), key="bw_date")
+            # Backlog upload controls (Admin only): score reports in the month of the period date
+            is_backlog = False
+            if is_admin():
+                is_backlog = st.checkbox("Backlog upload (score by Period Date)", value=False, key="bw_backlog")
             st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
             if st.button("⬆️ Upload Report", key="bw_up"):
@@ -1705,38 +1953,53 @@ def page_dashboard():
                 else:
                     path=save_uploaded_file(up, f"project_{pid}/reports")
                     if path:
-                        rid = execute("INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id) VALUES (?,?,?,?,?)",
-                                      (pid, str(rdate), datetime.now().isoformat(timespec='seconds'), path, current_staff_id()))
-                        try:
-                            execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(rdate + timedelta(days=14)), int(pid)))
-                        except Exception:
-                            pass
-                        st.success("Report uploaded.")
-                        sid = current_staff_id()
-                        if sid is not None:
-                            try:
-                                execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
-                                        (int(sid), "biweekly", int(rid), 5, datetime.now().isoformat(timespec="seconds")))
-                            except Exception:
-                                pass
-                        posted = fetch_df("SELECT staff_id FROM project_staff WHERE project_id=?", (pid,))
-                        if not posted.empty:
-                            for _,pr in posted.iterrows():
-                                try:
-                                    execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
-                                            (int(pr["staff_id"]), "biweekly", int(rid), 5, datetime.now().isoformat(timespec="seconds")))
-                                except Exception:
-                                    pass
+                        rid = execute(
+                            "INSERT INTO biweekly_reports (project_id,report_date,uploaded_at,file_path,uploader_staff_id,status,is_backlog) VALUES (?,?,?,?,?,?,?)",
+                            (pid, str(rdate), datetime.now().isoformat(timespec="seconds"), path, current_staff_id(), "PENDING", 1 if is_backlog else 0),
+                        )
+                        st.success("Report uploaded and queued for Admin approval.")
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,file_path FROM biweekly_reports WHERE project_id=? ORDER BY date(report_date) DESC",(pid,))
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, COALESCE(is_backlog,0) AS is_backlog FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
                 for _,r in rdf.iterrows():
-                    colA,colB=st.columns([3,1])
-                    with colA: st.write(f"**{r['report_date']}** — {os.path.basename(r['file_path'])}")
-                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
+                    colA,colB,colC = st.columns([3,1,2])
+                    sub = r['uploaded_at'] if pd.notna(r.get('uploaded_at')) and str(r.get('uploaded_at')).strip() else r['report_date']
+                    with colA:
+                        st.markdown(f"**Period:** {r['report_date']}  \n**Submitted:** {sub}  \n{os.path.basename(r['file_path'])}")
+                    with colB:
+                        file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
+                    with colC:
+                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
+                        if is_admin():
+                            c1,c2,c3 = st.columns([1,1,1])
+                            with c1:
+                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"bapp{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
+                                    try:
+                                        pdue = _parse_date_safe(r.get('report_date'))
+                                        if pdue and int(r.get('is_backlog') or 0)==0:
+                                            execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(pdue + timedelta(days=14)), int(pid)))
+                                    except Exception:
+                                        pass
+                                    st.rerun()
+                            with c2:
+                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"brej{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
+                                    st.rerun()
+                            with c3:
+                                if st.button("🗑️ Delete", key=f"bdel{r['id']}"):
+                                    try:
+                                        fp=str(r.get("file_path") or "")
+                                        if fp and os.path.exists(fp): os.remove(fp)
+                                    except Exception:
+                                        pass
+                                    execute("DELETE FROM biweekly_reports WHERE id=?", (int(r['id']),))
+                                    st.rerun()
 
 # ---------- Staff ----------
 def page_staff():
@@ -2190,18 +2453,19 @@ def page_projects():
                     else:
                         path=save_uploaded_file(up, f"project_{pid}/tests")
                         if path:
-                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id)
-                                       VALUES (?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id()))
+                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,status)
+                                       VALUES (?,?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id(), "PENDING"))
                             st.success("Test uploaded.")
                         else:
                             st.error("Select a file first.")
 
             # List
             tdf=fetch_df("""
-                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at
+                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at, COALESCE(tr.status,'APPROVED') AS status
                 FROM test_results tr
                 LEFT JOIN buildings b ON b.id=tr.building_id
                 WHERE tr.project_id=?
+                  AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=?)
                 ORDER BY tr.uploaded_at DESC
             """,(pid,))
             if tdf.empty:
@@ -2216,9 +2480,29 @@ def page_projects():
                     with colA: st.write(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n*{r['uploaded_at']}*")
                     with colB: file_download_button("⬇️ Download", r["file_path"], key=f"tdl{r['id']}")
                     with colC:
-                        if is_admin() and st.button("🗑️", key=f"tdel{r['id']}"):
-                            execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
-                            st.experimental_rerun()
+                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
+                        if is_admin():
+                            a1,a2,a3 = st.columns([1,1,1])
+                            with a1:
+                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"tapp{r['id']}"):
+                                    execute("UPDATE test_results SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
+                                    st.rerun()
+                            with a2:
+                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"trej{r['id']}"):
+                                    execute("UPDATE test_results SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
+                                    st.rerun()
+                            with a3:
+                                if st.button("🗑️ Delete", key=f"tdel{r['id']}"):
+                                    # remove file too
+                                    try:
+                                        fp=str(r.get("file_path") or "")
+                                        if fp and os.path.exists(fp): os.remove(fp)
+                                    except Exception:
+                                        pass
+                                    execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
+                                    st.rerun()
 
         # Biweekly Reports
         with tabs[3]:
@@ -2258,15 +2542,46 @@ def page_projects():
                                     pass
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,file_path FROM biweekly_reports WHERE project_id=? ORDER BY date(report_date) DESC",(pid,))
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid,))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
                 for _,r in rdf.iterrows():
-                    colA,colB=st.columns([3,1])
-                    with colA: st.write(f"**{r['report_date']}** — {os.path.basename(r['file_path'])}")
-                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
-
+                    colA,colB,colC = st.columns([3,1,2])
+                    sub = r['uploaded_at'] if pd.notna(r.get('uploaded_at')) and str(r.get('uploaded_at')).strip() else r['report_date']
+                    with colA:
+                        st.markdown(f"**Period:** {r['report_date']}  \n**Submitted:** {sub}  \n{os.path.basename(r['file_path'])}")
+                    with colB:
+                        file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
+                    with colC:
+                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
+                        if is_admin():
+                            c1,c2,c3 = st.columns([1,1,1])
+                            with c1:
+                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"bapp{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
+                                    try:
+                                        pdue = _parse_date_safe(r.get('report_date'))
+                                        if pdue:
+                                            execute("UPDATE projects SET next_due_date=? WHERE id=?", (str(pdue + timedelta(days=14)), int(pid)))
+                                    except Exception:
+                                        pass
+                                    st.rerun()
+                            with c2:
+                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"brej{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
+                                    st.rerun()
+                            with c3:
+                                if st.button("🗑️ Delete", key=f"bdel{r['id']}"):
+                                    try:
+                                        fp=str(r.get("file_path") or "")
+                                        if fp and os.path.exists(fp): os.remove(fp)
+                                    except Exception:
+                                        pass
+                                    execute("DELETE FROM biweekly_reports WHERE id=?", (int(r['id']),))
+                                    st.rerun()
 # ---------- Staff ----------
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
@@ -2798,8 +3113,13 @@ def page_tasks():
         st.info("No monthly records yet. Admin should click **Compute/Refresh month**.")
     else:
         st.dataframe(lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Reliability","Attention to Detail","Total Score"]] if inc_soft else lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]], use_container_width=True)
-        top = lb.iloc[0]
-        st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
+        # Staff of the Month: month-on-month delta (this month total - previous month total)
+        delta_lb = get_monthly_sotm_delta(ms, include_soft=inc_soft)
+        top = delta_lb.iloc[0] if not delta_lb.empty else lb.iloc[0]
+        if not delta_lb.empty:
+            st.success(f"Staff of the Month (delta): **{top['Name']}** — Δ{int(top['Delta'])} (this month {int(top['Total Score'])}, last month {int(top['Prev Total'])})")
+        else:
+            st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
 
     if is_admin():
         st.markdown("#### Admin: soft-factor scoring")
@@ -3177,8 +3497,8 @@ def page_account():
                 st.session_state["user"]["must_change_password"] = 0
                 # One-time flash on next render
                 st.session_state["flash_success"] = "Password updated successfully."
-                # Navigate away so user doesn't keep clicking
-                st.session_state["nav_radio"] = "🏠 Dashboard"
+                # Request navigation away (handled before sidebar radio is created)
+                st.session_state["_pending_nav"] = "🏠 Dashboard"
                 st.rerun()
 
 
