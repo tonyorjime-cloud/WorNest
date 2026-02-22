@@ -7,6 +7,13 @@ from dateutil import parser as dtparser
 from dateutil.relativedelta import relativedelta
 import pandas as pd, numpy as np, streamlit as st
 import uuid
+import streamlit.components.v1 as components
+
+# Optional HTTP client (for push notifications)
+try:
+    import requests
+except Exception:
+    requests = None
 
 # ML (optional)
 try:
@@ -868,6 +875,94 @@ def execute_sql(q, p=()):
 def exec_sql(q: str, p=None):
     """Backward-compatible alias for execute_sql (some modules still call exec_sql)."""
     return execute_sql(q, p)
+
+
+# ---------------------------
+# Push Notifications (OneSignal Web Push)
+# ---------------------------
+def _onesignal_cfg():
+    """Return (app_id, rest_api_key) or (None, None) if not configured."""
+    app_id = os.getenv("ONESIGNAL_APP_ID")
+    api_key = os.getenv("ONESIGNAL_REST_API_KEY")
+    if not app_id or not api_key or requests is None:
+        return None, None
+    return app_id.strip(), api_key.strip()
+
+
+def render_push_opt_in(external_user_id: str):
+    """Inject OneSignal SDK and (if configured) bind the user to external_user_id (usually email)."""
+    app_id, _ = _onesignal_cfg()
+    if not app_id:
+        return
+    # Avoid re-injecting every rerun
+    key = f"onesignal_bound::{external_user_id}"
+    if st.session_state.get(key):
+        return
+    st.session_state[key] = True
+    components.html(
+        f"""
+        <script src="https://cdn.onesignal.com/sdks/OneSignalSDK.js" async=""></script>
+        <script>
+          window.OneSignal = window.OneSignal || [];
+          OneSignal.push(function() {{
+            OneSignal.init({{ appId: "{app_id}", notifyButton: {{ enable: true }} }});
+            try {{ OneSignal.login("{external_user_id}"); }} catch (e) {{ /* ignore */ }}
+          }});
+        </script>
+        """,
+        height=0,
+    )
+
+
+def send_push(external_user_ids, title: str, message: str):
+    """Send a push notification to OneSignal users identified by external_user_ids (emails).
+
+    No-op if OneSignal is not configured.
+    """
+    app_id, api_key = _onesignal_cfg()
+    if not app_id:
+        return False
+    if not external_user_ids:
+        return False
+    # De-dup + sanitize
+    ids = [str(x).strip() for x in external_user_ids if str(x).strip()]
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return False
+    try:
+        r = requests.post(
+            "https://onesignal.com/api/v1/notifications",
+            headers={
+                "Authorization": f"Basic {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "app_id": app_id,
+                "include_external_user_ids": ids,
+                "headings": {"en": title[:60]},
+                "contents": {"en": message[:240]},
+            },
+            timeout=10,
+        )
+        return bool(r.ok)
+    except Exception:
+        return False
+
+
+def _staff_emails_for_project(project_id: int):
+    try:
+        df = fetch_df(
+            """
+            SELECT s.email
+            FROM project_staff ps
+            JOIN staff s ON s.id = ps.staff_id
+            WHERE ps.project_id=? AND COALESCE(s.email,'')<>''
+            """,
+            (project_id,),
+        )
+        return [str(x) for x in df["email"].tolist()] if not df.empty else []
+    except Exception:
+        return []
 
 def get_setting(key:str, default:str|None=None)->str|None:
     """Read a setting from DB (app_settings)."""
@@ -2404,11 +2499,26 @@ def _build_expected_biweekly_windows(start_date:date, today:date)->list:
     return out
 def page_projects():
     st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
-    projects=fetch_df("""
-        SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
-               (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
-        FROM projects p ORDER BY p.code
-    """)
+    # For Staff: show posted projects first, then the rest.
+    if is_admin() or can_manage_projects():
+        projects=fetch_df("""
+            SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
+                   (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
+            FROM projects p
+            ORDER BY p.code
+        """)
+    else:
+        sid = current_staff_id()
+        projects=fetch_df("""
+            SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
+                   (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor,
+                   CASE WHEN EXISTS (
+                        SELECT 1 FROM project_staff ps
+                        WHERE ps.project_id = p.id AND ps.staff_id = ?
+                   ) THEN 0 ELSE 1 END AS _posted_sort
+            FROM projects p
+            ORDER BY _posted_sort, p.code
+        """, (sid,))
 
     # Admin control: global reset of next bi-weekly due dates
     if is_admin():
@@ -3161,6 +3271,16 @@ def page_tasks():
             for nm in assignees:
                 sid=int(staff[staff["name"]==nm]["id"].iloc[0])
                 execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
+            # Push notifications to assignees (best-effort)
+            try:
+                if "email" in staff.columns:
+                    emails = staff[staff["name"].isin(assignees)]["email"].dropna().astype(str).tolist()
+                else:
+                    emails = []
+                if emails:
+                    send_push(emails, "WorkNest: New Task", f"You have been assigned: {title[:80]}")
+            except Exception:
+                pass
             st.success("Task created."); st.rerun()
 
     st.subheader("Assignments")
@@ -3297,12 +3417,15 @@ def page_admin_inbox():
 
         for _, r in df.iterrows():
             rid = int(r.get("id") or 0)
+            pid = int(r.get("project_id") or 0)
             code = r.get("project_code") or ""
             pname = r.get("project_name") or ""
-            uploader = r.get("uploader_email") or r.get("uploader_name") or ""
+            uploader_email = (r.get("uploader_email") or "").strip()
+            uploader = uploader_email or (r.get("uploader_name") or "")
             status = r.get("status") or "PENDING"
             uploaded_at = r.get("uploaded_at") or ""
             period_dt = r.get("report_date") or r.get("test_date") or ""
+            period_str = str(period_dt)[:10] if period_dt else ""
             file_path = r.get("file_path") or ""
 
             with st.container(border=True):
@@ -3327,6 +3450,24 @@ def page_admin_inbox():
                                 "UPDATE test_results SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_staff_id(), rid),
                             )
+                        # Push notifications (best-effort)
+                        try:
+                            notify = []
+                            if uploader_email:
+                                notify.append(uploader_email)
+                            if pid:
+                                notify += _staff_emails_for_project(pid)
+                            send_push(notify, "WorkNest: Approved", f"{kind.title()} approved for {code} ({period_str}).")
+                        except Exception:
+                            pass
+
+                        # Keep performance table aligned (best-effort)
+                        try:
+                            if kind == "report" and period_str:
+                                ms = dt.datetime.strptime(period_str, "%Y-%m-%d").date().replace(day=1)
+                                compute_and_store_monthly_performance(ms)
+                        except Exception:
+                            pass
                         st.success("Approved.")
                         st.rerun()
                 with c2:
@@ -3342,6 +3483,15 @@ def page_admin_inbox():
                                 "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_staff_id(), rid),
                             )
+                        try:
+                            notify = []
+                            if uploader_email:
+                                notify.append(uploader_email)
+                            if pid:
+                                notify += _staff_emails_for_project(pid)
+                            send_push(notify, "WorkNest: Rejected", f"{kind.title()} rejected for {code} ({period_str}).")
+                        except Exception:
+                            pass
                         st.warning("Rejected.")
                         st.rerun()
                 with c3:
@@ -3996,6 +4146,14 @@ def main():
     init_db(); apply_styles()
     if not current_user():
         login_ui(); return
+
+    # Web push (OneSignal): if configured, bind this browser session to the logged-in user email
+    try:
+        u = current_user()
+        if u and u.get("email"):
+            render_push_opt_in(u["email"])
+    except Exception:
+        pass
 
     # One-time flash messages
     try:
