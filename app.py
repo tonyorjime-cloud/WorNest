@@ -1057,119 +1057,142 @@ def upsert_performance_index(staff_id:int, month:dt.date, task_pts:int, report_p
 
 
 def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
-    """Compute points earned within the selected calendar month.
+    """Compute points for the given month.
 
-    - Task points: awarded to the individual assigned to the task (based on completion timing).
-    - Report points: awarded to ALL staff posted to the project (based on submission timing vs due date).
-    - Test points: awarded to ALL staff posted to the project (not time-bound, just on submission).
+    - Tasks: based on completed task assignments within the month.
+    - Biweekly reports: approved reports whose *due date* falls within the month.
+    - Test results: approved tests whose uploaded_at falls within the month; points are shared
+      across staff posted to the project.
     """
     ms = month_start.replace(day=1)
     me = (ms + relativedelta(months=1)) - dt.timedelta(days=1)
 
-    staff_df = fetch_df("SELECT id,name,rank,section FROM staff ORDER BY name")
+    staff_df = fetch_df("SELECT id AS staff_id, name, rank, section FROM staff ORDER BY name")
+    if staff_df.empty:
+        return pd.DataFrame(columns=[
+            "staff_id","name","rank","section","task_points","report_points","test_points","total_score"
+        ])
 
-    # Task completions within the month (per individual)
+    # Initialize points buckets
+    pts = {int(r.staff_id): {"task": 0.0, "report": 0.0, "test": 0.0} for r in staff_df.itertuples(index=False)}
+
+    # ---- Tasks (completed in month) ----
     tdf = fetch_df(
-        """SELECT id, staff_id, date_assigned, days_allotted, completed_date
-             FROM tasks
-             WHERE completed_date IS NOT NULL
-               AND date(completed_date) BETWEEN date(?) AND date(?)""",
-        (ms.isoformat(), me.isoformat()),
+        """
+        SELECT A.staff_id, A.completed_date, A.days_taken, T.days_allotted, T.date_assigned
+        FROM task_assignments A
+        JOIN tasks T ON T.id = A.task_id
+        WHERE COALESCE(A.status,'')='Completed'
+          AND A.completed_date IS NOT NULL
+        """
     )
-
-    # Postings (staff -> project)
-    ps = fetch_df("SELECT staff_id, project_id FROM project_staff")
-    staff_projects = defaultdict(list)
-    if not ps.empty:
-        for _, r in ps.iterrows():
+    if not tdf.empty:
+        for r in tdf.itertuples(index=False):
             try:
-                staff_projects[int(r["staff_id"])].append(int(r["project_id"]))
+                sid = int(r.staff_id)
             except Exception:
                 continue
+            cd = _parse_date(getattr(r, 'completed_date', None))
+            if not cd or not (ms <= cd <= me):
+                continue
 
-    # --- Biweekly report scoring ---
-    # Due date is the next Tuesday after the report period date selected on upload.
-    # This matches how legacy/paper submissions were recorded (often using the period end date).
-    def _due_date_for_report_period_date(period_date: dt.date) -> dt.date:
-        # Tuesday = weekday 1
-        days_ahead = (1 - period_date.weekday()) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        return period_date + dt.timedelta(days=days_ahead)
+            days_allotted = getattr(r, 'days_allotted', None)
+            days_taken = getattr(r, 'days_taken', None)
 
-    # Approved report submissions that happened within this month
+            if (days_taken is None or str(days_taken).strip()==""):
+                da = _parse_date(getattr(r, 'date_assigned', None))
+                if da and cd:
+                    days_taken = max(0, (cd - da).days)
+
+            try:
+                pts_val = _task_points(days_taken, days_allotted)
+            except Exception:
+                pts_val = 0
+
+            if sid in pts:
+                pts[sid]["task"] += float(pts_val)
+
+    # ---- Biweekly reports (due date in month, approved) ----
     rdf = fetch_df(
-        """SELECT project_id, report_date, COALESCE(uploaded_at, report_date) AS submitted_at
-             FROM biweekly_reports
-             WHERE COALESCE(status,'APPROVED')='APPROVED'
-               AND date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)""",
-        (ms.isoformat(), me.isoformat()),
+        """
+        SELECT id, project_id, report_date, uploaded_at, uploader_staff_id, COALESCE(status,'APPROVED') AS status
+        FROM biweekly_reports
+        WHERE COALESCE(status,'APPROVED')='APPROVED'
+        """
     )
-    proj_reports = defaultdict(list)  # pid -> list[(period_start, submitted_date)]
     if not rdf.empty:
-        for _, r in rdf.iterrows():
-            try:
-                pid = int(r["project_id"])
-                period_start = parse_date(str(r["report_date"])) if r["report_date"] is not None else None
-                submitted = parse_date(str(r["submitted_at"])) if r["submitted_at"] is not None else None
-                if period_start and submitted:
-                    proj_reports[pid].append((period_start, submitted))
-            except Exception:
+        for r in rdf.itertuples(index=False):
+            pid = getattr(r, 'project_id', None)
+            report_date = _parse_date(getattr(r, 'report_date', None))
+            uploaded_at = getattr(r, 'uploaded_at', None)
+
+            if not pid or not report_date:
                 continue
 
-    # Approved test submissions within this month (count per project)
-    ttest = fetch_df(
-        """SELECT project_id, COUNT(*) AS n
-             FROM test_results
-             WHERE COALESCE(status,'APPROVED')='APPROVED'
-               AND date(COALESCE(uploaded_at, test_date)) BETWEEN date(?) AND date(?)
-             GROUP BY project_id""",
-        (ms.isoformat(), me.isoformat()),
+            due = _biweekly_due_date(report_date)
+            if not (ms <= due <= me):
+                continue
+
+            try:
+                p = _report_points(uploaded_at, report_date)
+            except Exception:
+                p = 0
+
+            # Points apply to all posted staff (not split)
+            ps = fetch_df("SELECT staff_id FROM project_staff WHERE project_id=?", (pid,))
+            if ps.empty:
+                continue
+            for sid in ps['staff_id'].dropna().astype(int).tolist():
+                if sid in pts:
+                    pts[sid]["report"] += float(p)
+
+    # ---- Test results (uploaded in month, approved) ----
+    xdf = fetch_df(
+        """
+        SELECT id, project_id, test_date, uploaded_at, COALESCE(status,'APPROVED') AS status
+        FROM test_results
+        WHERE COALESCE(status,'APPROVED')='APPROVED'
+        """
     )
-    testproj = defaultdict(int)
-    if not ttest.empty:
-        for _, r in ttest.iterrows():
-            try:
-                testproj[int(r["project_id"])]=int(r["n"])
-            except Exception:
+    if not xdf.empty:
+        for r in xdf.itertuples(index=False):
+            pid = getattr(r, 'project_id', None)
+            up = getattr(r, 'uploaded_at', None)
+            up_dt = _parse_datetime(up)
+            if not pid or not up_dt:
+                continue
+            if not (ms <= up_dt.date() <= me):
                 continue
 
-    rows = []
-    for _, sr in staff_df.iterrows():
-        sid = int(sr["id"])
-        proj_ids = staff_projects.get(sid, [])
+            ps = fetch_df("SELECT staff_id FROM project_staff WHERE project_id=?", (pid,))
+            staff_ids = ps['staff_id'].dropna().astype(int).tolist() if not ps.empty else []
+            if not staff_ids:
+                continue
 
-        # Task points
-        task_pts = 0
-        if not tdf.empty:
-            srows = tdf[tdf["staff_id"] == sid]
-            for _, r in srows.iterrows():
-                task_pts += _task_points(r.get("date_assigned"), int(r.get("days_allotted") or 0), r.get("completed_date"))
+            share = 3.0 / len(staff_ids)
+            for sid in staff_ids:
+                if sid in pts:
+                    pts[sid]["test"] += share
 
-        # Report points (for all posted projects)
-        report_pts = 0
-        for pid in proj_ids:
-            for period_start, submitted in proj_reports.get(pid, []):
-                due = _due_date_for_report_period_date(period_start)
-                report_pts += _report_points(due, submitted)
-
-        # Test points (for all posted projects)
-        test_pts = sum(testproj.get(pid, 0) for pid in proj_ids) * _test_points()
-
-        total = task_pts + report_pts + test_pts
-        rows.append({
-            "id": sid,
-            "name": sr.get("name"),
-            "rank": sr.get("rank"),
-            "section": sr.get("section"),
-            "task_points": int(task_pts),
-            "report_points": int(report_pts),
-            "test_points": int(test_pts),
-            "total": int(total),
+    # Assemble
+    out_rows = []
+    for r in staff_df.itertuples(index=False):
+        sid = int(r.staff_id)
+        tp = round(pts[sid]["task"], 3)
+        rp = round(pts[sid]["report"], 3)
+        xp = round(pts[sid]["test"], 3)
+        out_rows.append({
+            "staff_id": sid,
+            "name": r.name,
+            "rank": r.rank,
+            "section": r.section,
+            "task_points": tp,
+            "report_points": rp,
+            "test_points": xp,
+            "total_score": round(tp + rp + xp, 3),
         })
 
-    return pd.DataFrame(rows)
-
+    return pd.DataFrame(out_rows)
 
 def compute_and_store_monthly_performance(month_start: dt.date) -> None:
     """Compute base points for the given month and persist to performance_index.
