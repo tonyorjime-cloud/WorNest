@@ -196,7 +196,14 @@ ENV_DATA_DIR=os.getenv("WORKNEST_DATA_DIR","").strip()
 # files written under /var/data will survive redeploys/restarts.
 RENDER_DISK_DIR = "/var/data/worknest_data"
 DEFAULT_LOCAL_DATA = RENDER_DISK_DIR if os.path.isdir("/var/data") else os.path.join(os.getcwd(), "data")
-DATA_DIR = _first_writable_dir([ENV_DATA_DIR, DEFAULT_LOCAL_DATA, os.getcwd()])
+
+# If the env var points to /tmp (ephemeral on Render), ignore it and use the
+# persistent disk path instead.
+effective_env_dir = ENV_DATA_DIR
+if ENV_DATA_DIR.startswith("/tmp") and os.path.isdir("/var/data"):
+    effective_env_dir = ""
+
+DATA_DIR = _first_writable_dir([effective_env_dir, DEFAULT_LOCAL_DATA, os.getcwd()])
 
 DB_PATH=os.getenv('WORKNEST_DB_PATH', os.path.join(DATA_DIR,'worknest.db'))
 UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads"))
@@ -1936,7 +1943,22 @@ def page_dashboard():
                         st.success("Report uploaded and queued for Admin approval.")
                     else:
                         st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",(pid, current_staff_id()))
+            # Staff should only see APPROVED reports (plus their own pending uploads).
+            # Admin should see everything so they can approve/reject pending uploads.
+            if is_admin():
+                rdf=fetch_df(
+                    "SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id "
+                    "FROM biweekly_reports WHERE project_id=? "
+                    "ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",
+                    (pid,)
+                )
+            else:
+                rdf=fetch_df(
+                    "SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id "
+                    "FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) "
+                    "ORDER BY date(COALESCE(uploaded_at,report_date)) DESC",
+                    (pid, current_staff_id())
+                )
             if rdf.empty:
                 st.info("No reports yet.")
             else:
