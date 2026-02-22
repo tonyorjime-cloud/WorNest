@@ -923,7 +923,13 @@ def compute_staff_activity_points(staff_id:int)->dict:
         # prefetch reports for those projects
         proj_ids=tuple(int(x) for x in pdf["id"].tolist())
         qmarks=",".join(["?"]*len(proj_ids))
-        rdf = fetch_df(f"SELECT project_id, report_date FROM biweekly_reports WHERE project_id IN ({qmarks})", proj_ids)
+        rdf = fetch_df(
+            f"""SELECT project_id, report_date
+                 FROM biweekly_reports
+                 WHERE project_id IN ({qmarks})
+                   AND COALESCE(status,'APPROVED')='APPROVED'""",
+            proj_ids,
+        )
         # map project->list of dates
         rmap={}
         for _,rr in rdf.iterrows():
@@ -945,7 +951,10 @@ def compute_staff_activity_points(staff_id:int)->dict:
                 due += dt.timedelta(days=14)
 
     # test reports (award to uploader)
-    tdf = fetch_df("SELECT id FROM test_results WHERE uploader_staff_id=?", (staff_id,))
+    tdf = fetch_df(
+        "SELECT id FROM test_results WHERE uploader_staff_id=? AND COALESCE(status,'APPROVED')='APPROVED'",
+        (staff_id,),
+    )
     if not tdf.empty:
         out["test_points"] = int(len(tdf)) * _test_points()
 
@@ -1364,6 +1373,10 @@ def user_role():
 def is_admin():
     return user_role()=='admin' or int((current_user() or {}).get('is_admin',0) or 0)==1
 
+# Future-proof hook: if we later introduce a dedicated "reviewer" role, this is where it plugs in.
+def is_reviewer():
+    return is_admin()
+
 def is_sub_admin():
     return user_role()=='sub_admin' or is_admin()
 
@@ -1498,7 +1511,7 @@ def sidebar_nav():
         pass
 
     base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
-    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights"]
+    admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights","📥 Admin Inbox"]
     pages = base_pages + (admin_pages if is_admin() else [])
 
     return st.sidebar.radio("Go to", pages, key="nav_radio")
@@ -3148,6 +3161,158 @@ def page_tasks():
                 st.warning(msg)
 
 
+def page_admin_inbox():
+    """Central approval queue for uploads across all projects.
+
+    This reduces the risk of staff uploading rubbish to farm points, because performance points
+    are computed from APPROVED uploads only.
+    """
+    if not is_admin():
+        st.warning("Admin only.")
+        return
+
+    st.title("📥 Admin Inbox")
+    st.caption("Pending uploads awaiting approval. Approve to count for performance points.")
+
+    # Quick reminder about persistence
+    if (ENV_DATA_DIR or "").startswith("/tmp") and os.path.isdir(RENDER_DISK_DIR):
+        st.warning(
+            "Your WORKNEST_DATA_DIR is pointing to /tmp (ephemeral). "
+            "Set it to /var/data/worknest_data in Render to persist uploads across redeploys."
+        )
+
+    tab_reports, tab_tests, tab_docs = st.tabs(["Biweekly Reports", "Test Results", "Core Docs"])
+
+    def _render_queue(df, kind: str):
+        if df is None or df.empty:
+            st.success("No pending items.")
+            return
+
+        for _, r in df.iterrows():
+            rid = int(r.get("id") or 0)
+            code = r.get("project_code") or ""
+            pname = r.get("project_name") or ""
+            uploader = r.get("uploader_email") or r.get("uploader_name") or ""
+            status = r.get("status") or "PENDING"
+            uploaded_at = r.get("uploaded_at") or ""
+            dt = r.get("report_date") or r.get("test_date") or r.get("doc_date") or ""
+            file_path = r.get("file_path") or ""
+
+            with st.container(border=True):
+                st.markdown(f"**{code}** — {pname}")
+                st.write(f"**Uploader:** {uploader} · **Status:** {status} · **Date:** {dt} · **Uploaded:** {uploaded_at}")
+
+                if file_path and not os.path.exists(file_path):
+                    st.warning(f"Missing file on disk: {file_path}")
+
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+                with c1:
+                    if st.button("✅ Approve", key=f"inbox_{kind}_approve_{rid}"):
+                        ts = dt.datetime.utcnow().isoformat(sep=' ', timespec='seconds')
+                        if kind == "report":
+                            exec_sql(
+                                "UPDATE biweekly_reports SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        elif kind == "test":
+                            exec_sql(
+                                "UPDATE test_results SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        elif kind == "doc":
+                            exec_sql(
+                                "UPDATE core_docs SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        st.success("Approved.")
+                        st.rerun()
+                with c2:
+                    if st.button("⛔ Reject", key=f"inbox_{kind}_reject_{rid}"):
+                        ts = dt.datetime.utcnow().isoformat(sep=' ', timespec='seconds')
+                        if kind == "report":
+                            exec_sql(
+                                "UPDATE biweekly_reports SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        elif kind == "test":
+                            exec_sql(
+                                "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        elif kind == "doc":
+                            exec_sql(
+                                "UPDATE core_docs SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
+                                (ts, current_user_id(), rid),
+                            )
+                        st.warning("Rejected.")
+                        st.rerun()
+                with c3:
+                    if st.button("🗑️ Delete", key=f"inbox_{kind}_delete_{rid}"):
+                        if kind == "report":
+                            exec_sql("DELETE FROM biweekly_reports WHERE id=?", (rid,))
+                        elif kind == "test":
+                            exec_sql("DELETE FROM test_results WHERE id=?", (rid,))
+                        elif kind == "doc":
+                            exec_sql("DELETE FROM core_docs WHERE id=?", (rid,))
+                        st.info("Deleted.")
+                        st.rerun()
+                with c4:
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            with open(file_path, "rb") as f:
+                                st.download_button(
+                                    "⬇️ Download",
+                                    f,
+                                    file_name=os.path.basename(file_path),
+                                    key=f"inbox_{kind}_dl_{rid}",
+                                )
+                        except Exception:
+                            st.caption("Download unavailable.")
+
+    with tab_reports:
+        df = fetch_df(
+            """
+            SELECT r.id, r.project_id, p.code AS project_code, p.name AS project_name,
+                   r.report_date, r.uploaded_at, r.file_path, COALESCE(r.status,'PENDING') AS status,
+                   s.email AS uploader_email, s.name AS uploader_name
+            FROM biweekly_reports r
+            LEFT JOIN projects p ON p.id=r.project_id
+            LEFT JOIN staff s ON s.id=r.uploader_staff_id
+            WHERE COALESCE(r.status,'PENDING')='PENDING'
+            ORDER BY COALESCE(r.uploaded_at, r.report_date) DESC
+            """
+        )
+        _render_queue(df, "report")
+
+    with tab_tests:
+        df = fetch_df(
+            """
+            SELECT t.id, t.project_id, p.code AS project_code, p.name AS project_name,
+                   t.test_date, t.uploaded_at, t.file_path, COALESCE(t.status,'PENDING') AS status,
+                   s.email AS uploader_email, s.name AS uploader_name
+            FROM test_results t
+            LEFT JOIN projects p ON p.id=t.project_id
+            LEFT JOIN staff s ON s.id=t.uploader_staff_id
+            WHERE COALESCE(t.status,'PENDING')='PENDING'
+            ORDER BY COALESCE(t.uploaded_at, t.test_date) DESC
+            """
+        )
+        _render_queue(df, "test")
+
+    with tab_docs:
+        df = fetch_df(
+            """
+            SELECT d.id, d.project_id, p.code AS project_code, p.name AS project_name,
+                   d.doc_date, d.uploaded_at, d.file_path, COALESCE(d.status,'PENDING') AS status,
+                   s.email AS uploader_email, s.name AS uploader_name
+            FROM core_docs d
+            LEFT JOIN projects p ON p.id=d.project_id
+            LEFT JOIN staff s ON s.id=d.uploader_staff_id
+            WHERE COALESCE(d.status,'PENDING')='PENDING'
+            ORDER BY COALESCE(d.uploaded_at, d.doc_date) DESC
+            """
+        )
+        _render_queue(df, "doc")
 
 
 def page_import():
@@ -3781,6 +3946,7 @@ def main():
     elif page.startswith("⬆️"): page_import()
     elif page.startswith("🔐"): page_access_control()
     elif page.startswith("🤖"): page_ml()
+    elif page.startswith("📥"): page_admin_inbox()
     else: page_dashboard()
 
 
