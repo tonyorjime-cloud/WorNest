@@ -573,6 +573,41 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
         if not _pg_has_column('chat_messages', 'attachment_type'):
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_type TEXT")
 
+        # ---- Content approval workflow hardening (older DBs may miss these)
+        # biweekly_reports
+        if not _pg_has_column('biweekly_reports', 'status'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN status TEXT")
+        if not _pg_has_column('biweekly_reports', 'approved_at'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN approved_at TEXT")
+        if not _pg_has_column('biweekly_reports', 'approved_by_staff_id'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN approved_by_staff_id INTEGER")
+        if not _pg_has_column('biweekly_reports', 'rejected_reason'):
+            _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN rejected_reason TEXT")
+
+        # core_docs
+        if not _pg_has_column('core_docs', 'doc_date'):
+            _pg_add_column("ALTER TABLE core_docs ADD COLUMN doc_date TEXT")
+        if not _pg_has_column('core_docs', 'status'):
+            _pg_add_column("ALTER TABLE core_docs ADD COLUMN status TEXT")
+        if not _pg_has_column('core_docs', 'approved_at'):
+            _pg_add_column("ALTER TABLE core_docs ADD COLUMN approved_at TEXT")
+        if not _pg_has_column('core_docs', 'approved_by_staff_id'):
+            _pg_add_column("ALTER TABLE core_docs ADD COLUMN approved_by_staff_id INTEGER")
+        if not _pg_has_column('core_docs', 'rejected_reason'):
+            _pg_add_column("ALTER TABLE core_docs ADD COLUMN rejected_reason TEXT")
+
+        # test_results
+        if not _pg_has_column('test_results', 'test_date'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN test_date TEXT")
+        if not _pg_has_column('test_results', 'status'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN status TEXT")
+        if not _pg_has_column('test_results', 'approved_at'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN approved_at TEXT")
+        if not _pg_has_column('test_results', 'approved_by_staff_id'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN approved_by_staff_id INTEGER")
+        if not _pg_has_column('test_results', 'rejected_reason'):
+            _pg_add_column("ALTER TABLE test_results ADD COLUMN rejected_reason TEXT")
+
     else:
         sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
