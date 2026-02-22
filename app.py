@@ -1087,13 +1087,14 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
                 continue
 
     # --- Biweekly report scoring ---
-    # Each report period is 14 days (Mon–Sun). Due date is the first Tuesday after the period end.
-    def _due_date_for_report_period_start(period_start: dt.date) -> dt.date:
-        period_end = period_start + dt.timedelta(days=13)
-        d = period_end + dt.timedelta(days=1)
-        while d.weekday() != 1:  # Tuesday
-            d += dt.timedelta(days=1)
-        return d
+    # Due date is the next Tuesday after the report period date selected on upload.
+    # This matches how legacy/paper submissions were recorded (often using the period end date).
+    def _due_date_for_report_period_date(period_date: dt.date) -> dt.date:
+        # Tuesday = weekday 1
+        days_ahead = (1 - period_date.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return period_date + dt.timedelta(days=days_ahead)
 
     # Approved report submissions that happened within this month
     rdf = fetch_df(
@@ -1148,7 +1149,7 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
         report_pts = 0
         for pid in proj_ids:
             for period_start, submitted in proj_reports.get(pid, []):
-                due = _due_date_for_report_period_start(period_start)
+                due = _due_date_for_report_period_date(period_start)
                 report_pts += _report_points(due, submitted)
 
         # Test points (for all posted projects)
@@ -1167,6 +1168,42 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows)
+
+
+def compute_and_store_monthly_performance(month_start: dt.date) -> None:
+    """Compute base points for the given month and persist to performance_index.
+
+    Updates task/report/test points while preserving any admin-entered soft-factor scores
+    (reliability/attention) already stored for that month.
+    """
+    df = compute_monthly_base_points(month_start)
+    if df is None or df.empty:
+        return
+    month_key = month_start.strftime('%Y-%m')
+    existing = fetch_df('SELECT staff_id, reliability_score, attention_score FROM performance_index WHERE month=?', (month_key,))
+    soft = {}
+    if existing is not None and not existing.empty:
+        for _, er in existing.iterrows():
+            try:
+                soft[int(er['staff_id'])] = (int(er.get('reliability_score') or 0), int(er.get('attention_score') or 0))
+            except Exception:
+                continue
+    now_iso = dt.datetime.now().isoformat(timespec='seconds')
+    for _, r in df.iterrows():
+        sid = int(r['staff_id'])
+        rel, att = soft.get(sid, (0, 0))
+        base_total = int(r.get('task_points') or 0) + int(r.get('report_points') or 0) + int(r.get('test_points') or 0)
+        upsert_performance_index(
+            staff_id=sid,
+            month=month_key,
+            task_points=int(r.get('task_points') or 0),
+            report_points=int(r.get('report_points') or 0),
+            test_points=int(r.get('test_points') or 0),
+            reliability_score=int(rel or 0),
+            attention_score=int(att or 0),
+            total_score=base_total + int(rel or 0) + int(att or 0),
+            updated_at=now_iso,
+        )
 
 
 def get_monthly_leaderboard(month:dt.date, include_soft:bool|None=None)->pd.DataFrame:
@@ -1460,6 +1497,10 @@ def current_staff_id():
     try: return int(sid) if sid is not None else None
     except: return None
 
+
+def current_user_id():
+    """Backward-compatible alias for older code paths."""
+    return current_staff_id()
 
 def _get_user_permissions(user_id:int)->dict:
     if user_id is None:
