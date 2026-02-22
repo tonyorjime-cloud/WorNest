@@ -192,8 +192,11 @@ def _first_writable_dir(candidates):
     return ""
 
 ENV_DATA_DIR=os.getenv("WORKNEST_DATA_DIR","").strip()
-DEFAULT_LOCAL_DATA=os.path.join(os.getcwd(), "data")
-DATA_DIR=_first_writable_dir([ENV_DATA_DIR, DEFAULT_LOCAL_DATA, os.getcwd()])
+# Prefer Render persistent disk if present. If you mount a disk at /var/data,
+# files written under /var/data will survive redeploys/restarts.
+RENDER_DISK_DIR = "/var/data/worknest_data"
+DEFAULT_LOCAL_DATA = RENDER_DISK_DIR if os.path.isdir("/var/data") else os.path.join(os.getcwd(), "data")
+DATA_DIR = _first_writable_dir([ENV_DATA_DIR, DEFAULT_LOCAL_DATA, os.getcwd()])
 
 DB_PATH=os.getenv('WORKNEST_DB_PATH', os.path.join(DATA_DIR,'worknest.db'))
 UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads"))
@@ -336,12 +339,16 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE TABLE IF NOT EXISTS biweekly_reports (
-  id SERIAL PRIMARY KEY,
-  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
   report_date TEXT NOT NULL,
-  uploaded_at TEXT,
-  file_path TEXT,
-  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER,
+  status TEXT,
+  approved_at TEXT,
+  approved_by_staff_id INTEGER,
+  rejected_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -396,15 +403,21 @@ CREATE TABLE IF NOT EXISTS leaves (
 );
 
 CREATE TABLE IF NOT EXISTS test_results (
-  id SERIAL PRIMARY KEY,
-  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  building_id INTEGER REFERENCES buildings(id) ON DELETE SET NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  building_id INTEGER,
   stage TEXT,
   test_type TEXT NOT NULL,
   batch_id TEXT,
   file_path TEXT NOT NULL,
   uploaded_at TEXT NOT NULL,
-  uploader_staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL
+  uploader_staff_id INTEGER,
+  test_date TEXT,
+  notes TEXT,
+  status TEXT,
+  approved_at TEXT,
+  approved_by_staff_id INTEGER,
+  rejected_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -561,13 +574,40 @@ CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NO
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, category TEXT NOT NULL, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS biweekly_reports (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, report_date TEXT NOT NULL, uploaded_at TEXT, file_path TEXT, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS biweekly_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  report_date TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER,
+  status TEXT,
+  approved_at TEXT,
+  approved_by_staff_id INTEGER,
+  rejected_reason TEXT
+);
 CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, date_assigned TEXT NOT NULL, days_allotted INTEGER NOT NULL, due_date TEXT NOT NULL, project_id INTEGER, created_by_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS task_assignments (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, status TEXT DEFAULT 'In progress', completed_date TEXT, days_taken INTEGER);
 CREATE TABLE IF NOT EXISTS task_documents (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
 CREATE TABLE IF NOT EXISTS reminders_sent (id INTEGER PRIMARY KEY, assignment_id INTEGER NOT NULL, reminder_type TEXT NOT NULL, sent_on TEXT NOT NULL, UNIQUE(assignment_id, reminder_type, sent_on));
 CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, leave_type TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, working_days INTEGER DEFAULT 0, relieving_staff_id INTEGER, status TEXT DEFAULT 'Pending', reason TEXT, request_date TEXT, approved_by_staff_id INTEGER);
-CREATE TABLE IF NOT EXISTS test_results (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, building_id INTEGER, stage TEXT, test_type TEXT NOT NULL, batch_id TEXT, file_path TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploader_staff_id INTEGER);
+CREATE TABLE IF NOT EXISTS test_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  building_id INTEGER,
+  stage TEXT,
+  test_type TEXT NOT NULL,
+  batch_id TEXT,
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  uploader_staff_id INTEGER,
+  test_date TEXT,
+  notes TEXT,
+  status TEXT,
+  approved_at TEXT,
+  approved_by_staff_id INTEGER,
+  rejected_reason TEXT
+);
 CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
 CREATE TABLE IF NOT EXISTS performance_index (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, month TEXT NOT NULL, task_points INTEGER DEFAULT 0, report_points INTEGER DEFAULT 0, test_points INTEGER DEFAULT 0, reliability_score INTEGER DEFAULT 0, attention_to_detail_score INTEGER DEFAULT 0, UNIQUE(staff_id, month));
 CREATE TABLE IF NOT EXISTS staff_of_month_posts (id INTEGER PRIMARY KEY, month TEXT NOT NULL UNIQUE, staff_id INTEGER, total_score INTEGER DEFAULT 0, posted_at TEXT NOT NULL);
@@ -956,125 +996,120 @@ def upsert_performance_index(staff_id:int, month:dt.date, task_pts:int, report_p
             (int(staff_id), m, int(task_pts), int(report_pts), int(test_pts), int(reliability), int(attention)),
         )
 
-def compute_monthly_base_points(month:dt.date)->pd.DataFrame:
-    """Compute monthly points per staff for the selected month.
 
-    Rules:
-    - Tasks: award when task is completed in the month.
-    - Biweekly reports: award for due dates that fall in the month (per project the staff is posted to).
-    - Test reports: award per test_result uploaded in the month.
+def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
+    """Compute points earned within the selected calendar month.
+
+    - Task points: awarded to the individual assigned to the task (based on completion timing).
+    - Report points: awarded to ALL staff posted to the project (based on submission timing vs due date).
+    - Test points: awarded to ALL staff posted to the project (not time-bound, just on submission).
     """
-    ms=_month_start(month)
-    me=_month_end(month)
-    staff_df = fetch_df("SELECT id, name, rank, section FROM staff ORDER BY name")
-    if staff_df.empty:
-        return pd.DataFrame(columns=["staff_id","Name","Rank","Section","Task Points","Report Points","Test Points","Base Total"])
+    ms = month_start.replace(day=1)
+    me = (ms + relativedelta(months=1)) - dt.timedelta(days=1)
 
-    # Prefetch task completions in month (per staff)
+    staff_df = fetch_df("SELECT id,name,rank,section FROM staff ORDER BY name")
+
+    # Task completions within the month (per individual)
     tdf = fetch_df(
-        """SELECT A.staff_id, T.date_assigned, T.days_allotted, A.completed_date
-             FROM task_assignments A
-             JOIN tasks T ON T.id=A.task_id
-            WHERE A.status='Completed'
-              AND date(A.completed_date) BETWEEN date(?) AND date(?)""",
-        (str(ms), str(me)),
+        """SELECT id, staff_id, date_assigned, days_allotted, completed_date
+             FROM tasks
+             WHERE completed_date IS NOT NULL
+               AND date(completed_date) BETWEEN date(?) AND date(?)""",
+        (ms.isoformat(), me.isoformat()),
     )
 
-    # Prefetch test results in month (per project) — shared points for all staff posted to the project
-    testdf = fetch_df(
-        """SELECT project_id, COUNT(1) AS n
-             FROM test_results
-            WHERE project_id IS NOT NULL
-              AND COALESCE(status,'APPROVED')='APPROVED'
-              AND date(uploaded_at) BETWEEN date(?) AND date(?)
-            GROUP BY project_id""",
-        (str(ms), str(me)),
-    )
-    testproj = {int(r["project_id"]): int(r["n"]) for _, r in testdf.iterrows()} if not testdf.empty else {}
+    # Postings (staff -> project)
+    ps = fetch_df("SELECT staff_id, project_id FROM project_staff")
+    staff_projects = defaultdict(list)
+    if not ps.empty:
+        for _, r in ps.iterrows():
+            try:
+                staff_projects[int(r["staff_id"])].append(int(r["project_id"]))
+            except Exception:
+                continue
 
-    # Biweekly reports scoring: due dates within month
-    start=_biweekly_start_date()
-    # Build due dates list for the selected month
-    due_dates=[]
-    d=start
-    while d < ms:
-        d += dt.timedelta(days=14)
-    while d <= me:
-        due_dates.append(d)
-        d += dt.timedelta(days=14)
+    # --- Biweekly report scoring ---
+    # Each report period is 14 days (Mon–Sun). Due date is the first Tuesday after the period end.
+    def _due_date_for_report_period_start(period_start: dt.date) -> dt.date:
+        period_end = period_start + dt.timedelta(days=13)
+        d = period_end + dt.timedelta(days=1)
+        while d.weekday() != 1:  # Tuesday
+            d += dt.timedelta(days=1)
+        return d
 
-    # Prefetch all reports for month +/- buffer (to match windows)
-    buf_start = ms - dt.timedelta(days=13)
-    buf_end   = me + dt.timedelta(days=30)
+    # Approved report submissions that happened within this month
     rdf = fetch_df(
-        "SELECT project_id, COALESCE(uploaded_at, report_date) AS submitted_at FROM biweekly_reports WHERE COALESCE(status,'APPROVED')='APPROVED' AND date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)",
-        (str(buf_start), str(buf_end)),
+        """SELECT project_id, report_date, COALESCE(uploaded_at, report_date) AS submitted_at
+             FROM biweekly_reports
+             WHERE COALESCE(status,'APPROVED')='APPROVED'
+               AND date(COALESCE(uploaded_at, report_date)) BETWEEN date(?) AND date(?)""",
+        (ms.isoformat(), me.isoformat()),
     )
-    # Map project -> sorted list of report dates
-    proj_reports:dict[int,list[dt.date]]={}
-    for _,rr in rdf.iterrows():
-        pid=int(rr.get("project_id") or 0)
-        rd=_parse_date_safe(rr.get("submitted_at"))
-        if pid and rd:
-            proj_reports.setdefault(pid, []).append(rd)
-    for pid in list(proj_reports.keys()):
-        proj_reports[pid]=sorted(set(proj_reports[pid]))
+    proj_reports = defaultdict(list)  # pid -> list[(period_start, submitted_date)]
+    if not rdf.empty:
+        for _, r in rdf.iterrows():
+            try:
+                pid = int(r["project_id"])
+                period_start = parse_date(str(r["report_date"])) if r["report_date"] is not None else None
+                submitted = parse_date(str(r["submitted_at"])) if r["submitted_at"] is not None else None
+                if period_start and submitted:
+                    proj_reports[pid].append((period_start, submitted))
+            except Exception:
+                continue
 
-    rows=[]
-    for _,sr in staff_df.iterrows():
-        sid=int(sr["id"])
-        task_pts=0
-        report_pts=0
-        # Tasks
+    # Approved test submissions within this month (count per project)
+    ttest = fetch_df(
+        """SELECT project_id, COUNT(*) AS n
+             FROM test_results
+             WHERE COALESCE(status,'APPROVED')='APPROVED'
+               AND date(COALESCE(uploaded_at, test_date)) BETWEEN date(?) AND date(?)
+             GROUP BY project_id""",
+        (ms.isoformat(), me.isoformat()),
+    )
+    testproj = defaultdict(int)
+    if not ttest.empty:
+        for _, r in ttest.iterrows():
+            try:
+                testproj[int(r["project_id"])]=int(r["n"])
+            except Exception:
+                continue
+
+    rows = []
+    for _, sr in staff_df.iterrows():
+        sid = int(sr["id"])
+        proj_ids = staff_projects.get(sid, [])
+
+        # Task points
+        task_pts = 0
         if not tdf.empty:
-            srows=tdf[tdf["staff_id"]==sid]
-            for _,r in srows.iterrows():
+            srows = tdf[tdf["staff_id"] == sid]
+            for _, r in srows.iterrows():
                 task_pts += _task_points(r.get("date_assigned"), int(r.get("days_allotted") or 0), r.get("completed_date"))
 
-        # Reports (per posted project)
-        pdf = fetch_df("SELECT project_id FROM project_staff WHERE staff_id=?", (sid,))
-        proj_ids=[int(x) for x in (pdf["project_id"].tolist() if not pdf.empty else [])]
+        # Report points (for all posted projects)
+        report_pts = 0
         for pid in proj_ids:
-            used=set()  # prevent double-counting the same report across cycles
-            rdates=proj_reports.get(pid, [])
-            for due in due_dates:
-                window_start = due - dt.timedelta(days=13)
-                window_end   = due + dt.timedelta(days=30)
-                candidates=[d for d in rdates if (window_start <= d <= window_end and d not in used)]
-                if not candidates:
-                    continue
-                submitted=min(candidates)
-                used.add(submitted)
+            for period_start, submitted in proj_reports.get(pid, []):
+                due = _due_date_for_report_period_start(period_start)
                 report_pts += _report_points(due, submitted)
 
-        test_pts = sum((testproj.get(pid, 0) for pid in proj_ids), 0) * _test_points()
-        base_total = int(task_pts) + int(report_pts) + int(test_pts)
+        # Test points (for all posted projects)
+        test_pts = sum(testproj.get(pid, 0) for pid in proj_ids) * _test_points()
+
+        total = task_pts + report_pts + test_pts
         rows.append({
-            "staff_id": sid,
-            "Name": sr.get("name"),
-            "Rank": sr.get("rank"),
-            "Section": sr.get("section"),
-            "Task Points": int(task_pts),
-            "Report Points": int(report_pts),
-            "Test Points": int(test_pts),
-            "Base Total": int(base_total),
+            "id": sid,
+            "name": sr.get("name"),
+            "rank": sr.get("rank"),
+            "section": sr.get("section"),
+            "task_points": int(task_pts),
+            "report_points": int(report_pts),
+            "test_points": int(test_pts),
+            "total": int(total),
         })
 
     return pd.DataFrame(rows)
 
-def compute_and_store_monthly_performance(month:dt.date)->pd.DataFrame:
-    df=compute_monthly_base_points(month)
-    if df.empty:
-        return df
-    for _,r in df.iterrows():
-        upsert_performance_index(
-            int(r["staff_id"]),
-            _month_start(month),
-            int(r["Task Points"]),
-            int(r["Report Points"]),
-            int(r["Test Points"]),
-        )
-    return df
 
 def get_monthly_leaderboard(month:dt.date, include_soft:bool|None=None)->pd.DataFrame:
     ms=str(_month_start(month))
