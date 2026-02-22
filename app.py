@@ -3254,12 +3254,13 @@ def page_admin_inbox():
                         if kind == "report":
                             execute_sql(
                                 "UPDATE biweekly_reports SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
+                                # reviewed_by_staff_id expects the Staff.id (not Users.id)
+                                (ts, current_staff_id(), rid),
                             )
                         elif kind == "test":
                             execute_sql(
                                 "UPDATE test_results SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
+                                (ts, current_staff_id(), rid),
                             )
                         st.success("Approved.")
                         st.rerun()
@@ -3269,12 +3270,12 @@ def page_admin_inbox():
                         if kind == "report":
                             execute_sql(
                                 "UPDATE biweekly_reports SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
+                                (ts, current_staff_id(), rid),
                             )
                         elif kind == "test":
                             execute_sql(
                                 "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
+                                (ts, current_staff_id(), rid),
                             )
                         st.warning("Rejected.")
                         st.rerun()
