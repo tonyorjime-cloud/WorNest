@@ -4,6 +4,7 @@ import smtplib, ssl
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
 from dateutil import parser as dtparser
+from dateutil.relativedelta import relativedelta
 import pandas as pd, numpy as np, streamlit as st
 import uuid
 
