@@ -503,7 +503,17 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
             return cur.fetchone() is not None
 
         def _pg_add_column(ddl: str):
-            cur.execute(ddl)
+            try:
+                cur.execute(ddl)
+            except Exception as e:
+                msg = str(e)
+                # Ignore missing-table errors during incremental migrations
+                if ('does not exist' in msg and ('relation' in msg or 'table' in msg)):
+                    return
+                # Ignore duplicate-column errors
+                if ('already exists' in msg or 'duplicate column' in msg):
+                    return
+                raise
 
         # leaves: align old schema to new fields expected by UI
         if not _pg_has_column('leaves', 'relieving_staff_id'):
@@ -584,19 +594,11 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
         if not _pg_has_column('biweekly_reports', 'rejected_reason'):
             _pg_add_column("ALTER TABLE biweekly_reports ADD COLUMN rejected_reason TEXT")
 
-        # core_docs
-        if not _pg_has_column('core_docs', 'doc_date'):
-            _pg_add_column("ALTER TABLE core_docs ADD COLUMN doc_date TEXT")
-        if not _pg_has_column('core_docs', 'status'):
-            _pg_add_column("ALTER TABLE core_docs ADD COLUMN status TEXT")
-        if not _pg_has_column('core_docs', 'approved_at'):
-            _pg_add_column("ALTER TABLE core_docs ADD COLUMN approved_at TEXT")
-        if not _pg_has_column('core_docs', 'approved_by_staff_id'):
-            _pg_add_column("ALTER TABLE core_docs ADD COLUMN approved_by_staff_id INTEGER")
-        if not _pg_has_column('core_docs', 'rejected_reason'):
-            _pg_add_column("ALTER TABLE core_docs ADD COLUMN rejected_reason TEXT")
-
-        # test_results
+        
+        # documents (core docs)
+        if not _pg_has_column('documents', 'doc_date'):
+            _pg_add_column("ALTER TABLE documents ADD COLUMN doc_date TEXT")
+# test_results
         if not _pg_has_column('test_results', 'test_date'):
             _pg_add_column("ALTER TABLE test_results ADD COLUMN test_date TEXT")
         if not _pg_has_column('test_results', 'status'):
@@ -3216,7 +3218,7 @@ def page_admin_inbox():
             "Set it to /var/data/worknest_data in Render to persist uploads across redeploys."
         )
 
-    tab_reports, tab_tests, tab_docs = st.tabs(["Biweekly Reports", "Test Results", "Core Docs"])
+    tab_reports, tab_tests = st.tabs(["Biweekly Reports","Test Results"])
 
     def _render_queue(df, kind: str):
         if df is None or df.empty:
@@ -3230,12 +3232,12 @@ def page_admin_inbox():
             uploader = r.get("uploader_email") or r.get("uploader_name") or ""
             status = r.get("status") or "PENDING"
             uploaded_at = r.get("uploaded_at") or ""
-            dt = r.get("report_date") or r.get("test_date") or r.get("doc_date") or ""
+            period_dt = r.get("report_date") or r.get("test_date") or ""
             file_path = r.get("file_path") or ""
 
             with st.container(border=True):
                 st.markdown(f"**{code}** — {pname}")
-                st.write(f"**Uploader:** {uploader} · **Status:** {status} · **Date:** {dt} · **Uploaded:** {uploaded_at}")
+                st.write(f"**Uploader:** {uploader} · **Status:** {status} · **Period/Test date:** {period_dt} · **Uploaded:** {uploaded_at}")
 
                 if file_path and not os.path.exists(file_path):
                     st.warning(f"Missing file on disk: {file_path}")
@@ -3254,11 +3256,6 @@ def page_admin_inbox():
                                 "UPDATE test_results SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
-                        elif kind == "doc":
-                            exec_sql(
-                                "UPDATE core_docs SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
-                            )
                         st.success("Approved.")
                         st.rerun()
                 with c2:
@@ -3274,11 +3271,6 @@ def page_admin_inbox():
                                 "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
-                        elif kind == "doc":
-                            exec_sql(
-                                "UPDATE core_docs SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
-                                (ts, current_user_id(), rid),
-                            )
                         st.warning("Rejected.")
                         st.rerun()
                 with c3:
@@ -3287,8 +3279,6 @@ def page_admin_inbox():
                             exec_sql("DELETE FROM biweekly_reports WHERE id=?", (rid,))
                         elif kind == "test":
                             exec_sql("DELETE FROM test_results WHERE id=?", (rid,))
-                        elif kind == "doc":
-                            exec_sql("DELETE FROM core_docs WHERE id=?", (rid,))
                         st.info("Deleted.")
                         st.rerun()
                 with c4:
@@ -3323,31 +3313,17 @@ def page_admin_inbox():
         df = fetch_df(
             """
             SELECT t.id, t.project_id, p.code AS project_code, p.name AS project_name,
-                   t.test_date, t.uploaded_at, t.file_path, COALESCE(t.status,'PENDING') AS status,
+                   NULL AS test_date, t.uploaded_at, t.file_path, COALESCE(t.status,'PENDING') AS status,
                    s.email AS uploader_email, s.name AS uploader_name
             FROM test_results t
             LEFT JOIN projects p ON p.id=t.project_id
             LEFT JOIN staff s ON s.id=t.uploader_staff_id
             WHERE COALESCE(t.status,'PENDING')='PENDING'
-            ORDER BY COALESCE(t.uploaded_at, t.test_date) DESC
+            ORDER BY COALESCE(t.uploaded_at) DESC
             """
         )
         _render_queue(df, "test")
 
-    with tab_docs:
-        df = fetch_df(
-            """
-            SELECT d.id, d.project_id, p.code AS project_code, p.name AS project_name,
-                   d.doc_date, d.uploaded_at, d.file_path, COALESCE(d.status,'PENDING') AS status,
-                   s.email AS uploader_email, s.name AS uploader_name
-            FROM core_docs d
-            LEFT JOIN projects p ON p.id=d.project_id
-            LEFT JOIN staff s ON s.id=d.uploader_staff_id
-            WHERE COALESCE(d.status,'PENDING')='PENDING'
-            ORDER BY COALESCE(d.uploaded_at, d.doc_date) DESC
-            """
-        )
-        _render_queue(df, "doc")
 
 
 def page_import():
