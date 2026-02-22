@@ -863,6 +863,11 @@ def execute_sql(q, p=()):
     """Backward-compatible alias used by some pages."""
     return execute(q, p)
 
+
+def exec_sql(q: str, p=None):
+    """Backward-compatible alias for execute_sql (some modules still call exec_sql)."""
+    return execute_sql(q, p)
+
 def get_setting(key:str, default:str|None=None)->str|None:
     """Read a setting from DB (app_settings)."""
     try:
@@ -3247,12 +3252,12 @@ def page_admin_inbox():
                     if st.button("✅ Approve", key=f"inbox_{kind}_approve_{rid}"):
                         ts = dt.datetime.utcnow().isoformat(sep=' ', timespec='seconds')
                         if kind == "report":
-                            exec_sql(
+                            execute_sql(
                                 "UPDATE biweekly_reports SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
                         elif kind == "test":
-                            exec_sql(
+                            execute_sql(
                                 "UPDATE test_results SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
@@ -3262,12 +3267,12 @@ def page_admin_inbox():
                     if st.button("⛔ Reject", key=f"inbox_{kind}_reject_{rid}"):
                         ts = dt.datetime.utcnow().isoformat(sep=' ', timespec='seconds')
                         if kind == "report":
-                            exec_sql(
+                            execute_sql(
                                 "UPDATE biweekly_reports SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
                         elif kind == "test":
-                            exec_sql(
+                            execute_sql(
                                 "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_user_id(), rid),
                             )
@@ -3276,9 +3281,9 @@ def page_admin_inbox():
                 with c3:
                     if st.button("🗑️ Delete", key=f"inbox_{kind}_delete_{rid}"):
                         if kind == "report":
-                            exec_sql("DELETE FROM biweekly_reports WHERE id=?", (rid,))
+                            execute_sql("DELETE FROM biweekly_reports WHERE id=?", (rid,))
                         elif kind == "test":
-                            exec_sql("DELETE FROM test_results WHERE id=?", (rid,))
+                            execute_sql("DELETE FROM test_results WHERE id=?", (rid,))
                         st.info("Deleted.")
                         st.rerun()
                 with c4:
