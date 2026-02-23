@@ -1109,84 +1109,81 @@ def compute_staff_activity_points(staff_id:int)->dict:
     return out
 
 
-# ---------- Performance Index (Monthly) ----------
+# ---------- Performance (Cumulative + Monthly) ----------
 
-def _month_start(d:dt.date)->dt.date:
+def _month_start(d: dt.date) -> dt.date:
     return dt.date(d.year, d.month, 1)
 
-def _month_end(d:dt.date)->dt.date:
-    ms=_month_start(d)
-    if ms.month==12:
-        nxt=dt.date(ms.year+1, 1, 1)
+def _month_end(d: dt.date) -> dt.date:
+    if d.month == 12:
+        nxt = dt.date(d.year + 1, 1, 1)
     else:
-        nxt=dt.date(ms.year, ms.month+1, 1)
+        nxt = dt.date(d.year, d.month + 1, 1)
     return nxt - dt.timedelta(days=1)
 
-def _is_last_day_of_month(d:dt.date)->bool:
+def _is_last_day_of_month(d: dt.date) -> bool:
     return d == _month_end(d)
 
-def _perf_include_soft()->bool:
+def _perf_include_soft() -> bool:
     return str(get_setting("PERF_INCLUDE_SOFT", "0") or "0").strip() in ("1","true","True","yes","YES")
 
-def upsert_performance_index(staff_id:int, month:dt.date, task_pts:int, report_pts:int, test_pts:int,
-                             reliability:int|None=None, attention:int|None=None)->None:
-    m=str(_month_start(month))
-    if reliability is None or attention is None:
-        ex=fetch_df("SELECT reliability_score, attention_to_detail_score FROM performance_index WHERE staff_id=? AND month=?", (int(staff_id), m))
-        if ex.empty:
-            reliability = 0 if reliability is None else reliability
-            attention = 0 if attention is None else attention
-        else:
-            if reliability is None: reliability=int(ex.iloc[0].get("reliability_score") or 0)
-            if attention is None: attention=int(ex.iloc[0].get("attention_to_detail_score") or 0)
+def _parse_date_safe(x):
+    try:
+        return _parse_date(x)
+    except Exception:
+        return None
 
-    if DB_IS_POSTGRES:
-        execute(
-            """INSERT INTO performance_index (staff_id, month, task_points, report_points, test_points, reliability_score, attention_to_detail_score)
-               VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT (staff_id, month) DO UPDATE
-               SET task_points=EXCLUDED.task_points,
-                   report_points=EXCLUDED.report_points,
-                   test_points=EXCLUDED.test_points,
-                   reliability_score=EXCLUDED.reliability_score,
-                   attention_to_detail_score=EXCLUDED.attention_to_detail_score""",
-            (int(staff_id), m, int(task_pts), int(report_pts), int(test_pts), int(reliability), int(attention)),
-        )
-    else:
-        execute(
-            """INSERT OR REPLACE INTO performance_index (staff_id, month, task_points, report_points, test_points, reliability_score, attention_to_detail_score)
-               VALUES (?,?,?,?,?,?,?)""",
-            (int(staff_id), m, int(task_pts), int(report_pts), int(test_pts), int(reliability), int(attention)),
-        )
+def _points_for_task(days_taken: int | None, days_allotted: int | None) -> int:
+    # Defensive scoring: if we can't compute properly, still award minimal credit.
+    if days_taken is None or days_allotted is None or days_allotted <= 0:
+        return 1
+    if days_taken <= days_allotted:
+        return 3
+    if days_taken <= int(1.5 * days_allotted):
+        return 2
+    return 1
 
+def _points_for_report(uploaded: dt.date | None, due: dt.date | None) -> int:
+    # Your rule-set:
+    #  - on/before due date => 3
+    #  - within 7 days late => 2
+    #  - after 7 days       => 1
+    if uploaded is None or due is None:
+        return 1
+    if uploaded <= due:
+        return 3
+    if uploaded <= (due + dt.timedelta(days=7)):
+        return 2
+    return 1
 
-def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
-    """Compute per-staff points for the calendar month that contains month_start.
+def _get_project_staff_ids(project_id: int) -> list[int]:
+    df = fetch_df("SELECT staff_id FROM staff_projects WHERE project_id=?", (int(project_id),))
+    if df is None or df.empty:
+        return []
+    out = []
+    for v in df["staff_id"].tolist():
+        try:
+            out.append(int(v))
+        except Exception:
+            pass
+    return sorted(set(out))
 
-    Scoring rules:
-      • Tasks (completed in the selected month):
-          - within allotted days  => 3 pts
-          - within 1.5× allotted  => 2 pts
-          - beyond 1.5×           => 1 pt
-      • Bi-weekly reports (APPROVED; due date (report_date) in the selected month):
-          - uploaded_at <= report_date          => 3 pts
-          - uploaded_at <= report_date + 7 days => 2 pts
-          - otherwise                           => 1 pt
-        Points are shared across all staff posted to that project.
-      • Test results (APPROVED; submitted_at in the selected month):
-          - each approved submission => 3 pts (shared across all staff posted to the project)
+def compute_points_breakdown(date_from: dt.date | None = None,
+                             date_to: dt.date | None = None,
+                             mode: str = "monthly") -> pd.DataFrame:
+    """Compute points per staff.
+
+    mode:
+      - 'monthly': report points are anchored to report due-date (report_date) within the period
+      - 'cumulative': same logic but across all time (still due-date based for reports)
+
+    date_from/date_to are inclusive boundaries (used for monthly windows).
     """
-    ms = dt.date(month_start.year, month_start.month, 1)
-    me = (ms + relativedelta(months=1)) - dt.timedelta(days=1)
-
-    def _d(x):
-        return _parse_date(x) if x is not None else None
-
     staff_df = fetch_df("SELECT id, name, rank, section FROM staff ORDER BY name", ())
-    if staff_df.empty:
+    if staff_df is None or staff_df.empty:
         return pd.DataFrame(columns=[
-            "staff_id","name","rank","section",
-            "task_points","report_points","test_points","total"
+            "staff_id","Name","Rank","Section",
+            "Task Points","Report Points","Test Points","Total Score"
         ])
 
     acc = {}
@@ -1194,586 +1191,150 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
         sid = int(r["id"])
         acc[sid] = {
             "staff_id": sid,
-            "name": r.get("name") or "",
-            "rank": r.get("rank") or "",
-            "section": r.get("section") or "",
-            "task_points": 0,
-            "report_points": 0,
-            "test_points": 0,
+            "Name": r.get("name") or "",
+            "Rank": r.get("rank") or "",
+            "Section": r.get("section") or "",
+            "Task Points": 0,
+            "Report Points": 0,
+            "Test Points": 0,
         }
 
-    # TASKS: our schema tracks completion via task_assignments.status + completed_date (no boolean column).
-    # Status is set to "Completed" by the UI when staff mark an assignment done.
+    # ---------- TASKS ----------
+    # Completed tasks contribute points ONLY to the assigned staff.
+    # completion_date is the control point for the period.
     task_rows = fetch_df(
-        (
-            "SELECT ta.staff_id, t.date_assigned, t.days_allotted, ta.completed_date "
-            "FROM task_assignments ta "
-            "JOIN tasks t ON t.id = ta.task_id "
-            "WHERE ta.status = 'Completed'"
-        ) if not USE_PG else
-        (
-            "SELECT ta.staff_id, t.date_assigned, t.days_allotted, ta.completed_date "
-            "FROM task_assignments ta "
-            "JOIN tasks t ON t.id = ta.task_id "
-            "WHERE ta.status = 'Completed'"
-        ),
+        """SELECT ta.staff_id, t.date_assigned, t.days_allotted, ta.completed_date
+             FROM task_assignments ta
+             JOIN tasks t ON t.id = ta.task_id
+            WHERE ta.status='Completed' AND ta.completed_date IS NOT NULL""",
         ()
     )
+    if task_rows is not None and not task_rows.empty:
+        for _, r in task_rows.iterrows():
+            try:
+                sid = int(r.get("staff_id"))
+            except Exception:
+                continue
+            if sid not in acc:
+                continue
+            cd = _parse_date_safe(r.get("completed_date"))
+            if cd is None:
+                continue
+            if (date_from is not None and cd < date_from) or (date_to is not None and cd > date_to):
+                continue
+            ad = _parse_date_safe(r.get("date_assigned"))
+            try:
+                allotted = int(r.get("days_allotted")) if r.get("days_allotted") is not None else None
+            except Exception:
+                allotted = None
+            days_taken = None
+            if ad is not None:
+                days_taken = (cd - ad).days
+                if days_taken < 0:
+                    days_taken = None
+            acc[sid]["Task Points"] += _points_for_task(days_taken, allotted)
 
-    for _, r in task_rows.iterrows():
-        try:
-            sid = int(r.get("staff_id"))
-        except Exception:
-            continue
-        if sid not in acc:
-            continue
-        cd = _d(r.get("completed_date"))
-        if cd is None or cd < ms or cd > me:
-            continue
-        ad = _d(r.get("date_assigned"))
-        allotted = r.get("days_allotted")
-        try:
-            allotted = int(allotted) if allotted is not None else None
-        except Exception:
-            allotted = None
-
-        days_taken = None
-        if ad is not None:
-            days_taken = (cd - ad).days
-            if days_taken < 0:
-                days_taken = None
-
-        if allotted is None or allotted <= 0 or days_taken is None:
-            pts = 1
-        else:
-            if days_taken <= allotted:
-                pts = 3
-            elif days_taken <= int(1.5 * allotted):
-                pts = 2
-            else:
-                pts = 1
-
-        acc[sid]["task_points"] += pts
-
-    # REPORTS: approved, due date within month; points to all posted staff
+    # ---------- BIWEEKLY REPORTS ----------
+    # Approved reports: points shared across ALL posted staff on that project.
     rpt_rows = fetch_df(
-        (
-            "SELECT id, project_id, report_date, uploaded_at "
-            "FROM biweekly_reports "
-            "WHERE approved = 1"
-        ) if not USE_PG else
-        (
-            "SELECT id, project_id, report_date, uploaded_at "
-            "FROM biweekly_reports "
-            "WHERE COALESCE(approved, FALSE) = TRUE"
-        ),
+        """SELECT id, project_id, report_date, uploaded_at, COALESCE(status,'APPROVED') AS status
+             FROM biweekly_reports
+            WHERE COALESCE(status,'APPROVED')='APPROVED'""",
         ()
     )
-
-    for _, r in rpt_rows.iterrows():
-        pid = r.get("project_id")
-        due = _d(r.get("report_date"))
-        up = _d(r.get("uploaded_at"))
-        if pid is None or due is None or up is None:
-            continue
-        if due < ms or due > me:
-            continue
-
-        if up <= due:
-            pts = 3
-        elif up <= (due + dt.timedelta(days=7)):
-            pts = 2
-        else:
-            pts = 1
-
-        posted_df = fetch_df(
-            ("SELECT staff_id FROM staff_projects WHERE project_id=?" if not USE_PG else
-             "SELECT staff_id FROM staff_projects WHERE project_id=%s"),
-            (pid,)
-        )
-        if posted_df.empty:
-            continue
-        for sid in posted_df["staff_id"].tolist():
-            try:
-                sid = int(sid)
-            except Exception:
+    if rpt_rows is not None and not rpt_rows.empty:
+        for _, r in rpt_rows.iterrows():
+            pid = r.get("project_id")
+            due = _parse_date_safe(r.get("report_date"))
+            up  = _parse_date_safe(r.get("uploaded_at")) or due  # fallback
+            if pid is None or due is None:
                 continue
-            if sid in acc:
-                acc[sid]["report_points"] += pts
 
-    # TEST RESULTS: approved, submitted within month; points to all posted staff
+            # Monthly window is based on due date (your requirement), not upload date.
+            if mode == "monthly":
+                if (date_from is not None and due < date_from) or (date_to is not None and due > date_to):
+                    continue
+
+            pts = _points_for_report(up, due)
+            for sid in _get_project_staff_ids(int(pid)):
+                if sid in acc:
+                    acc[sid]["Report Points"] += pts
+
+    # ---------- TEST RESULTS ----------
+    # Approved test results: points shared across ALL posted staff on that project.
     test_rows = fetch_df(
-        (
-            "SELECT id, project_id, submitted_at "
-            "FROM test_results "
-            "WHERE approved = 1"
-        ) if not USE_PG else
-        (
-            "SELECT id, project_id, submitted_at "
-            "FROM test_results "
-            "WHERE COALESCE(approved, FALSE) = TRUE"
-        ),
+        """SELECT id, project_id, submitted_at, COALESCE(status,'APPROVED') AS status
+             FROM test_results
+            WHERE COALESCE(status,'APPROVED')='APPROVED'""",
         ()
     )
-
-    for _, r in test_rows.iterrows():
-        pid = r.get("project_id")
-        sub = _d(r.get("submitted_at"))
-        if pid is None or sub is None:
-            continue
-        if sub < ms or sub > me:
-            continue
-
-        pts = 3
-        posted_df = fetch_df(
-            ("SELECT staff_id FROM staff_projects WHERE project_id=?" if not USE_PG else
-             "SELECT staff_id FROM staff_projects WHERE project_id=%s"),
-            (pid,)
-        )
-        if posted_df.empty:
-            continue
-        for sid in posted_df["staff_id"].tolist():
-            try:
-                sid = int(sid)
-            except Exception:
+    if test_rows is not None and not test_rows.empty:
+        for _, r in test_rows.iterrows():
+            pid = r.get("project_id")
+            sub = _parse_date_safe(r.get("submitted_at"))
+            if pid is None or sub is None:
                 continue
-            if sid in acc:
-                acc[sid]["test_points"] += pts
+            # For tests we use submission date as control point for the period.
+            if (date_from is not None and sub < date_from) or (date_to is not None and sub > date_to):
+                continue
+            for sid in _get_project_staff_ids(int(pid)):
+                if sid in acc:
+                    acc[sid]["Test Points"] += 3
 
     df = pd.DataFrame(list(acc.values()))
-    if df.empty:
-        return df
-    df["total"] = df[["task_points","report_points","test_points"]].sum(axis=1)
+    df["Total Score"] = df[["Task Points","Report Points","Test Points"]].fillna(0).sum(axis=1)
+
+    # Sort: Total DESC, then Task, Report, Test DESC, then Name ASC
     df = df.sort_values(
-        by=["total","task_points","report_points","test_points","name"],
+        ["Total Score","Task Points","Report Points","Test Points","Name"],
         ascending=[False,False,False,False,True]
     ).reset_index(drop=True)
+
     return df
 
-def compute_and_store_monthly_performance(month_start: dt.date) -> None:
-    """Compute base points for the given month and persist to performance_index.
+def get_monthly_leaderboard(month_date: dt.date) -> pd.DataFrame:
+    ms = _month_start(month_date)
+    me = _month_end(month_date)
+    return compute_points_breakdown(ms, me, mode="monthly")
 
-    Updates task/report/test points while preserving any admin-entered soft-factor scores
-    (reliability/attention) already stored for that month.
-    """
-    df = compute_monthly_base_points(month_start)
-    if df is None or df.empty:
-        return
-    month_key = month_start.strftime('%Y-%m')
-    existing = fetch_df('SELECT staff_id, reliability_score, attention_to_detail_score FROM performance_index WHERE month=?', (month_key,))
-    soft = {}
-    if existing is not None and not existing.empty:
-        for _, er in existing.iterrows():
-            try:
-                soft[int(er['staff_id'])] = (int(er.get('reliability_score') or 0), int(er.get('attention_to_detail_score') or 0))
-            except Exception:
-                continue
-    now_iso = dt.datetime.now().isoformat(timespec='seconds')
-    for _, r in df.iterrows():
-        sid = int(r['staff_id'])
-        rel, att = soft.get(sid, (0, 0))
-        base_total = int(r.get('task_points') or 0) + int(r.get('report_points') or 0) + int(r.get('test_points') or 0)
-        upsert_performance_index(
-            staff_id=sid,
-            month=month_key,
-            task_points=int(r.get('task_points') or 0),
-            report_points=int(r.get('report_points') or 0),
-            test_points=int(r.get('test_points') or 0),
-            reliability_score=int(rel or 0),
-            attention_to_detail_score=int(att or 0),
-            total_score=base_total + int(rel or 0) + int(att or 0),
-            updated_at=now_iso,
-        )
+def get_cumulative_leaderboard() -> pd.DataFrame:
+    return compute_points_breakdown(None, None, mode="cumulative")
 
-
-def get_monthly_leaderboard(month:dt.date, include_soft:bool|None=None)->pd.DataFrame:
-    ms=str(_month_start(month))
-    df=fetch_df(
-        """SELECT PI.staff_id, S.name AS name, S.rank AS rank, S.section AS section,
-                  PI.task_points, PI.report_points, PI.test_points,
-                  PI.reliability_score, PI.attention_to_detail_score
-             FROM performance_index PI
-             JOIN staff S ON S.id=PI.staff_id
-            WHERE PI.month=?""",
-        (ms,),
-    )
-    if df.empty:
-        return df
-    inc = _perf_include_soft() if include_soft is None else bool(include_soft)
-    if inc:
-        df["Total Score"] = df[["task_points","report_points","test_points","reliability_score","attention_to_detail_score"]].fillna(0).sum(axis=1)
-    else:
-        df["Total Score"] = df[["task_points","report_points","test_points"]].fillna(0).sum(axis=1)
-    df = df.rename(columns={
-        "name":"Name","rank":"Rank","section":"Section",
-        "task_points":"Task Points","report_points":"Report Points","test_points":"Test Points",
-        "reliability_score":"Reliability","attention_to_detail_score":"Attention to Detail",
-    })
-    df = df.sort_values(["Total Score","Test Points","Report Points","Task Points","Name"], ascending=[False,False,False,False,True])
-    return df
-
-def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
+def post_staff_of_month(month: dt.date, force: bool = False) -> tuple[bool, str]:
     """Post staff-of-the-month to in-app chat (group). Uses staff_of_month_posts to avoid duplicates."""
-    ms=_month_start(month)
-    mstr=str(ms)
+    ms = _month_start(month)
+    mstr = str(ms)
+
     already = fetch_df("SELECT 1 FROM staff_of_month_posts WHERE month=?", (mstr,))
-    if (not already.empty) and (not force):
+    if (already is not None and not already.empty) and (not force):
         return (False, "Already posted for this month")
 
-    lb = get_monthly_leaderboard(ms, include_soft=None)
+    lb = get_monthly_leaderboard(ms)
     if lb.empty:
         return (False, "No performance records for month")
     top = lb.iloc[0]
-    top_sid = int(fetch_df("SELECT id FROM staff WHERE name=? LIMIT 1", (str(top["Name"]),)).iloc[0]["id"]) if True else None
-    total=int(top["Total Score"])
-    inc=_perf_include_soft()
-    month_label=ms.strftime("%B %Y")
-    msg=(
+    total = int(top["Total Score"] or 0)
+    month_label = ms.strftime("%B %Y")
+
+    msg = (
         f"🏆 Staff of the Month — {month_label}\n\n"
         f"🥇 {top['Name']} ({top.get('Rank','')})\n"
         f"Total Score: {total} points\n\n"
-        f"Breakdown: Tasks {int(top['Task Points'])} | Biweekly Reports {int(top['Report Points'])} | Test Reports {int(top['Test Points'])}"
+        f"Breakdown: Tasks {int(top['Task Points'])} | Biweekly Reports {int(top['Report Points'])} | Test Results {int(top['Test Points'])}"
+        "\n\n— WorkNest"
     )
-    if inc:
-        msg += f" | Reliability {int(top.get('Reliability',0))} | Attention to Detail {int(top.get('Attention to Detail',0))}"
-    msg += "\n\n— WorkNest (Performance Index)"
 
-    # Insert into chat (staff_id nullable in Postgres schema, but NOT NULL in SQLite schema).
     poster_sid = current_staff_id() or 1
-    nowiso=dt.datetime.now().isoformat(timespec="seconds")
     if DB_IS_POSTGRES:
         execute("INSERT INTO chat_messages (staff_id, message, created_at) VALUES (?,?,NOW())", (int(poster_sid), msg))
     else:
+        nowiso = dt.datetime.now().isoformat(timespec="seconds")
         execute("INSERT INTO chat_messages (staff_id, message, posted_at) VALUES (?,?,?)", (int(poster_sid), msg, nowiso))
 
-    # Record post
-    if DB_IS_POSTGRES:
-        if force:
-            execute("DELETE FROM staff_of_month_posts WHERE month=?", (mstr,))
-        execute("INSERT INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)", (mstr, top_sid, total, nowiso))
-    else:
-        if force:
-            execute("DELETE FROM staff_of_month_posts WHERE month=?", (mstr,))
-        execute("INSERT OR REPLACE INTO staff_of_month_posts (month, staff_id, total_score, posted_at) VALUES (?,?,?,?)", (mstr, top_sid, total, nowiso))
-
+    execute("INSERT INTO staff_of_month_posts (month, posted_at) VALUES (?,?) " + ("ON CONFLICT (month) DO NOTHING" if DB_IS_POSTGRES else ""), (mstr, dt.datetime.now().isoformat(timespec="seconds")))
     return (True, "Posted")
 
-def smtp_configured()->bool:
-    return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
-
-
-import secrets
-
-def _hash_token(token:str)->str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-def create_password_reset_for_user(user_id:int, minutes_valid:int=30)->str:
-    token = secrets.token_urlsafe(16)
-    expires = (dt.datetime.utcnow() + dt.timedelta(minutes=minutes_valid)).isoformat()
-    execute("INSERT INTO password_resets (user_id, token_hash, expires_at, used) VALUES (?,?,?,0)", (user_id, _hash_token(token), expires))
-    return token
-
-def consume_password_reset(token:str)->int|None:
-    th=_hash_token(token.strip())
-    df=fetch_df("SELECT id, user_id, expires_at, used FROM password_resets WHERE token_hash=? ORDER BY id DESC LIMIT 1", (th,))
-    if df.empty:
-        return None
-    row=df.iloc[0]
-    if int(row.get("used") or 0)==1:
-        return None
-    exp=_parse_date_safe(row.get("expires_at"))
-    # expires_at has datetime, parse again:
-    try:
-        expdt=dtparser.parse(str(row.get("expires_at")))
-        if expdt < dt.datetime.utcnow():
-            return None
-    except Exception:
-        return None
-    execute("UPDATE password_resets SET used=1 WHERE id=?", (int(row["id"]),))
-    return int(row["user_id"])
-
-def send_email(to_email:str, subject:str, body:str)->tuple[bool,str]:
-    """Send plain-text email via SMTP. Requires env vars:
-    SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD, SMTP_FROM (optional), SMTP_TLS (default 1).
-    """
-    if not to_email:
-        return (False, "missing recipient")
-    host=os.getenv("SMTP_HOST","").strip()
-    port=int(os.getenv("SMTP_PORT","587").strip() or "587")
-    user=os.getenv("SMTP_USER","").strip()
-    pwd=os.getenv("SMTP_PASSWORD","").strip()
-    use_tls=(os.getenv("SMTP_TLS","1").strip() not in ["0","false","False"])
-    sender=os.getenv("SMTP_FROM", user).strip() or user
-    if not (host and user and pwd):
-        return (False, "SMTP not configured")
-
-    msg=EmailMessage()
-    msg["From"]=sender
-    msg["To"]=to_email
-    msg["Subject"]=subject
-    msg.set_content(body)
-
-    ctx=ssl.create_default_context()
-    try:
-        if use_tls:
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.login(user, pwd)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.login(user, pwd)
-                s.send_message(msg)
-        return (True, "sent")
-    except Exception as e:
-        return (False, f"{type(e).__name__}: {e}")
-
-def run_task_reminders(today:date|None=None, horizon_days:int=2)->dict:
-    """Checks due-soon and overdue tasks and sends email reminders once per day per assignment + type."""
-    if today is None: today=date.today()
-    today_s=str(today)
-
-    df=fetch_df("""
-        SELECT
-            ta.id AS assignment_id,
-            ta.status,
-            t.title,
-            t.due_date,
-            t.date_assigned,
-            s.name AS staff_name,
-            s.email AS staff_email,
-            p.code AS project_code,
-            p.name AS project_name
-        FROM task_assignments ta
-        JOIN tasks t ON t.id=ta.task_id
-        JOIN staff s ON s.id=ta.staff_id
-        LEFT JOIN projects p ON p.id=t.project_id
-        WHERE ta.status!='Completed'
-    """)
-    if df.empty:
-        return {"checked":0,"sent":0,"skipped":0,"errors":0}
-
-    sent=skipped=errors=0
-    for _,r in df.iterrows():
-        try:
-            due=dtparser.parse(r["due_date"]).date()
-        except Exception:
-            continue
-        days_to_due=(due - today).days
-        if days_to_due < 0:
-            rtype="overdue"
-        elif days_to_due <= horizon_days:
-            rtype="due_soon"
-        else:
-            continue
-
-        # dedupe per day
-        already=fetch_df("SELECT 1 FROM reminders_sent WHERE assignment_id=? AND reminder_type=? AND sent_on=?",
-                         (int(r["assignment_id"]), rtype, today_s))
-        if not already.empty:
-            continue
-
-        proj=""
-        if pd.notna(r.get("project_code")) and pd.notna(r.get("project_name")):
-            proj=f"{r['project_code']} — {r['project_name']}"
-        elif pd.notna(r.get("project_code")):
-            proj=str(r["project_code"])
-        subj=f"WorkNest: Task reminder ({'OVERDUE' if rtype=='overdue' else 'Due soon'}) — {r['title']}"
-        body_lines=[
-            f"Hello {r['staff_name']},",
-            "",
-            "This is an automated reminder from WorkNest.",
-            "",
-            f"Task: {r['title']}",
-            f"Due date: {due.isoformat()}",
-        ]
-        if proj:
-            body_lines.append(f"Project: {proj}")
-        if rtype=="overdue":
-            body_lines.append(f"Status: OVERDUE by {abs(days_to_due)} day(s)")
-        else:
-            body_lines.append(f"Status: Due in {days_to_due} day(s)")
-        body_lines += [
-            "",
-            "Please log into WorkNest to review the task details and attachments.",
-            "",
-            "— WorkNest"
-        ]
-        ok,msg=send_email(str(r.get("staff_email") or "").strip(), subj, "\n".join(body_lines))
-        if ok:
-            sent += 1
-            execute("INSERT OR IGNORE INTO reminders_sent (assignment_id, reminder_type, sent_on) VALUES (?,?,?)",
-                    (int(r["assignment_id"]), rtype, today_s))
-        else:
-            # We only log as 'sent' if actually sent; otherwise keep it eligible.
-            if msg=="missing recipient" or msg=="SMTP not configured":
-                skipped += 1
-            else:
-                errors += 1
-    return {"checked":int(len(df)),"sent":sent,"skipped":skipped,"errors":errors}
-
-
-def apply_styles():
-    st.markdown("""<style>
-    .worknest-header{background:linear-gradient(90deg,#00B09B,#96C93D);color:#fff;padding:12px 16px;border-radius:14px}
-    .pill{display:inline-block;padding:2px 10px;border-radius:999px;background:#eef}
-    </style>""", unsafe_allow_html=True)
-
-def current_user(): return st.session_state.get("user")
-def user_role():
-    u=current_user()
-    if not u: return None
-    r=(u.get('role') or '').strip()
-    if r: return r
-    # Backward compatibility
-    return 'admin' if int(u.get('is_admin',0) or 0)==1 else 'staff'
-
-def is_admin():
-    return user_role()=='admin' or int((current_user() or {}).get('is_admin',0) or 0)==1
-
-# Future-proof hook: if we later introduce a dedicated "reviewer" role, this is where it plugs in.
-def is_reviewer():
-    return is_admin()
-
-def is_sub_admin():
-    return user_role()=='sub_admin' or is_admin()
-
-def is_section_head():
-    return user_role()=='section_head' or is_admin()
-
-def can_import_csv():
-    return is_admin()
-
-def can_manage_projects():
-    # create/edit/delete projects
-    return is_admin()
-
-def can_upload_core_docs():
-    # Core project documents (drawings, approvals, etc.)
-    # Admin always. Sub-admin only when explicitly enabled.
-    if is_admin():
-        return True
-    return (user_role()=='sub_admin') and has_perm('can_upload_project_docs')
-
-def can_assign_tasks():
-    # Create/assign tasks
-    if is_admin():
-        return True
-    return (user_role()=='section_head') and has_perm('can_assign_tasks')
-
-def can_confirm_task_completion():
-    if is_admin():
-        return True
-    return (user_role()=='section_head') and has_perm('can_confirm_task_completion')
-
-def can_approve_leave():
-    return is_admin()
-
-def current_staff_id():
-    u=current_user()
-    if not u: return None
-    sid=u.get("staff_id")
-    try: return int(sid) if sid is not None else None
-    except: return None
-
-
-def current_user_id():
-    """Backward-compatible alias for older code paths."""
-    return current_staff_id()
-
-def _get_user_permissions(user_id:int)->dict:
-    if user_id is None:
-        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
-    df = fetch_df("SELECT can_assign_tasks, can_confirm_task_completion, can_upload_project_docs FROM user_permissions WHERE user_id=?", (int(user_id),))
-    if df.empty:
-        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
-    r = df.iloc[0].to_dict()
-    return {
-        "can_assign_tasks": int(r.get("can_assign_tasks") or 0),
-        "can_confirm_task_completion": int(r.get("can_confirm_task_completion") or 0),
-        "can_upload_project_docs": int(r.get("can_upload_project_docs") or 0),
-    }
-
-def has_perm(flag:str)->bool:
-    u = current_user()
-    if not u:
-        return False
-    if is_admin():
-        return True
-    perms = _get_user_permissions(int(u.get("id")))
-    return int(perms.get(flag) or 0)==1
-
-def current_staff_section()->str|None:
-    sid = current_staff_id()
-    if sid is None:
-        return None
-    df = fetch_df("SELECT section FROM staff WHERE id=?", (int(sid),))
-    if df.empty:
-        return None
-    sec = df["section"].iloc[0]
-    return str(sec).strip() if sec is not None else None
-
-# ---------- Auth ----------
-def login_ui():
-    st.markdown(f"<h2 style='text-align:center'>{APP_TITLE}</h2>", unsafe_allow_html=True)
-    st.caption("Login with staff <b>email</b> (preferred) or <b>name</b>. Default password is <b>fcda</b>.", unsafe_allow_html=True)
-    username=st.text_input("Username (email or name)", key="login_user")
-    password=st.text_input("Password", type="password", key="login_pwd")
-    if st.button("Login", key="login_btn"):
-        u_in = (username or "").strip()
-        if not u_in:
-            st.error("Enter your email or name.")
-            return
-
-        # Allow login using:
-        #  - users.username (stored as email for most staff)
-        #  - staff.email
-        #  - staff.name
-        u=fetch_df("""SELECT u.* FROM users u
-                       LEFT JOIN staff s ON s.id=u.staff_id
-                       WHERE LOWER(u.username)=LOWER(?) OR LOWER(COALESCE(s.email,''))=LOWER(?) OR LOWER(COALESCE(s.name,''))=LOWER(?)
-                       LIMIT 1""", (u_in, u_in, u_in))
-
-        if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
-            st.session_state["user"]=dict(u.iloc[0])
-            try:
-                if int(st.session_state["user"].get("must_change_password") or 0)==1:
-                    st.session_state["force_pw_change"]=True
-                    st.session_state["nav_radio"]="⚙️ Account"
-            except Exception:
-                pass
-            st.rerun()
-        else:
-            st.error("Wrong password. Default is 'fcda' unless changed.")
-
-def logout_button():
-    if st.sidebar.button("🚪 Logout", key="logout_btn"):
-        st.session_state.pop("user", None); st.rerun()
-
-
-def sidebar_nav():
-    u=current_user()
-    st.sidebar.title("📚 Navigation")
-    if u: st.sidebar.markdown(f"**User:** {u['username']}  \n**Role:** {user_role()}")
-    logout_button()
-
-    # ---- Navigation control (avoid modifying widget state after creation) ----
-    # If another page requested a redirect, apply it *before* the radio widget is instantiated.
-    _pending_nav = st.session_state.pop("_pending_nav", None)
-    if _pending_nav:
-        st.session_state["nav_radio"] = _pending_nav
-
-    # If user must change password, force navigation to Account and limit pages.
-    try:
-        if u and int(u.get("must_change_password") or 0) == 1:
-            st.session_state["nav_radio"] = "⚙️ Account"
-            forced_pages=["⚙️ Account","❓ Help"]
-            return st.sidebar.radio("Go to", forced_pages, key="nav_radio")
-    except Exception:
-        pass
-
-    base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
+base_pages=["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
     admin_pages=["👥 Staff","📄 Leave Table","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights","📥 Admin Inbox"]
     pages = base_pages + (admin_pages if is_admin() else [])
 
@@ -3377,79 +2938,57 @@ def page_tasks():
         st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
     st.divider()
-    st.subheader("📊 Monthly Performance Scoreboard")
-    st.caption("This scoreboard is the single source of truth for monthly points. Staff of the Month is simply the top scorer for the selected month.")
+    st.subheader("📊 Performance")
+    st.caption("Cumulative scores are always based on **APPROVED** uploads + **COMPLETED** tasks. Monthly Staff‑of‑the‑Month is the top scorer for that month.")
 
-    c1,c2,c3=st.columns([2,2,3])
+    # Cumulative (all-time)
+    st.markdown("### Cumulative Leaderboard")
+    cum = get_cumulative_leaderboard()
+    if cum.empty:
+        st.info("No performance records yet.")
+    else:
+        st.dataframe(
+            cum[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]],
+            width="stretch"
+        )
+
+    st.markdown("### Monthly Staff‑of‑the‑Month")
+    sel_month = st.date_input("Pick month", value=_month_start(_today()), help="Choose any date in the month you want to review.")
+    ms = _month_start(sel_month)
+    me = _month_end(sel_month)
+
+    c1, c2 = st.columns([1,3])
     with c1:
-        sel_month = st.date_input("Month", value=_month_start(_today()), help="Select any date in the month.")
-    ms=_month_start(sel_month)
-
+        if st.button("🔄 Refresh", help="Rebuild the leaderboard from approved uploads and completed tasks."):
+            st.rerun()
     with c2:
-        if is_admin():
-            inc_soft = st.toggle("Include soft factors", value=_perf_include_soft(), help="Admin can include Reliability + Attention to Detail in ranking.")
-            set_setting("PERF_INCLUDE_SOFT", "1" if inc_soft else "0")
-        else:
-            inc_soft = _perf_include_soft()
-            st.caption(f"Soft factors: {'ON' if inc_soft else 'OFF'}")
+        st.caption(f"Month window: {ms.isoformat()} to {me.isoformat()} (inclusive).")
 
-    with c3:
-        if is_admin():
-            if st.button("🔄 Compute/Refresh month", help="Recompute monthly points and store to Performance Index."):
-                compute_and_store_monthly_performance(ms)
-                st.success("Monthly performance updated.")
-                st.rerun()
-        else:
-            st.button("🔄 Compute/Refresh month", disabled=True, help="Only Admin can recompute/store monthly performance.")
-
-    lb = get_monthly_leaderboard(ms, include_soft=inc_soft)
+    lb = get_monthly_leaderboard(ms)
     with st.expander("How points are calculated", expanded=False):
-        st.markdown("""- **Tasks (completed in the selected month)**: within allotted days = **3 pts**; within **1.5×** allotted days = **2 pts**; beyond **1.5×** = **1 pt**.  
-- **Bi‑weekly reports (per project you are posted to; due dates within the selected month)**: on/before due date = **3 pts**; within 7 days late = **2 pts**; after 7 days = **1 pt**.  
+        st.markdown("""- **Tasks (completed in the selected month)**: within allotted days = **3 pts**; within **1.5×** allotted days = **2 pts**; beyond **1.5×** = **1 pt**.
+- **Bi‑weekly reports (per project you are posted to; due dates within the selected month)**: on/before due date = **3 pts**; within 7 days late = **2 pts**; after 7 days = **1 pt**.
 - **Test results (submitted in the selected month)**: each submission = **3 pts** (shared across staff posted to the project).""")
 
     if lb.empty:
-        st.info("No monthly records yet. Admin should click **Compute/Refresh month**.")
+        st.info("No records for this month yet (or nothing approved/completed for the period).")
     else:
-        st.dataframe(lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Reliability","Attention to Detail","Total Score"]] if inc_soft else lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]], use_container_width=True)
+        st.dataframe(
+            lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]],
+            width="stretch"
+        )
         top = lb.iloc[0]
         st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
 
-    if is_admin():
-        st.markdown("#### Admin: soft-factor scoring")
-        staff_opts = fetch_df("SELECT id, name FROM staff ORDER BY name")
-        if not staff_opts.empty:
-            name_to_id = {r["name"]: int(r["id"]) for _,r in staff_opts.iterrows()}
-            pick = st.selectbox("Select staff", list(name_to_id.keys()), key="pi_staff_pick")
-            sid = name_to_id[pick]
-            ex = fetch_df("SELECT reliability_score, attention_to_detail_score FROM performance_index WHERE staff_id=? AND month=?", (sid, str(ms)))
-            r0 = int(ex.iloc[0].get("reliability_score") or 0) if not ex.empty else 0
-            a0 = int(ex.iloc[0].get("attention_to_detail_score") or 0) if not ex.empty else 0
-            rscore = st.number_input("Reliability", min_value=0, max_value=50, value=r0, step=1)
-            ascore = st.number_input("Attention to Detail", min_value=0, max_value=50, value=a0, step=1)
-            if st.button("💾 Save soft scores", key="pi_save_soft"):
-                # ensure base points exist
-                compute_and_store_monthly_performance(ms)
-                ex2 = fetch_df("SELECT task_points, report_points, test_points FROM performance_index WHERE staff_id=? AND month=?", (sid, str(ms)))
-                tp = int(ex2.iloc[0].get("task_points") or 0) if not ex2.empty else 0
-                rp = int(ex2.iloc[0].get("report_points") or 0) if not ex2.empty else 0
-                tsp = int(ex2.iloc[0].get("test_points") or 0) if not ex2.empty else 0
-                upsert_performance_index(sid, ms, tp, rp, tsp, reliability=int(rscore), attention=int(ascore))
-                st.success("Soft scores saved.")
-                st.rerun()
-
-        st.markdown("#### Admin: post to chat group")
-        last_day = _is_last_day_of_month(_today())
-        st.caption("WorkNest can auto-post on the last day of the month via reminder_worker. You can also post manually here.")
-        if st.button("📢 Post Staff of the Month to Chat", disabled=(lb.empty), key="pi_post_now"):
-            ok,msg = post_staff_of_month(ms, force=False)
-            if ok:
-                st.success("Posted to chat.")
-            else:
-                st.warning(msg)
+        if is_admin():
+            st.caption("Admin can post Staff‑of‑the‑Month to the chat group.")
+            if st.button("📢 Post Staff of the Month to Chat", key="pi_post_now"):
+                ok, msg = post_staff_of_month(ms, force=False)
+                st.success("Posted.") if ok else st.warning(msg)
 
 
-def page_admin_inbox():
+def page_admin_inbox
+():
     """Central approval queue for uploads across all projects.
 
     This reduces the risk of staff uploading rubbish to farm points, because performance points
