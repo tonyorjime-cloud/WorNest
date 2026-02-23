@@ -1202,19 +1202,20 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
             "test_points": 0,
         }
 
-    # TASKS: pull completed assignments, then filter by completed_date within month
+    # TASKS: our schema tracks completion via task_assignments.status + completed_date (no boolean column).
+    # Status is set to "Completed" by the UI when staff mark an assignment done.
     task_rows = fetch_df(
         (
             "SELECT ta.staff_id, t.date_assigned, t.days_allotted, ta.completed_date "
             "FROM task_assignments ta "
             "JOIN tasks t ON t.id = ta.task_id "
-            "WHERE ta.completed = 1"
+            "WHERE ta.status = 'Completed'"
         ) if not USE_PG else
         (
             "SELECT ta.staff_id, t.date_assigned, t.days_allotted, ta.completed_date "
             "FROM task_assignments ta "
             "JOIN tasks t ON t.id = ta.task_id "
-            "WHERE COALESCE(ta.completed, FALSE) = TRUE"
+            "WHERE ta.status = 'Completed'"
         ),
         ()
     )
