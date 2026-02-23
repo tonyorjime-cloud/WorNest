@@ -48,6 +48,10 @@ import sqlite3
 # Database backend selection
 DB_URL = os.getenv('DATABASE_URL') or os.getenv('WORKNEST_DB_URL') or ''
 DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(('postgres://','postgresql://')))
+# Backwards-compat alias used by older helper functions / branches
+# (Some parts of the app still reference USE_PG; keep it in sync with DB_IS_POSTGRES.)
+USE_PG = DB_IS_POSTGRES
+
 
 st.set_page_config(page_title="WorkNest Mini v3.2.4", layout="wide")
 
