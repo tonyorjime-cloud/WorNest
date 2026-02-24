@@ -1,4 +1,4 @@
-import os, hashlib, secrets
+import os, hashlib
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -6,7 +6,6 @@ from datetime import datetime, date, timedelta
 from dateutil import parser as dtparser
 from dateutil.relativedelta import relativedelta
 import pandas as pd, numpy as np, streamlit as st
-from streamlit_cookies_manager import CookieManager
 import uuid
 import streamlit.components.v1 as components
 
@@ -55,97 +54,6 @@ USE_PG = DB_IS_POSTGRES
 
 
 st.set_page_config(page_title="WorkNest Mini v3.2.4", layout="wide")
-# --- Persistent login (Remember me) ---
-cookies = CookieManager(prefix="worknest")
-TOKEN_SALT = os.environ.get("WORKNEST_TOKEN_SALT") or os.environ.get("SECRET_KEY") or "worknest-mini"
-
-def _hash_token(raw: str) -> str:
-    return hashlib.sha256((raw + TOKEN_SALT).encode("utf-8")).hexdigest()
-
-def _utcnow_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
-
-def _parse_iso(s: str):
-    try:
-        return dtparser.parse(s) if s else None
-    except Exception:
-        return None
-
-def try_auto_login_from_cookie():
-    """
-    If session is empty but a remember_token cookie exists, validate it and restore st.session_state['user'].
-    This keeps the existing auth model intact (users table is still the source of truth for accounts).
-    """
-    if st.session_state.get("user"):
-        return True
-
-    # CookieManager needs a ready() handshake
-    try:
-        if not cookies.ready():
-            st.stop()
-    except Exception:
-        # If cookie manager fails, fall back to normal login
-        return False
-
-    raw = cookies.get("remember_token")
-    if not raw:
-        return False
-
-    token_hash = _hash_token(str(raw))
-    row = fetch_df("""
-        SELECT a.expires_at, u.*
-        FROM auth_tokens a
-        JOIN users u ON u.id = a.user_id
-        WHERE a.token_hash = ?
-        LIMIT 1
-    """, (token_hash,))
-
-    if row.empty:
-        return False
-
-    expires_at = _parse_iso(str(row["expires_at"].iloc[0]))
-    if (expires_at is not None) and (expires_at < dt.datetime.utcnow()):
-        # Expired token: cleanup and force login
-        try:
-            execute("DELETE FROM auth_tokens WHERE token_hash=?", (token_hash,))
-        except Exception:
-            pass
-        try:
-            cookies.delete("remember_token"); cookies.save()
-        except Exception:
-            pass
-        return False
-
-    # User must still be active
-    if int(row["is_active"].iloc[0] if "is_active" in row.columns else 1) != 1:
-        return False
-
-    st.session_state["user"] = dict(row.iloc[0].drop(labels=["expires_at"], errors="ignore"))
-    # Touch last_used_at (best-effort)
-    try:
-        execute("UPDATE auth_tokens SET last_used_at=? WHERE token_hash=?", (_utcnow_iso(), token_hash))
-    except Exception:
-        pass
-    return True
-
-def clear_remember_cookie_and_token():
-    """Invalidate the current remember-token (if any) and clear the browser cookie."""
-    try:
-        if not cookies.ready():
-            return
-    except Exception:
-        return
-    raw = cookies.get("remember_token")
-    if raw:
-        try:
-            execute("DELETE FROM auth_tokens WHERE token_hash=?", (_hash_token(str(raw)),))
-        except Exception:
-            pass
-    try:
-        cookies.delete("remember_token"); cookies.save()
-    except Exception:
-        pass
-
 
 # --- Navigation constants (avoid accidental indentation bugs) ---
 BASE_PAGES = ["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","💬 Chat","⚙️ Account","❓ Help"]
@@ -554,16 +462,6 @@ CREATE TABLE IF NOT EXISTS points (
   UNIQUE(staff_id, source, source_id)
 );
 
-
-CREATE TABLE IF NOT EXISTS auth_tokens (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  token_hash TEXT UNIQUE NOT NULL,
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT NOW(),
-  last_used_at TEXT
-);
-
 CREATE TABLE IF NOT EXISTS performance_index (
   id SERIAL PRIMARY KEY,
   staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
@@ -772,7 +670,6 @@ CREATE TABLE IF NOT EXISTS test_results (
   rejected_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
-CREATE TABLE IF NOT EXISTS auth_tokens (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT);
 CREATE TABLE IF NOT EXISTS performance_index (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, month TEXT NOT NULL, task_points INTEGER DEFAULT 0, report_points INTEGER DEFAULT 0, test_points INTEGER DEFAULT 0, reliability_score INTEGER DEFAULT 0, attention_to_detail_score INTEGER DEFAULT 0, UNIQUE(staff_id, month));
 CREATE TABLE IF NOT EXISTS staff_of_month_posts (id INTEGER PRIMARY KEY, month TEXT NOT NULL UNIQUE, staff_id INTEGER, total_score INTEGER DEFAULT 0, posted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, image_path TEXT, posted_at TEXT NOT NULL);
@@ -1828,7 +1725,6 @@ def login_ui():
     st.caption("Login with staff <b>email</b> (preferred) or <b>name</b>. Default password is <b>fcda</b>.", unsafe_allow_html=True)
     username=st.text_input("Username (email or name)", key="login_user")
     password=st.text_input("Password", type="password", key="login_pwd")
-    remember_me = st.checkbox("Remember me on this device", value=True, key="remember_me")
     if st.button("Login", key="login_btn"):
         u_in = (username or "").strip()
         if not u_in:
@@ -1846,21 +1742,6 @@ def login_ui():
 
         if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
             st.session_state["user"]=dict(u.iloc[0])
-            # Optional persistent login (Remember me)
-            if remember_me:
-                try:
-                    if cookies.ready():
-                        raw = secrets.token_urlsafe(32)
-                        token_hash = _hash_token(raw)
-                        expires = (dt.datetime.utcnow() + dt.timedelta(days=30)).replace(microsecond=0).isoformat()
-                        # Best-effort insert; token_hash is UNIQUE
-                        execute("INSERT OR IGNORE INTO auth_tokens (user_id, token_hash, expires_at, created_at, last_used_at) VALUES (?,?,?,?,?)",
-                                (int(st.session_state["user"]["id"]), token_hash, expires, _utcnow_iso(), _utcnow_iso()))
-                        cookies["remember_token"] = raw
-                        cookies.save()
-                except Exception:
-                    pass
-
             try:
                 if int(st.session_state["user"].get("must_change_password") or 0)==1:
                     st.session_state["force_pw_change"]=True
@@ -1873,7 +1754,6 @@ def login_ui():
 
 def logout_button():
     if st.sidebar.button("🚪 Logout", key="logout_btn"):
-        clear_remember_cookie_and_token()
         st.session_state.pop("user", None); st.rerun()
 
 
@@ -2638,7 +2518,7 @@ def page_chat():
         return
 
     # show oldest -> newest
-    for r in (df.to_dict('records')):
+    for r in reversed(df.to_dict('records')):
         ts=str(r.get('created_at') or '')
         st.markdown(f"**{r.get('staff_name','(Unknown)')}**  \n{ts}")
         if r.get('message'):
@@ -3502,42 +3382,76 @@ def page_tasks():
         st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
 
     st.divider()
-    st.subheader("📊 Cumulative Performance Scoreboard")
-    st.caption("Scores are aggregated directly from the points ledger (single source of truth).")
+    st.subheader("📊 Monthly Performance Scoreboard")
+    st.caption("This scoreboard is the single source of truth for monthly points. Staff of the Month is simply the top scorer for the selected month.")
 
-    perf = fetch_df("""
-        SELECT
-            s.id,
-            s.name,
-            s.rank,
-            s.section,
-            COALESCE(SUM(CASE WHEN p.source = 'task' THEN p.points END), 0) AS task_points,
-            COALESCE(SUM(CASE WHEN p.source IN ('biweekly','report') THEN p.points END), 0) AS report_points,
-            COALESCE(SUM(CASE WHEN p.source = 'test' THEN p.points END), 0) AS test_points,
-            COALESCE(SUM(p.points), 0) AS total_score
-        FROM staff s
-        LEFT JOIN points p ON p.staff_id = s.id
-        GROUP BY s.id, s.name, s.rank, s.section
-        ORDER BY total_score DESC, s.name ASC;
-    """)
+    c1,c2,c3=st.columns([2,2,3])
+    with c1:
+        sel_month = st.date_input("Month", value=_month_start(_today()), help="Select any date in the month.")
+    ms=_month_start(sel_month)
 
-    if perf.empty:
-        st.info("No points recorded yet.")
+    with c2:
+        if is_admin():
+            inc_soft = st.toggle("Include soft factors", value=_perf_include_soft(), help="Admin can include Reliability + Attention to Detail in ranking.")
+            set_setting("PERF_INCLUDE_SOFT", "1" if inc_soft else "0")
+        else:
+            inc_soft = _perf_include_soft()
+            st.caption(f"Soft factors: {'ON' if inc_soft else 'OFF'}")
+
+    with c3:
+        if is_admin():
+            if st.button("🔄 Compute/Refresh month", help="Recompute monthly points and store to Performance Index."):
+                compute_and_store_monthly_performance(ms)
+                st.success("Monthly performance updated.")
+                st.rerun()
+        else:
+            st.button("🔄 Compute/Refresh month", disabled=True, help="Only Admin can recompute/store monthly performance.")
+
+    lb = get_monthly_leaderboard(ms, include_soft=inc_soft)
+    with st.expander("How points are calculated", expanded=False):
+        st.markdown("""- **Tasks (completed in the selected month)**: within allotted days = **3 pts**; within **1.5×** allotted days = **2 pts**; beyond **1.5×** = **1 pt**.  
+- **Bi‑weekly reports (per project you are posted to; due dates within the selected month)**: on/before due date = **3 pts**; within 7 days late = **2 pts**; after 7 days = **1 pt**.  
+- **Test results (submitted in the selected month)**: each submission = **3 pts** (shared across staff posted to the project).""")
+
+    if lb.empty:
+        st.info("No monthly records yet. Admin should click **Compute/Refresh month**.")
     else:
-        st.dataframe(
-            perf[[
-                "name",
-                "rank",
-                "section",
-                "task_points",
-                "report_points",
-                "test_points",
-                "total_score",
-            ]],
-            use_container_width=True,
-        )
-        winner = perf.iloc[0]
-        st.success(f"🏆 Top performer (cumulative): **{winner['name']}** — {int(winner['total_score'])} points")
+        st.dataframe(lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Reliability","Attention to Detail","Total Score"]] if inc_soft else lb[["Name","Rank","Section","Task Points","Report Points","Test Points","Total Score"]], use_container_width=True)
+        top = lb.iloc[0]
+        st.success(f"Staff of the Month (derived): **{top['Name']}** — {int(top['Total Score'])} points")
+
+    if is_admin():
+        st.markdown("#### Admin: soft-factor scoring")
+        staff_opts = fetch_df("SELECT id, name FROM staff ORDER BY name")
+        if not staff_opts.empty:
+            name_to_id = {r["name"]: int(r["id"]) for _,r in staff_opts.iterrows()}
+            pick = st.selectbox("Select staff", list(name_to_id.keys()), key="pi_staff_pick")
+            sid = name_to_id[pick]
+            ex = fetch_df("SELECT reliability_score, attention_to_detail_score FROM performance_index WHERE staff_id=? AND month=?", (sid, str(ms)))
+            r0 = int(ex.iloc[0].get("reliability_score") or 0) if not ex.empty else 0
+            a0 = int(ex.iloc[0].get("attention_to_detail_score") or 0) if not ex.empty else 0
+            rscore = st.number_input("Reliability", min_value=0, max_value=50, value=r0, step=1)
+            ascore = st.number_input("Attention to Detail", min_value=0, max_value=50, value=a0, step=1)
+            if st.button("💾 Save soft scores", key="pi_save_soft"):
+                # ensure base points exist
+                compute_and_store_monthly_performance(ms)
+                ex2 = fetch_df("SELECT task_points, report_points, test_points FROM performance_index WHERE staff_id=? AND month=?", (sid, str(ms)))
+                tp = int(ex2.iloc[0].get("task_points") or 0) if not ex2.empty else 0
+                rp = int(ex2.iloc[0].get("report_points") or 0) if not ex2.empty else 0
+                tsp = int(ex2.iloc[0].get("test_points") or 0) if not ex2.empty else 0
+                upsert_performance_index(sid, ms, tp, rp, tsp, reliability=int(rscore), attention=int(ascore))
+                st.success("Soft scores saved.")
+                st.rerun()
+
+        st.markdown("#### Admin: post to chat group")
+        last_day = _is_last_day_of_month(_today())
+        st.caption("WorkNest can auto-post on the last day of the month via reminder_worker. You can also post manually here.")
+        if st.button("📢 Post Staff of the Month to Chat", disabled=(lb.empty), key="pi_post_now"):
+            ok,msg = post_staff_of_month(ms, force=False)
+            if ok:
+                st.success("Posted to chat.")
+            else:
+                st.warning(msg)
 
 
 def page_admin_inbox():
@@ -4304,8 +4218,6 @@ def page_ml():
 
 def main():
     init_db(); apply_styles()
-    # Restore login from remember-token cookie (if present)
-    try_auto_login_from_cookie()
     if not current_user():
         login_ui(); return
 
