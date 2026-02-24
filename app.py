@@ -2638,7 +2638,7 @@ def page_chat():
         return
 
     # show oldest -> newest
-    for r in reversed(df.to_dict('records')):
+    for r in (df.to_dict('records')):
         ts=str(r.get('created_at') or '')
         st.markdown(f"**{r.get('staff_name','(Unknown)')}**  \n{ts}")
         if r.get('message'):
