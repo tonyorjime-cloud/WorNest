@@ -929,6 +929,22 @@ def fetch_df(q, p=()):
         try: c.close()
         except Exception: pass
 
+
+def safe_parse_date(val, default=None):
+    """Parse a date-like value defensively (handles None/'NaN'/bad strings)."""
+    from datetime import date as _date
+    if default is None:
+        default = _date.today()
+    if val is None:
+        return default
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return default
+    try:
+        return dtparser.parse(s).date()
+    except Exception:
+        return default
+
 def execute(q, p=()):
     q=_adapt_query(q).strip()
     c=get_conn()
@@ -2102,7 +2118,7 @@ def page_dashboard():
         df_items["__due_sort"]=pd.to_datetime(df_items["due"], errors="coerce")
         df_items["__status_sort"]=df_items["status"].map(lambda s: 0 if s=="Overdue" else 1)
         df_items=df_items.sort_values(["__status_sort","__due_sort","type","item"]).drop(columns=["__due_sort","__status_sort"])
-        st.dataframe(df_items, hide_index=True, use_container_width=True)
+        st.dataframe(df_items, hide_index=True, width='stretch')
     else:
         st.success("No due/overdue items in the next 7 days.")
 
@@ -2459,7 +2475,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=date.today(), key="lv_start")
+        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -2743,8 +2759,8 @@ def page_projects():
         name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key=f"proj_name{suffix}")
         client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key=f"proj_client{suffix}")
         location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key=f"proj_loc{suffix}")
-        start=st.date_input("Start Date", value=(dtparser.parse(selected["start_date"]).date() if selected is not None and pd.notna(selected["start_date"]) else date.today()), key=f"proj_start{suffix}")
-        end=st.date_input("End Date", value=(dtparser.parse(selected["end_date"]).date() if selected is not None and pd.notna(selected["end_date"]) else date.today()), key=f"proj_end{suffix}")
+        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        end=st.date_input("End Date", value=(safe_parse_date(selected["end_date"], date.today()) if selected is not None else date.today()), key=f"proj_end{suffix}")
         sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
         sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key=f"proj_sup{suffix}")
         colA,colB=st.columns(2)
@@ -3055,7 +3071,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=date.today(), key="lv_start")
+        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -3534,7 +3550,7 @@ def page_tasks():
                 "test_points",
                 "total_score",
             ]],
-            use_container_width=True,
+            width='stretch',
         )
         winner = perf.iloc[0]
         st.success(f"🏆 Top performer (cumulative): **{winner['name']}** — {int(winner['total_score'])} points")
@@ -4002,7 +4018,7 @@ def page_staff_directory():
             df["email"].fillna("").str.lower().str.contains(ql)
         )
         df = df[mask]
-    st.dataframe(df.drop(columns=["id"]), use_container_width=True)
+    st.dataframe(df.drop(columns=["id"]), width='stretch')
 
 def page_account():
     st.title("⚙️ Account")
@@ -4276,7 +4292,7 @@ def page_ml():
     df = _ml_fetch_training_df()
     st.caption(f"Training rows available: {len(df)}")
     with st.expander("Preview training data"):
-        st.dataframe(df.head(50), use_container_width=True)
+        st.dataframe(df.head(50), width='stretch')
 
     col1,col2 = st.columns(2)
     with col1:
