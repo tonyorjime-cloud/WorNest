@@ -1011,38 +1011,75 @@ def exec_sql(q: str, p=None):
 # Push Notifications (OneSignal Web Push)
 # ---------------------------
 def _onesignal_cfg():
-    """Return (app_id, rest_api_key) or (None, None) if not configured."""
-    app_id = os.getenv("ONESIGNAL_APP_ID")
-    api_key = os.getenv("ONESIGNAL_REST_API_KEY")
-    if not app_id or not api_key or requests is None:
+    """Return (app_id, rest_api_key). app_id is required for web SDK; rest_api_key is only required for server-side sends."""
+    app_id = (os.getenv("ONESIGNAL_APP_ID") or "").strip()
+    api_key = (os.getenv("ONESIGNAL_REST_API_KEY") or "").strip()
+    if not app_id:
         return None, None
-    return app_id.strip(), api_key.strip()
+    return app_id, (api_key or None)
+
 
 
 def render_push_opt_in(external_user_id: str):
-    """Inject OneSignal SDK and (if configured) bind the user to external_user_id (usually email)."""
+    """Inject OneSignal Web SDK and bind the logged-in user to an External ID (typically email)."""
     app_id, _ = _onesignal_cfg()
     if not app_id:
         return
-    # Avoid re-injecting every rerun
+
+    # Avoid re-injecting on every Streamlit rerun
     key = f"onesignal_bound::{external_user_id}"
     if st.session_state.get(key):
         return
     st.session_state[key] = True
+
+    # Streamlit static files are served under /app/static/...
+    sw_path = "/app/static/OneSignalSDKWorker.js"
+    sw_updater_path = "/app/static/OneSignalSDKUpdaterWorker.js"
+
     components.html(
         f"""
-        <script src="https://cdn.onesignal.com/sdks/OneSignalSDK.js" async=""></script>
+        <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
         <script>
-          window.OneSignal = window.OneSignal || [];
-          OneSignal.push(function() {{
-            OneSignal.init({{ appId: "{app_id}", notifyButton: {{ enable: true }} }});
-            try {{ OneSignal.login("{external_user_id}"); }} catch (e) {{ /* ignore */ }}
+          window.OneSignalDeferred = window.OneSignalDeferred || [];
+          OneSignalDeferred.push(async function(OneSignal) {{
+            try {{
+              await OneSignal.init({{
+                appId: "{app_id}",
+                serviceWorkerPath: "{sw_path}",
+                serviceWorkerUpdaterPath: "{sw_updater_path}",
+                serviceWorkerParam: {{ scope: "/" }},
+                notifyButton: {{ enable: false }}
+              }});
+              try {{ await OneSignal.login("{external_user_id}"); }} catch (e) {{}}
+            }} catch (e) {{
+              console.warn("OneSignal init/login failed", e);
+            }}
           }});
         </script>
         """,
         height=0,
     )
 
+
+def prompt_push_opt_in():
+    """Show OneSignal permission prompt on user action (best practice)."""
+    app_id, _ = _onesignal_cfg()
+    if not app_id:
+        st.warning("Push notifications are not configured on this server.")
+        return
+    components.html(
+        """
+        <script>
+          try {
+            window.OneSignalDeferred = window.OneSignalDeferred || [];
+            OneSignalDeferred.push(async function(OneSignal) {
+              try { await OneSignal.Slidedown.promptPush({force: true}); } catch(e) {}
+            });
+          } catch(e) {}
+        </script>
+        """,
+        height=0,
+    )
 
 def send_push(external_user_ids, title: str, message: str):
     """Send a push notification to OneSignal users identified by external_user_ids (emails).
@@ -1878,12 +1915,6 @@ def login_ui():
                         cookies.save()
                 except Exception:
                     pass
-# OneSignal: identify user for push/in-app (no prompt on login)
-try:
-    _onesignal_bootstrap(st.session_state["user"].get("username") or st.session_state["user"].get("name") or str(st.session_state["user"].get("id")), prompt=False)
-except Exception:
-    pass
-
 
             try:
                 if int(st.session_state["user"].get("must_change_password") or 0)==1:
@@ -4029,15 +4060,6 @@ def page_staff_directory():
     st.dataframe(df.drop(columns=["id"]), width='stretch')
 
 def page_account():
-st.divider()
-st.subheader("Push notifications (OneSignal)")
-st.caption("Enable browser notifications on this device. This works best on desktop Chrome/Edge and Android Chrome.")
-if st.button("Enable push notifications on this device", key="onesignal_enable_btn"):
-    ext_id = (u.get("username") or u.get("name") or str(u.get("id")))
-    _onesignal_bootstrap(ext_id, prompt=True)
-    st.success("If your browser supports it, you should see the permission prompt. After allowing, you can receive notifications.")
-
-
     st.title("⚙️ Account")
     u = st.session_state.get("user")
     if not u:
@@ -4052,6 +4074,11 @@ if st.button("Enable push notifications on this device", key="onesignal_enable_b
         st.warning("You must change your password before continuing.")
 
     st.subheader("Change password")
+
+# --- Push Notifications (OneSignal) ---
+if st.button("🔔 Enable push notifications on this device", key="push_enable_btn"):
+    prompt_push_opt_in()
+
     st.caption("After a successful change, we’ll take you back to the dashboard.")
 
     # Use a form so Streamlit clears inputs on submit and prevents accidental double-clicks.
