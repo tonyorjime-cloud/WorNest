@@ -4075,9 +4075,7 @@ def page_account():
 
     st.subheader("Change password")
 
-# --- Push Notifications (OneSignal) ---
-if st.button("🔔 Enable push notifications on this device", key="push_enable_btn"):
-    prompt_push_opt_in()
+
 
     st.caption("After a successful change, we’ll take you back to the dashboard.")
 
@@ -4110,6 +4108,12 @@ if st.button("🔔 Enable push notifications on this device", key="push_enable_b
                 # Request navigation away (handled before sidebar radio is created)
                 st.session_state["_pending_nav"] = "🏠 Dashboard"
                 st.rerun()
+
+        return  # <-- IMPORTANT: stop here
+
+# --- Push Notifications (OneSignal) ---
+if st.button("🔔 Enable push notifications on this device", key="push_enable_btn"):
+    prompt_push_opt_in()
 
 
 def _read_help_md(fname:str)->str:
