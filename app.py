@@ -1,3 +1,8 @@
+
+try:
+    from streamlit_javascript import st_javascript
+except Exception:
+    st_javascript = None
 import os, hashlib, secrets
 import datetime as dt
 import smtplib, ssl
@@ -1007,87 +1012,172 @@ def exec_sql(q: str, p=None):
     return execute_sql(q, p)
 
 
+
 # ---------------------------
 # Push Notifications (OneSignal Web Push)
 # ---------------------------
 def _onesignal_cfg():
-    """Return (app_id, rest_api_key). app_id is required for web SDK; rest_api_key is only required for server-side sends."""
+    """Return OneSignal config dict.
+
+    - ONESIGNAL_APP_ID is required for browser-side opt-in (Web SDK).
+    - ONESIGNAL_REST_API_KEY is optional and only needed for server-side sending.
+    """
     app_id = (os.getenv("ONESIGNAL_APP_ID") or "").strip()
     api_key = (os.getenv("ONESIGNAL_REST_API_KEY") or "").strip()
-    if not app_id:
-        return None, None
-    return app_id, (api_key or None)
+    return {
+        "app_id": app_id or None,
+        "api_key": api_key or None,
+    }
 
 
+def _onesignal_init_js(app_id: str, external_user_id: str | None = None) -> str:
+    """JS snippet to init OneSignal Web SDK v16 and optionally login with external_user_id."""
+    ext = (external_user_id or "").replace('"', '\"')
+    login_line = f'try {{ OneSignal.login("{ext}"); }} catch(e) {{}}' if ext else ""
+    return f"""
+<script src=\"https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js\" async></script>
+<script>
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  OneSignalDeferred.push(async function(OneSignal) {{
+    try {{
+      await OneSignal.init({{
+        appId: \"{app_id}\",
+        serviceWorkerPath: \"/app/static/OneSignalSDKWorker.js\",
+        serviceWorkerUpdaterPath: \"/app/static/OneSignalSDKUpdaterWorker.js\",
+        serviceWorkerParam: {{ scope: \"/\" }},
+      }});
+      {login_line}
+    }} catch (e) {{
+      // ignore init errors here; status probe will expose them when needed
+    }}
+  }});
+</script>
+"""
 
-def render_push_opt_in(external_user_id: str):
-    """Inject OneSignal Web SDK and bind the logged-in user to an External ID (typically email)."""
-    app_id, _ = _onesignal_cfg()
+
+def render_push_bind(external_user_id: str):
+    """Inject OneSignal init and bind the browser to external_user_id (email recommended)."""
+    cfg = _onesignal_cfg()
+    app_id = cfg.get("app_id")
     if not app_id:
         return
-
-    # Avoid re-injecting on every Streamlit rerun
     key = f"onesignal_bound::{external_user_id}"
     if st.session_state.get(key):
         return
     st.session_state[key] = True
+    components.html(_onesignal_init_js(app_id, external_user_id), height=0)
 
-    # Streamlit static files are served under /app/static/...
-    sw_path = "/app/static/OneSignalSDKWorker.js"
-    sw_updater_path = "/app/static/OneSignalSDKUpdaterWorker.js"
 
+def onesignal_get_status(app_id: str, external_user_id: str | None = None):
+    """Return dict with permission/subscription status from the browser.
+
+    Requires streamlit-javascript; if unavailable returns None.
+    """
+    if st_javascript is None:
+        return None
+
+    ext = (external_user_id or "").replace('"', '\"')
+    login_snip = f'try {{ OneSignal.login("{ext}"); }} catch(e) {{}}' if ext else ""
+    js = f"""
+async () => {{
+  return new Promise((resolve) => {{
+    const ensureScript = () => {{
+      if (document.querySelector('script[src*="OneSignalSDK.page.js"]')) return;
+      const s = document.createElement("script");
+      s.src = "https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js";
+      s.async = true;
+      document.head.appendChild(s);
+    }};
+    ensureScript();
+
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    OneSignalDeferred.push(async function(OneSignal) {{
+      try {{
+        await OneSignal.init({{
+          appId: "{app_id}",
+          serviceWorkerPath: "/app/static/OneSignalSDKWorker.js",
+          serviceWorkerUpdaterPath: "/app/static/OneSignalSDKUpdaterWorker.js",
+          serviceWorkerParam: {{ scope: "/" }},
+        }});
+        {login_snip}
+        const perm = Notification.permission; // granted | denied | default
+        let supported = true;
+        try {{
+          supported = !!(window.Notification && navigator.serviceWorker);
+        }} catch(e) {{}}
+        let optedIn = false;
+        try {{
+          optedIn = !!(OneSignal?.User?.PushSubscription?.optedIn);
+        }} catch(e) {{}}
+        resolve({{ perm, subscribed: optedIn, supported }});
+      }} catch (e) {{
+        resolve({{ error: String(e) }});
+      }}
+    }});
+  }});
+}}
+"""
+    return st_javascript(js)
+
+
+def onesignal_prompt_opt_in(app_id: str, external_user_id: str | None = None):
+    """Trigger the OneSignal permission prompt (best called from a button click)."""
+    ext = (external_user_id or "").replace('"', '\"')
+    login_line = f'try {{ OneSignal.login("{ext}"); }} catch(e) {{}}' if ext else ""
     components.html(
-        f"""
-        <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
-        <script>
-          window.OneSignalDeferred = window.OneSignalDeferred || [];
-          OneSignalDeferred.push(async function(OneSignal) {{
-            try {{
-              await OneSignal.init({{
-                appId: "{app_id}",
-                serviceWorkerPath: "{sw_path}",
-                serviceWorkerUpdaterPath: "{sw_updater_path}",
-                serviceWorkerParam: {{ scope: "/" }},
-                notifyButton: {{ enable: false }}
-              }});
-              try {{ await OneSignal.login("{external_user_id}"); }} catch (e) {{}}
-            }} catch (e) {{
-              console.warn("OneSignal init/login failed", e);
-            }}
-          }});
-        </script>
-        """,
+        _onesignal_init_js(app_id, external_user_id)
+        + f"""
+<script>
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  OneSignalDeferred.push(async function(OneSignal) {{
+    try {{
+      {login_line}
+      // Show the prompt
+      if (OneSignal?.Slidedown?.promptPush) {{
+        OneSignal.Slidedown.promptPush({{ force: true }});
+      }} else if (OneSignal?.Notifications?.requestPermission) {{
+        OneSignal.Notifications.requestPermission();
+      }}
+    }} catch(e) {{}}
+  }});
+</script>
+""",
         height=0,
     )
 
 
-def prompt_push_opt_in():
-    """Show OneSignal permission prompt on user action (best practice)."""
-    app_id, _ = _onesignal_cfg()
-    if not app_id:
-        st.warning("Push notifications are not configured on this server.")
-        return
+def onesignal_opt_out(app_id: str, external_user_id: str | None = None):
+    """Opt-out on this device."""
+    ext = (external_user_id or "").replace('"', '\"')
+    login_line = f'try {{ OneSignal.login("{ext}"); }} catch(e) {{}}' if ext else ""
     components.html(
-        """
-        <script>
-          try {
-            window.OneSignalDeferred = window.OneSignalDeferred || [];
-            OneSignalDeferred.push(async function(OneSignal) {
-              try { await OneSignal.Slidedown.promptPush({force: true}); } catch(e) {}
-            });
-          } catch(e) {}
-        </script>
-        """,
+        _onesignal_init_js(app_id, external_user_id)
+        + f"""
+<script>
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  OneSignalDeferred.push(async function(OneSignal) {{
+    try {{
+      {login_line}
+      if (OneSignal?.User?.PushSubscription?.optOut) {{
+        await OneSignal.User.PushSubscription.optOut();
+      }}
+    }} catch(e) {{}}
+  }});
+</script>
+""",
         height=0,
     )
+
 
 def send_push(external_user_ids, title: str, message: str):
     """Send a push notification to OneSignal users identified by external_user_ids (emails).
 
-    No-op if OneSignal is not configured.
+    Requires ONESIGNAL_APP_ID + ONESIGNAL_REST_API_KEY.
     """
-    app_id, api_key = _onesignal_cfg()
-    if not app_id:
+    cfg = _onesignal_cfg()
+    app_id = cfg.get("app_id")
+    api_key = cfg.get("api_key")
+    if not app_id or not api_key:
         return False
     if not external_user_ids:
         return False
@@ -4070,16 +4160,97 @@ def page_account():
     urec = fetch_df("SELECT id, username, role, is_admin, must_change_password FROM users WHERE id=?", (uid,))
     must = 0 if urec.empty else int(urec.iloc[0].get("must_change_password") or 0)
 
+    # Prefer email as external id for OneSignal targeting
+    external_id = (u.get("email") or u.get("username") or str(uid)).strip()
+
+    # If user is forced to change password, keep this page focused
     if must == 1:
         st.warning("You must change your password before continuing.")
+        st.subheader("Change password")
+        st.caption("After a successful change, we’ll take you back to the dashboard.")
 
+        with st.form("change_password_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            old = c1.text_input("Current password", type="password", key="pwd_old")
+            new1 = c2.text_input("New password", type="password", key="pwd_new1")
+            new2 = c2.text_input("Confirm new password", type="password", key="pwd_new2")
+            submitted = st.form_submit_button("Update password", type="primary")
+
+        if submitted:
+            if not new1 or len(new1) < 4:
+                st.error("Password is too short.")
+            elif new1 != new2:
+                st.error("Passwords do not match.")
+            else:
+                row = fetch_df("SELECT password_hash FROM users WHERE id=?", (uid,))
+                if row.empty or (hash_pwd(old) != str(row.iloc[0]["password_hash"])):
+                    st.error("Current password is incorrect.")
+                else:
+                    execute_sql(
+                        "UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+                        (hash_pwd(new1), uid),
+                    )
+                    st.session_state["user"]["must_change_password"] = 0
+                    st.session_state["flash_success"] = "Password updated successfully."
+                    st.session_state["_pending_nav"] = "🏠 Dashboard"
+                    st.rerun()
+        return
+
+    # ------------------------
+    # Push notifications UI
+    # ------------------------
+    cfg = _onesignal_cfg()
+    app_id = cfg.get("app_id")
+
+    st.markdown("### 🔔 Push Notifications")
+
+    if not app_id:
+        st.info("Push notifications are not configured on this server yet.")
+    elif st_javascript is None:
+        st.warning("Push notifications status checker is missing (streamlit-javascript). Please redeploy with updated requirements.")
+    else:
+        # Make sure OneSignal knows who this user is (External User ID)
+        render_push_bind(external_id)
+
+        status = onesignal_get_status(app_id, external_id) or {}
+        if status.get("error"):
+            st.warning("Push status not available yet. Refresh this page once.")
+        else:
+            perm = status.get("perm")
+            subscribed = bool(status.get("subscribed"))
+            supported = status.get("supported", True)
+
+            if not supported:
+                st.error("This browser does not support push notifications.")
+            elif perm == "denied":
+                st.error("Push notifications are blocked for this site in your browser settings.")
+                st.caption("In Chrome: click the padlock icon → Site settings → Notifications → Allow.")
+            elif subscribed:
+                st.success("Push notifications are enabled on this device ✅")
+                c1, c2 = st.columns([1, 2])
+                if c1.button("Disable on this device", key="push_disable_btn"):
+                    onesignal_opt_out(app_id, external_id)
+                    st.toast("Disabling…", icon="🔕")
+                    st.rerun()
+                c2.caption("You’ll keep receiving WorkNest notifications on this browser until you disable it.")
+            else:
+                if perm == "granted":
+                    st.info("Permission is granted, but you are not subscribed yet.")
+                else:
+                    st.info("Push notifications are not enabled on this device.")
+
+                if st.button("Enable push notifications on this device", key="push_enable_btn"):
+                    onesignal_prompt_opt_in(app_id, external_id)
+                    st.toast("Check your browser prompt…", icon="🔔")
+
+    st.divider()
+
+    # ------------------------
+    # Password change (optional)
+    # ------------------------
     st.subheader("Change password")
-
-
-
     st.caption("After a successful change, we’ll take you back to the dashboard.")
 
-    # Use a form so Streamlit clears inputs on submit and prevents accidental double-clicks.
     with st.form("change_password_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         old = c1.text_input("Current password", type="password", key="pwd_old")
@@ -4093,28 +4264,17 @@ def page_account():
         elif new1 != new2:
             st.error("Passwords do not match.")
         else:
-            # verify old
             row = fetch_df("SELECT password_hash FROM users WHERE id=?", (uid,))
             if row.empty or (hash_pwd(old) != str(row.iloc[0]["password_hash"])):
                 st.error("Current password is incorrect.")
             else:
-                execute(
-                    "UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+                execute_sql(
+                    "UPDATE users SET password_hash=? WHERE id=?",
                     (hash_pwd(new1), uid),
                 )
-                st.session_state["user"]["must_change_password"] = 0
-                # One-time flash on next render
                 st.session_state["flash_success"] = "Password updated successfully."
-                # Request navigation away (handled before sidebar radio is created)
                 st.session_state["_pending_nav"] = "🏠 Dashboard"
                 st.rerun()
-
-        return  # <-- IMPORTANT: stop here
-
-# --- Push Notifications (OneSignal) ---
-if st.button("🔔 Enable push notifications on this device", key="push_enable_btn"):
-    prompt_push_opt_in()
-
 
 def _read_help_md(fname:str)->str:
     path=os.path.join(BASE_DIR, "help", fname)

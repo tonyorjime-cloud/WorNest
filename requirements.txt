@@ -7,3 +7,4 @@ scikit-learn
 joblib
 streamlit-cookies-manager
 requests
+streamlit-javascript
