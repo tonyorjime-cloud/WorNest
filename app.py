@@ -10,6 +10,8 @@ from streamlit_cookies_manager import CookieManager
 import uuid
 import streamlit.components.v1 as components
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Optional HTTP client (for push notifications)
 try:
     import requests
