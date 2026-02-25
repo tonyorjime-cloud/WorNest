@@ -1878,6 +1878,12 @@ def login_ui():
                         cookies.save()
                 except Exception:
                     pass
+# OneSignal: identify user for push/in-app (no prompt on login)
+try:
+    _onesignal_bootstrap(st.session_state["user"].get("username") or st.session_state["user"].get("name") or str(st.session_state["user"].get("id")), prompt=False)
+except Exception:
+    pass
+
 
             try:
                 if int(st.session_state["user"].get("must_change_password") or 0)==1:
@@ -4023,6 +4029,15 @@ def page_staff_directory():
     st.dataframe(df.drop(columns=["id"]), width='stretch')
 
 def page_account():
+st.divider()
+st.subheader("Push notifications (OneSignal)")
+st.caption("Enable browser notifications on this device. This works best on desktop Chrome/Edge and Android Chrome.")
+if st.button("Enable push notifications on this device", key="onesignal_enable_btn"):
+    ext_id = (u.get("username") or u.get("name") or str(u.get("id")))
+    _onesignal_bootstrap(ext_id, prompt=True)
+    st.success("If your browser supports it, you should see the permission prompt. After allowing, you can receive notifications.")
+
+
     st.title("⚙️ Account")
     u = st.session_state.get("user")
     if not u:
