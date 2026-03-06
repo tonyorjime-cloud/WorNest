@@ -3,7 +3,7 @@ try:
     from streamlit_javascript import st_javascript
 except Exception:
     st_javascript = None
-import os, hashlib, secrets
+import os, hashlib, secrets, html
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -3455,47 +3455,88 @@ def page_tasks():
                 bad = existing_ass["section"].fillna("").str.strip().apply(lambda x: x!=sec).any()
                 if bad:
                     can_edit = False
-        title=st.text_input("Title", value=trow["title"], key=f"tsk_title{tkey}", disabled=not can_edit)
-        desc=st.text_area("Description", value=trow["description"] or "", key=f"tsk_desc{tkey}", disabled=not can_edit)
-        date_assigned=st.date_input("Date assigned", value=dtparser.parse(trow["date_assigned"]).date(), key=f"tsk_da{tkey}", disabled=not can_edit)
-        due=st.date_input("Due date", value=dtparser.parse(trow["due_date"]).date(), key=f"tsk_due{tkey}", disabled=not can_edit)
-        da=int(max((due - date_assigned).days + 1, 1))
-        st.write(f"Days allotted (auto): **{da}**")
+        current_assignees = fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist()
         proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
         proj_value="—"
         if pd.notna(trow["project_id"]):
             pr=projects[projects["id"]==int(trow["project_id"])]
             if not pr.empty: proj_value=f"{pr['code'].iloc[0]} — {pr['name'].iloc[0]}"
-        proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key=f"tsk_proj{tkey}", disabled=not can_edit)
-        assignees=st.multiselect(
-            "Assignees",
-            staff_allowed["name"].tolist(),
-            key=f"tsk_asg{tkey}",
-            default=fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist(),
-            disabled=not can_edit,
+        assigned_by_name = ""
+        try:
+            creator = fetch_df("SELECT name FROM staff WHERE id=?", (int(trow.get("created_by")),))
+            if not creator.empty:
+                assigned_by_name = str(creator["name"].iloc[0])
+        except Exception:
+            assigned_by_name = ""
+        title_value = str(trow["title"] or "")
+        desc_value = str(trow["description"] or "")
+        date_assigned = dtparser.parse(trow["date_assigned"]).date()
+        due = dtparser.parse(trow["due_date"]).date()
+        da=int(max((due - date_assigned).days + 1, 1))
+
+        # Readable task summary for all users
+        st.markdown(
+            f"""
+            <div style="background:#ffffff;border:1px solid #d9d9d9;border-radius:10px;padding:16px 18px;margin:8px 0 14px 0;color:#111;">
+              <div style="font-size:1.15rem;font-weight:700;margin-bottom:10px;">{html.escape(title_value)}</div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 18px;line-height:1.6;">
+                <div><span style="font-weight:700;">Assigned by:</span> {html.escape(assigned_by_name or '—')}</div>
+                <div><span style="font-weight:700;">Date assigned:</span> {html.escape(str(date_assigned))}</div>
+                <div><span style="font-weight:700;">Due date:</span> {html.escape(str(due))}</div>
+                <div><span style="font-weight:700;">Days allotted:</span> {da}</div>
+                <div><span style="font-weight:700;">Project:</span> {html.escape(proj_value)}</div>
+                <div><span style="font-weight:700;">Assignees:</span> {html.escape(', '.join(current_assignees) if current_assignees else '—')}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+        st.markdown("**Description**")
+        st.markdown(
+            f"""
+            <div style="background:#f8f9fa;padding:16px;border-radius:10px;border:1px solid #d9d9d9;color:#111;white-space:pre-wrap;line-height:1.65;margin-bottom:16px;">
+              {html.escape(desc_value) if desc_value else '<span style="color:#555;">No description provided.</span>'}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if can_edit:
+            st.markdown("### Edit task")
+            title=st.text_input("Title", value=title_value, key=f"tsk_title{tkey}")
+            desc=st.text_area("Description", value=desc_value, key=f"tsk_desc{tkey}", height=240)
+            date_assigned=st.date_input("Date assigned", value=date_assigned, key=f"tsk_da{tkey}")
+            due=st.date_input("Due date", value=due, key=f"tsk_due{tkey}")
+            da=int(max((due - date_assigned).days + 1, 1))
+            st.write(f"Days allotted (auto): **{da}**")
+            proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key=f"tsk_proj{tkey}")
+            assignees=st.multiselect(
+                "Assignees",
+                staff_allowed["name"].tolist(),
+                key=f"tsk_asg{tkey}",
+                default=current_assignees,
+            )
+        else:
+            title = title_value
+            desc = desc_value
+            proj = proj_value
+            assignees = current_assignees
         colA,colB,colC=st.columns(3)
         with colA:
-            if st.button("💾 Save", key=f"tsk_save{tkey}", disabled=not can_edit):
-                if not can_edit:
-                    st.warning("You don't have permission to edit this task.")
-                else:
-                    execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
-                        (title, desc or None, str(date_assigned), int(da), str(due),
-                         int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None, tid))
-                    execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
-                    for nm in assignees:
-                        sid=int(staff[staff["name"]==nm]["id"].iloc[0])
-                        execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
-                    st.success("Task updated."); st.rerun()
+            if can_edit and st.button("💾 Save", key=f"tsk_save{tkey}"):
+                execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
+                    (title, desc or None, str(date_assigned), int(da), str(due),
+                     int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None, tid))
+                execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
+                for nm in assignees:
+                    sid=int(staff[staff["name"]==nm]["id"].iloc[0])
+                    execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
+                st.success("Task updated."); st.rerun()
         with colB:
             # Completion workflow: only Admin or permitted Section Heads can confirm completion.
             can_confirm = can_confirm_task_completion()
             btn_label = "✅ Confirm Completed (today)" if not is_admin() else "✅ Admin: Certify Completed (today)"
             if st.button(btn_label, key=f"tsk_done{tkey}", disabled=not can_confirm):
-                if not can_confirm:
-                    st.warning("You don't have permission to confirm completion.")
-                else:
                     # Section heads may only confirm tasks within their section
                     if (not is_admin()) and user_role()=='section_head':
                         sec = current_staff_section() or ""

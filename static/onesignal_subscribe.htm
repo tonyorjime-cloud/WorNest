@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WorkNest — Enable Notifications</title>
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #fafafa; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; border: 1px solid #e6e6e6; border-radius: 14px; padding: 18px 18px 14px; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p { margin: 8px 0; color: #333; line-height: 1.35; }
+    .muted { color: #666; font-size: 13px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #cfcfcf; background: #f4f4f4; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .status { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: #f7f7ff; border: 1px solid #e7e7ff; }
+    .ok { background: #f2fff6; border-color: #d6ffe3; }
+    .bad { background: #fff6f6; border-color: #ffd6d6; }
+    code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Enable Push Notifications</h1>
+    <p class="muted">This page registers notifications in a standard browser context (more reliable than inside the app frame).</p>
+
+    <button id="btn" onclick="enablePush()">Enable notifications</button>
+
+    <div id="status" class="status">Initializing…</div>
+
+    <p class="muted" style="margin-top:12px;">
+      If you don’t see a prompt: open <code>Chrome → Site settings → Notifications</code> and set this site to <b>Allow</b>.
+    </p>
+  </div>
+
+<script>
+  const STATUS = document.getElementById('status');
+  const BTN = document.getElementById('btn');
+
+  function setStatus(msg, cls) {
+    STATUS.className = 'status' + (cls ? (' ' + cls) : '');
+    STATUS.textContent = msg;
+  }
+
+  async function initOneSignal() {
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    return new Promise((resolve) => {
+      OneSignalDeferred.push(async function(OneSignal) {
+        try {
+          await OneSignal.init({
+            appId: "1afeee61-59b9-4277-8594-9a086d30767d",
+            serviceWorkerPath: "/app/static/OneSignalSDKWorker.js",
+            serviceWorkerUpdaterPath: "/app/static/OneSignalSDKUpdaterWorker.js",
+            serviceWorkerParam: { scope: "/app/" }
+          });
+          resolve(true);
+        } catch (e) {
+          console.error(e);
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  async function getSubState() {
+    try {
+      // v16 shape
+      const optedIn = !!(window.OneSignal?.User?.PushSubscription?.optedIn);
+      return optedIn;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function enablePush() {
+    BTN.disabled = true;
+    setStatus("Requesting permission…", "");
+    try {
+      // Request permission
+      if (window.OneSignal?.Notifications?.requestPermission) {
+        await window.OneSignal.Notifications.requestPermission();
+      } else {
+        // fallback
+        await Notification.requestPermission();
+      }
+
+      if (Notification.permission !== "granted") {
+        setStatus("Notifications are not allowed on this device. Please allow and retry.", "bad");
+        BTN.disabled = false;
+        return;
+      }
+
+      // Try opting in explicitly if available
+      try {
+        if (window.OneSignal?.User?.PushSubscription?.optIn) {
+          await window.OneSignal.User.PushSubscription.optIn();
+        }
+      } catch(e) {}
+
+      // Re-check after a short delay
+      setStatus("Finalizing subscription…", "");
+      await new Promise(r => setTimeout(r, 1200));
+
+      const ok = await getSubState();
+      if (ok) {
+        setStatus("Subscribed successfully ✅ Returning to WorkNest…", "ok");
+        setTimeout(() => {
+          window.location.href = "/";
+        }, 1800);
+      } else {
+        setStatus("Permission granted, but subscription did not complete. Try again once, or clear site data and retry.", "bad");
+        BTN.disabled = false;
+      }
+    } catch (e) {
+      console.error(e);
+      setStatus("An error occurred while enabling notifications. Please retry.", "bad");
+      BTN.disabled = false;
+    }
+  }
+
+  (async () => {
+    const ok = await initOneSignal();
+    if (!ok) {
+      setStatus("Failed to initialize notifications on this browser.", "bad");
+      BTN.disabled = true;
+      return;
+    }
+    if (Notification.permission === "granted") {
+      const sub = await getSubState();
+      if (sub) {
+        setStatus("Notifications are already enabled on this device ✅", "ok");
+        BTN.textContent = "Enabled";
+        BTN.disabled = true;
+      } else {
+        setStatus("Permission is granted. Click Enable to finalize subscription.", "");
+      }
+    } else if (Notification.permission === "denied") {
+      setStatus("Notifications are blocked for this site. Change it to Allow in browser settings, then reload.", "bad");
+    } else {
+      setStatus("Click Enable to allow notifications.", "");
+    }
+  })();
+</script>
+</body>
+</html>
