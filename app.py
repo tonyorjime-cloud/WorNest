@@ -817,6 +817,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 ("window_end", "ALTER TABLE biweekly_reports ADD COLUMN window_end TEXT"),
                 ("due_date", "ALTER TABLE biweekly_reports ADD COLUMN due_date TEXT"),
                 ("timing_status", "ALTER TABLE biweekly_reports ADD COLUMN timing_status TEXT"),
+                ("submitted_on", "ALTER TABLE biweekly_reports ADD COLUMN submitted_on TEXT"),
             ]:
                 if col not in cols:
                     try:
@@ -843,11 +844,17 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             pass
 
 
-        # projects: next_due_date
+        # projects: next_due_date / dormant status
         try:
             cols = [r[1] for r in cur.execute("PRAGMA table_info(projects)").fetchall()]
-            if "next_due_date" not in cols:
-                cur.execute("ALTER TABLE projects ADD COLUMN next_due_date TEXT")
+            for col, ddl in [
+                ("next_due_date", "ALTER TABLE projects ADD COLUMN next_due_date TEXT"),
+                ("status", "ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'ACTIVE'"),
+                ("dormant_since", "ALTER TABLE projects ADD COLUMN dormant_since TEXT"),
+                ("dormant_reason", "ALTER TABLE projects ADD COLUMN dormant_reason TEXT"),
+            ]:
+                if col not in cols:
+                    cur.execute(ddl)
         except Exception:
             pass
 
@@ -890,6 +897,11 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS reviewed_by_staff_id INTEGER")
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS review_note TEXT")
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS submitted_on TEXT")
+            execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ACTIVE'")
+            execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS dormant_since TEXT")
+            execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS dormant_reason TEXT")
+            execute("UPDATE projects SET status='ACTIVE' WHERE status IS NULL")
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_by_staff_id INTEGER")
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
@@ -910,6 +922,10 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 "ALTER TABLE biweekly_reports ADD COLUMN reviewed_by_staff_id INTEGER",
                 "ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT",
                 "ALTER TABLE biweekly_reports ADD COLUMN review_note TEXT",
+                "ALTER TABLE biweekly_reports ADD COLUMN submitted_on TEXT",
+                "ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'ACTIVE'",
+                "ALTER TABLE projects ADD COLUMN dormant_since TEXT",
+                "ALTER TABLE projects ADD COLUMN dormant_reason TEXT",
                 "ALTER TABLE test_results ADD COLUMN status TEXT DEFAULT 'PENDING'",
                 "ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER",
                 "ALTER TABLE test_results ADD COLUMN reviewed_at TEXT",
@@ -918,6 +934,8 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 try: execute(q)
                 except Exception: pass
             try: execute("UPDATE biweekly_reports SET status='APPROVED' WHERE status IS NULL")
+            except Exception: pass
+            try: execute("UPDATE projects SET status='ACTIVE' WHERE status IS NULL")
             except Exception: pass
             try: execute("UPDATE test_results SET status='APPROVED' WHERE status IS NULL")
             except Exception: pass
@@ -1326,27 +1344,46 @@ def _biweekly_cycle_for_due(due_date: dt.date | None) -> dict | None:
     return None
 
 
-def _project_report_rows(pid: int) -> pd.DataFrame:
-    return fetch_df(
-        """SELECT id, project_id, report_date, uploaded_at, COALESCE(status,'PENDING') AS status,
-                  cycle_no, window_start, window_end, due_date, timing_status
-           FROM biweekly_reports
-           WHERE project_id=?
-           ORDER BY date(COALESCE(due_date, report_date)) ASC, id ASC""",
-        (int(pid),),
-    )
+def _biweekly_backfill_cutoff_cycle() -> int:
+    try:
+        return int(get_setting("BIWEEKLY_LIVE_FROM_CYCLE", "10") or 10)
+    except Exception:
+        return 10
 
 
-def _project_open_biweekly_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
-    today = today or _today()
-    rdf = _project_report_rows(pid)
+def _project_meta(pid: int) -> dict:
+    df = fetch_df("SELECT id, start_date, COALESCE(status,'ACTIVE') AS status, dormant_since, dormant_reason FROM projects WHERE id=?", (int(pid),))
+    if df.empty:
+        return {"id": int(pid), "start_date": None, "status": "ACTIVE", "dormant_since": None, "dormant_reason": None}
+    return df.iloc[0].to_dict()
+
+
+def _project_is_dormant(pid: int) -> bool:
+    try:
+        return str(_project_meta(int(pid)).get("status") or "ACTIVE").upper() == "DORMANT"
+    except Exception:
+        return False
+
+
+def _project_first_cycle_index(pid: int) -> int:
+    meta = _project_meta(int(pid))
+    sd = _parse_date_safe(meta.get("start_date")) or _biweekly_start_date()
+    idx = 0
+    while idx < 500:
+        cyc = _biweekly_cycle_from_index(idx)
+        if cyc["window_end"] >= sd:
+            return idx
+        idx += 1
+    return 0
+
+
+def _project_nonrejected_cycle_map(pid: int) -> dict:
+    rdf = _project_report_rows(int(pid))
     existing = {}
     if not rdf.empty:
         for _, rr in rdf.iterrows():
-            due = _parse_date_safe(rr.get("due_date") or rr.get("report_date"))
             cyc_no = rr.get("cycle_no")
-            if due is None and cyc_no is None:
-                continue
+            due = _parse_date_safe(rr.get("due_date") or rr.get("report_date"))
             if cyc_no is None:
                 cyc = _biweekly_cycle_for_due(due)
                 cyc_no = cyc["cycle_no"] if cyc else None
@@ -1357,16 +1394,74 @@ def _project_open_biweekly_cycle(pid: int, today: dt.date | None = None) -> tupl
             status = str(rr.get("status") or "PENDING").upper()
             if status != "REJECTED":
                 existing[cyc_no] = status
-    idx = 0
-    while idx < 500:
+    return existing
+
+
+def _project_current_due_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
+    today = today or _today()
+    if _project_is_dormant(int(pid)):
+        return None, "Dormant project — reporting is ignored."
+    first_idx = _project_first_cycle_index(int(pid))
+    existing = _project_nonrejected_cycle_map(int(pid))
+    live_cutoff = _biweekly_backfill_cutoff_cycle()
+
+    upcoming_idx = None
+    for idx in range(first_idx, 500):
         cyc = _biweekly_cycle_from_index(idx)
-        cyc_no = cyc["cycle_no"]
-        if cyc["window_end"] > today:
-            return None, f"Current reporting window is still open until {cyc['window_end'].isoformat()}."
-        if cyc_no not in existing:
-            return cyc, None
-        idx += 1
-    return None, "Unable to determine reporting cycle."
+        if cyc["cycle_no"] < live_cutoff:
+            continue
+        if today <= cyc["due_date"]:
+            upcoming_idx = idx
+            break
+    if upcoming_idx is None:
+        return None, "No reporting cycle available."
+
+    # If the immediately previous live cycle is unresolved, treat that as the overdue current obligation.
+    prev_idx = upcoming_idx - 1
+    if prev_idx >= first_idx:
+        prev = _biweekly_cycle_from_index(prev_idx)
+        if prev["cycle_no"] >= live_cutoff and prev["due_date"] < today and prev["cycle_no"] not in existing:
+            return prev, None
+
+    cyc = _biweekly_cycle_from_index(upcoming_idx)
+    if cyc["cycle_no"] in existing:
+        return None, "Current cycle already submitted."
+    return cyc, None
+
+
+def _project_missing_historical_cycles(pid: int, today: dt.date | None = None) -> list[dict]:
+    today = today or _today()
+    if _project_is_dormant(int(pid)):
+        return []
+    existing = _project_nonrejected_cycle_map(int(pid))
+    first_idx = _project_first_cycle_index(int(pid))
+    out = []
+    cutoff = _biweekly_backfill_cutoff_cycle()
+    for idx in range(first_idx, 500):
+        cyc = _biweekly_cycle_from_index(idx)
+        if cyc["cycle_no"] >= cutoff:
+            break
+        if cyc["due_date"] > today:
+            break
+        if cyc["cycle_no"] not in existing:
+            out.append(cyc)
+    return out
+
+
+def _project_report_rows(pid: int) -> pd.DataFrame:
+    return fetch_df(
+        """SELECT id, project_id, report_date, uploaded_at, submitted_on, COALESCE(status,'PENDING') AS status,
+                  cycle_no, window_start, window_end, due_date, timing_status
+           FROM biweekly_reports
+           WHERE project_id=?
+           ORDER BY date(COALESCE(due_date, report_date)) ASC, id ASC""",
+        (int(pid),),
+    )
+
+
+def _project_open_biweekly_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
+    """Backward-compatible wrapper: return only the one live obligation the UI should care about."""
+    return _project_current_due_cycle(pid, today or _today())
 
 
 def _report_cycle_status_label(cycle: dict, submitted_on: dt.date | None = None) -> str:
@@ -1377,7 +1472,7 @@ def _report_cycle_status_label(cycle: dict, submitted_on: dt.date | None = None)
 
 def _award_biweekly_points(report_id: int) -> None:
     df = fetch_df(
-        "SELECT project_id, due_date, report_date, uploaded_at, timing_status FROM biweekly_reports WHERE id=?",
+        "SELECT project_id, due_date, report_date, uploaded_at, submitted_on, timing_status FROM biweekly_reports WHERE id=?",
         (int(report_id),),
     )
     if df.empty:
@@ -1385,7 +1480,7 @@ def _award_biweekly_points(report_id: int) -> None:
     r = df.iloc[0]
     pid = int(r["project_id"])
     due = _parse_date_safe(r.get("due_date") or r.get("report_date"))
-    submitted = _parse_date_safe(r.get("uploaded_at")) or due or _today()
+    submitted = _parse_date_safe(r.get("submitted_on")) or _parse_date_safe(r.get("uploaded_at")) or due or _today()
     timing = str(r.get("timing_status") or "").upper()
     pts = 3 if (timing == "LATE" or (due and submitted > due)) else 5
     posted = fetch_df("SELECT staff_id FROM project_staff WHERE project_id=?", (pid,))
@@ -2265,13 +2360,16 @@ def page_dashboard():
     sid=current_staff_id()
     admin=is_admin()
     selected = None  # ensure defined for all branches
-    col1,col2,col3=st.columns(3)
-    projects=fetch_df("SELECT * FROM projects")
+    col1,col2,col3,col4=st.columns(4)
+    projects=fetch_df("SELECT *, COALESCE(status,'ACTIVE') AS proj_status FROM projects")
     staff=fetch_df("SELECT * FROM staff")
     open_tasks=fetch_df("SELECT * FROM task_assignments WHERE status!='Completed'")
+    active_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="ACTIVE").sum())
+    dormant_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="DORMANT").sum())
     col1.metric("Projects", len(projects))
-    col2.metric("Staff", len(staff))
-    col3.metric("Open Tasks", len(open_tasks))
+    col2.metric("Active", active_projects)
+    col3.metric("Dormant", dormant_projects)
+    col4.metric("Open Tasks", len(open_tasks))
 
     def project_core_docs_status(pid):
         df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid, current_staff_id() or -1,))
@@ -2295,15 +2393,15 @@ def page_dashboard():
 
     # 1) Bi-weekly reports / project outputs due for projects you are posted to
     if admin:
-        proj_due=fetch_df("SELECT id,code,name,start_date,next_due_date FROM projects ORDER BY code")
+        proj_due=fetch_df("SELECT id,code,name,start_date,next_due_date,COALESCE(status,'ACTIVE') AS status FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT' ORDER BY code")
     else:
-        proj_due=fetch_df("SELECT P.id,P.code,P.name,P.start_date,P.next_due_date FROM projects P JOIN project_staff PS ON PS.project_id=P.id WHERE PS.staff_id=? ORDER BY P.code", (sid,))
+        proj_due=fetch_df("SELECT P.id,P.code,P.name,P.start_date,P.next_due_date,COALESCE(P.status,'ACTIVE') AS status FROM projects P JOIN project_staff PS ON PS.project_id=P.id WHERE PS.staff_id=? AND COALESCE(P.status,'ACTIVE')!='DORMANT' ORDER BY P.code", (sid,))
 
     for _,p in proj_due.iterrows():
         pid=int(p["id"])
         overdue,last_d,exp,reason = project_next_due(pid, p.get("start_date"), p.get("next_due_date"))
         if exp is None: continue
-        if overdue or (exp - today).days <= 7:
+        if overdue or (0 <= (exp - today).days <= 7):
             status = "Overdue" if overdue else "Due soon"
             items.append({
                 "type":"Project report",
@@ -2344,6 +2442,99 @@ def page_dashboard():
         st.dataframe(df_items, hide_index=True, width='stretch')
     else:
         st.success("No due/overdue items in the next 7 days.")
+
+    def _queue_rows(for_staff_id=None):
+        q = []
+        if for_staff_id is None:
+            pdf_q = fetch_df("SELECT id, code, name FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT' ORDER BY code")
+        else:
+            pdf_q = fetch_df("SELECT p.id, p.code, p.name FROM projects p JOIN project_staff ps ON ps.project_id=p.id WHERE ps.staff_id=? AND COALESCE(p.status,'ACTIVE')!='DORMANT' ORDER BY p.code", (int(for_staff_id),))
+        for _, pr in pdf_q.iterrows():
+            cyc, reason = _project_current_due_cycle(int(pr['id']), today)
+            if cyc is None:
+                continue
+            q.append({
+                'project': f"{pr.get('code','')} — {pr.get('name','')}",
+                'report_no': int(cyc['cycle_no']),
+                'window': f"{cyc['window_start'].isoformat()} → {cyc['window_end'].isoformat()}",
+                'due': cyc['due_date'].isoformat(),
+                'status': 'Overdue' if today > cyc['due_date'] else ('Due soon' if (cyc['due_date']-today).days <= 7 else 'Open')
+            })
+        return pd.DataFrame(q)
+
+    st.markdown("### 🗂️ Report Queue")
+    if sid is not None:
+        myq = _queue_rows(sid)
+        st.markdown("**My Pending Reports**")
+        if myq.empty:
+            st.caption("No pending report obligations for you right now.")
+        else:
+            st.dataframe(myq, hide_index=True, width='stretch')
+    if admin:
+        bq = _queue_rows(None)
+        st.markdown("**Branch Report Queue**")
+        if bq.empty:
+            st.caption("No pending report obligations across active projects.")
+        else:
+            st.dataframe(bq, hide_index=True, width='stretch')
+
+    st.markdown("### 📊 Reporting Compliance")
+    cutoff = _biweekly_backfill_cutoff_cycle()
+    active_pdf = fetch_df("SELECT id, code, name, start_date FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT'")
+    staff_pdf = fetch_df("SELECT DISTINCT s.id, s.name FROM staff s JOIN project_staff ps ON ps.staff_id=s.id JOIN projects p ON p.id=ps.project_id WHERE COALESCE(p.status,'ACTIVE')!='DORMANT' ORDER BY s.name")
+    if not active_pdf.empty and not staff_pdf.empty:
+        rows=[]
+        today_cycle = _project_current_due_cycle(int(active_pdf.iloc[0]['id']), today)[0]
+        latest_cycle_no = None
+        if today_cycle is not None:
+            latest_cycle_no = int(today_cycle['cycle_no']) if today <= today_cycle['due_date'] else int(today_cycle['cycle_no'])
+        else:
+            for idx in range(499, -1, -1):
+                cyc = _biweekly_cycle_from_index(idx)
+                if cyc['due_date'] <= today:
+                    latest_cycle_no = cyc['cycle_no']
+                    break
+        latest_cycle_no = latest_cycle_no or cutoff
+        approved = fetch_df("SELECT project_id, cycle_no, COALESCE(timing_status,'ON_TIME') AS timing_status, COALESCE(status,'PENDING') AS status FROM biweekly_reports WHERE COALESCE(status,'PENDING')='APPROVED'")
+        posted = fetch_df("SELECT project_id, staff_id FROM project_staff")
+        app_map = {}
+        if not approved.empty:
+            for _, rr in approved.iterrows():
+                try:
+                    app_map.setdefault((int(rr['project_id']), int(rr['cycle_no'])), str(rr['timing_status']).upper())
+                except Exception:
+                    pass
+        post_map = {}
+        if not posted.empty:
+            for _, rr in posted.iterrows():
+                try:
+                    post_map.setdefault(int(rr['staff_id']), set()).add(int(rr['project_id']))
+                except Exception:
+                    pass
+        for _, sr in staff_pdf.iterrows():
+            sid2 = int(sr['id'])
+            ontime = late = missed = 0
+            total_points = 0
+            for pid2 in post_map.get(sid2, set()):
+                first_idx = _project_first_cycle_index(pid2)
+                for idx in range(first_idx, 500):
+                    cyc = _biweekly_cycle_from_index(idx)
+                    if cyc['cycle_no'] < cutoff or cyc['cycle_no'] > latest_cycle_no:
+                        continue
+                    if cyc['due_date'] > today:
+                        continue
+                    timing = app_map.get((pid2, cyc['cycle_no']))
+                    if timing is None:
+                        missed += 1
+                    elif timing == 'LATE':
+                        late += 1
+                        total_points += 3
+                    else:
+                        ontime += 1
+                        total_points += 5
+            rows.append({'Engineer': sr['name'], 'On-time': ontime, 'Late': late, 'Missed': missed, 'Points': total_points})
+        cdf = pd.DataFrame(rows).sort_values(['Points','On-time','Engineer'], ascending=[False,False,True])
+        st.dataframe(cdf, hide_index=True, width='stretch')
 
     # --- Project Quick Edit (Admin only) ---
     st.markdown("### Project Quick Edit")
@@ -2921,14 +3112,16 @@ def page_projects():
     if is_admin() or can_manage_projects():
         projects=fetch_df("""
             SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
+                   COALESCE(p.status,'ACTIVE') AS status, p.dormant_since, p.dormant_reason,
                    (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
             FROM projects p
-            ORDER BY p.code
+            ORDER BY CASE WHEN COALESCE(p.status,'ACTIVE')='ACTIVE' THEN 0 ELSE 1 END, p.code
         """)
     else:
         sid = current_staff_id()
         projects=fetch_df("""
             SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
+                   COALESCE(p.status,'ACTIVE') AS status, p.dormant_since, p.dormant_reason,
                    (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor,
                    CASE WHEN EXISTS (
                         SELECT 1 FROM project_staff ps
@@ -2937,6 +3130,15 @@ def page_projects():
             FROM projects p
             ORDER BY _posted_sort, p.code
         """, (sid,))
+
+    # Filter large project lists
+    proj_filter = st.radio("Project view", ["Active", "Dormant", "All"], horizontal=True, key="proj_filter")
+    if not projects.empty:
+        ps = projects["status"].astype(str).str.upper()
+        if proj_filter == "Active":
+            projects = projects[ps == "ACTIVE"]
+        elif proj_filter == "Dormant":
+            projects = projects[ps == "DORMANT"]
 
     # Admin control: global reset of next bi-weekly due dates
     if is_admin():
@@ -2979,20 +3181,24 @@ def page_projects():
         end=st.date_input("End Date", value=(safe_parse_date(selected["end_date"], date.today()) if selected is not None else date.today()), key=f"proj_end{suffix}")
         sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
         sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key=f"proj_sup{suffix}")
+        status_opts = ["ACTIVE", "DORMANT"]
+        p_status = st.selectbox("Project Status", status_opts, index=(status_opts.index(str(selected.get('status') or 'ACTIVE').upper()) if selected is not None and str(selected.get('status') or 'ACTIVE').upper() in status_opts else 0), key=f"proj_status{suffix}")
+        dormant_since = st.text_input("Dormant Since (YYYY-MM-DD)", value=(selected.get('dormant_since') if selected is not None and pd.notna(selected.get('dormant_since')) else ""), key=f"proj_dormant_since{suffix}") if p_status == "DORMANT" else ""
+        dormant_reason = st.text_input("Dormant Reason", value=(selected.get('dormant_reason') if selected is not None and pd.notna(selected.get('dormant_reason')) else ""), key=f"proj_dormant_reason{suffix}") if p_status == "DORMANT" else ""
         colA,colB=st.columns(2)
         with colA:
             if can_manage_projects() and st.button("💾 Save / Update", key=f"proj_save{suffix}"):
                 if selected is None:
                     sup_id=None
                     if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""INSERT INTO projects (code,name,client,location,start_date,end_date,supervisor_staff_id)
-                               VALUES (?,?,?,?,?,?,?)""", (code,name,client or None,location or None,str(start),str(end),sup_id))
+                    execute("""INSERT INTO projects (code,name,client,location,start_date,end_date,supervisor_staff_id,status,dormant_since,dormant_reason)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)""", (code,name,client or None,location or None,str(start),str(end),sup_id,p_status,dormant_since or None,dormant_reason or None))
                     st.success("Project created.")
                 else:
                     sup_id=None
                     if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""UPDATE projects SET code=?,name=?,client=?,location=?,start_date=?,end_date=?,supervisor_staff_id=? WHERE id=?""",
-                            (code,name,client or None,location or None,str(start),str(end),sup_id,int(selected["id"])))
+                    execute("""UPDATE projects SET code=?,name=?,client=?,location=?,start_date=?,end_date=?,supervisor_staff_id=?,status=?,dormant_since=?,dormant_reason=? WHERE id=?""",
+                            (code,name,client or None,location or None,str(start),str(end),sup_id,p_status,(dormant_since or None) if p_status=='DORMANT' else None,(dormant_reason or None) if p_status=='DORMANT' else None,int(selected["id"])))
                     st.success("Project updated.")
                 st.rerun()
         with colB:
@@ -3155,53 +3361,83 @@ def page_projects():
             st.subheader("Biweekly Reports")
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-            current_cycle, cycle_reason = _project_open_biweekly_cycle(pid)
-            if current_cycle is not None:
-                st.markdown(
-                    f"""
-                    <div style="background:#f8f9fa;border:1px solid #d9d9d9;border-radius:10px;padding:14px 16px;margin:8px 0 12px 0;color:#111;line-height:1.65;">
-                      <div style="font-size:1.05rem;font-weight:700;margin-bottom:8px;">Current Reporting Window</div>
-                      <div><strong>Report No:</strong> {current_cycle['cycle_no']}</div>
-                      <div><strong>Reporting Period:</strong> {current_cycle['window_start'].isoformat()} → {current_cycle['window_end'].isoformat()}</div>
-                      <div><strong>Submission Deadline:</strong> Tue {current_cycle['due_date'].isoformat()}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            if _project_is_dormant(pid):
+                st.info("This project is dormant. Biweekly reporting is ignored while dormant.")
+                current_cycle, cycle_reason = None, "Dormant project"
             else:
-                st.info(cycle_reason or "No report window is currently available for upload.")
-            st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
-            if st.button("⬆️ Upload Report", key="bw_up"):
-                if not allowed:
-                    st.error("You don't have permission to upload to this project.")
-                elif current_cycle is None:
-                    st.error(cycle_reason or "No open reporting cycle is available.")
+                current_cycle, cycle_reason = _project_open_biweekly_cycle(pid)
+                if current_cycle is not None:
+                    st.markdown(
+                        f"""
+                        <div style="background:#f8f9fa;border:1px solid #d9d9d9;border-radius:10px;padding:14px 16px;margin:8px 0 12px 0;color:#111;line-height:1.65;">
+                          <div style="font-size:1.05rem;font-weight:700;margin-bottom:8px;">Current Reporting Window</div>
+                          <div><strong>Report No:</strong> {current_cycle['cycle_no']}</div>
+                          <div><strong>Reporting Period:</strong> {current_cycle['window_start'].isoformat()} → {current_cycle['window_end'].isoformat()}</div>
+                          <div><strong>Submission Deadline:</strong> Tue {current_cycle['due_date'].isoformat()}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
                 else:
-                    path=save_uploaded_file(up, f"project_{pid}/reports")
-                    if path:
-                        submitted_on = _today()
-                        timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
-                        rid = execute(
-                            "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                pid,
-                                str(current_cycle['due_date']),
-                                path,
-                                datetime.now().isoformat(timespec="seconds"),
-                                current_staff_id(),
-                                "PENDING",
-                                int(current_cycle['cycle_no']),
-                                str(current_cycle['window_start']),
-                                str(current_cycle['window_end']),
-                                str(current_cycle['due_date']),
-                                timing_status,
-                            ),
-                        )
-                        st.success(f"Report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                    st.info(cycle_reason or "No report window is currently available for upload.")
+
+                hist = _project_missing_historical_cycles(pid)
+                if hist:
+                    with st.expander("Historical Backfill (old report cycles)", expanded=False):
+                        options = {f"Report {c['cycle_no']} — {c['window_start'].isoformat()} → {c['window_end'].isoformat()} — Due {c['due_date'].isoformat()}": c for c in hist}
+                        pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
+                        chosen = options[pick]
+                        manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
+                        up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
+                        if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
+                            if not allowed:
+                                st.error("You don't have permission to upload to this project.")
+                            else:
+                                path = save_uploaded_file(up_hist, f"project_{pid}/reports")
+                                if path:
+                                    timing_status = "LATE" if manual_sub > chosen['due_date'] else "ON_TIME"
+                                    execute(
+                                        "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                        (pid, str(chosen['due_date']), path, datetime.now().isoformat(timespec='seconds'), str(manual_sub), current_staff_id(), 'PENDING', int(chosen['cycle_no']), str(chosen['window_start']), str(chosen['window_end']), str(chosen['due_date']), timing_status)
+                                    )
+                                    st.success(f"Historical report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                                    st.rerun()
+                                else:
+                                    st.error("Select a file first.")
+
+                st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
+                if st.button("⬆️ Upload Report", key="bw_up"):
+                    if not allowed:
+                        st.error("You don't have permission to upload to this project.")
+                    elif current_cycle is None:
+                        st.error(cycle_reason or "No open reporting cycle is available.")
                     else:
-                        st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no, window_start, window_end, due_date, timing_status FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC",(pid, current_staff_id()))
+                        path=save_uploaded_file(up, f"project_{pid}/reports")
+                        if path:
+                            submitted_on = _today()
+                            timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
+                            execute(
+                                "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    pid,
+                                    str(current_cycle['due_date']),
+                                    path,
+                                    datetime.now().isoformat(timespec="seconds"),
+                                    str(submitted_on),
+                                    current_staff_id(),
+                                    "PENDING",
+                                    int(current_cycle['cycle_no']),
+                                    str(current_cycle['window_start']),
+                                    str(current_cycle['window_end']),
+                                    str(current_cycle['due_date']),
+                                    timing_status,
+                                ),
+                            )
+                            st.success(f"Report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                        else:
+                            st.error("Select a file first.")
+            rdf=fetch_df("SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no, window_start, window_end, due_date, timing_status FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC",(pid, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
