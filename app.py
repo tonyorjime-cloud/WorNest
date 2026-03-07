@@ -2882,7 +2882,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -3529,7 +3529,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
