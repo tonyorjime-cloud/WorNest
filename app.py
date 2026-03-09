@@ -3,7 +3,7 @@ try:
     from streamlit_javascript import st_javascript
 except Exception:
     st_javascript = None
-import os, hashlib, secrets, html
+import os, hashlib, secrets, html, json, zipfile
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -2354,6 +2354,137 @@ def file_download_button(label, file_path, key):
     except Exception as e:
         st.error(f"Missing file: {file_path}")
 
+
+def _safe_slug(value: str) -> str:
+    value = (value or '').strip()
+    safe = ''.join(ch if ch.isalnum() or ch in ('-','_','.') else '_' for ch in value)
+    while '__' in safe:
+        safe = safe.replace('__', '_')
+    return safe.strip('_') or 'item'
+
+def _biweekly_package_paths(project_id: int, cycle_no: int | None) -> tuple[str, str, str]:
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    cyc = f"cycle_{int(cycle_no)}" if cycle_no is not None else 'cycle_x'
+    folder = os.path.join(UPLOAD_DIR, f"project_{project_id}", 'reports', f"{cyc}_{ts}_{uuid.uuid4().hex[:6]}")
+    os.makedirs(folder, exist_ok=True)
+    zip_path = os.path.join(folder, f"biweekly_{cyc}_{ts}.zip")
+    json_path = zip_path + '.json'
+    return folder, zip_path, json_path
+
+def _parse_photo_caption_lines(lines_text: str) -> list[dict]:
+    rows = []
+    for raw in (lines_text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 4:
+            rows.append({'filename': parts[0], 'element': parts[1], 'level': parts[2], 'date': parts[3]})
+        else:
+            rows.append({'filename': line, 'element': '', 'level': '', 'date': ''})
+    return rows
+
+def _build_biweekly_summary_text(payload: dict) -> str:
+    lines = []
+    lines.append(f"Project: {payload.get('project_name','—')}")
+    lines.append(f"Cycle No: {payload.get('cycle_no','—')}")
+    lines.append(f"Reporting Window: {payload.get('window_start','—')} to {payload.get('window_end','—')}")
+    lines.append(f"Due Date: {payload.get('due_date','—')}")
+    lines.append(f"Submitted By: {payload.get('uploader_name','—')}")
+    lines.append(f"Submitted At: {payload.get('uploaded_at','—')}")
+    lines.append(f"NIL Report: {'Yes' if payload.get('nil_report') else 'No'}")
+    lines.append('')
+    lines.append('Structural Activities / Progress')
+    lines.append(payload.get('activity_summary') or '—')
+    lines.append('')
+    lines.append('Reinforcement Checks')
+    lines.append(payload.get('reinforcement_checks') or '—')
+    lines.append('')
+    lines.append('HSE')
+    lines.append(payload.get('hse_summary') or '—')
+    lines.append('')
+    lines.append('Additional Notes / Constraints')
+    lines.append(payload.get('additional_notes') or '—')
+    lines.append('')
+    lines.append('RFI / SI / EI Register')
+    regs = payload.get('register_items') or []
+    if regs:
+        for item in regs:
+            if any(str(item.get(k,'')).strip() for k in ['type','ref','status','notes','date']):
+                lines.append(f"- {item.get('type','')} | {item.get('ref','')} | {item.get('date','')} | {item.get('status','')} | {item.get('notes','')}")
+    else:
+        lines.append('—')
+    lines.append('')
+    lines.append('NCR Register')
+    ncrs = payload.get('ncr_items') or []
+    if ncrs:
+        for item in ncrs:
+            if any(str(item.get(k,'')).strip() for k in ['ncr_no','status','action','owner']):
+                lines.append(f"- {item.get('ncr_no','')} | {item.get('status','')} | {item.get('action','')} | {item.get('owner','')}")
+    else:
+        lines.append('—')
+    lines.append('')
+    lines.append('Photo Captions')
+    photos = payload.get('photo_items') or []
+    if photos:
+        for item in photos:
+            lines.append(f"- {item.get('filename','')} | {item.get('element','')} | {item.get('level','')} | {item.get('date','')}")
+    else:
+        lines.append('—')
+    return '\n'.join(lines)
+
+def save_biweekly_form_package(project_id: int, payload: dict, uploaded_files: list) -> tuple[str, str]:
+    folder, zip_path, json_path = _biweekly_package_paths(int(project_id), payload.get('cycle_no'))
+    photo_dir = os.path.join(folder, 'photos')
+    os.makedirs(photo_dir, exist_ok=True)
+    saved_photos = []
+    for up in (uploaded_files or []):
+        if up is None:
+            continue
+        original_name = getattr(up, 'name', 'photo')
+        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_slug(original_name)}"
+        fpath = os.path.join(photo_dir, fname)
+        with open(fpath, 'wb') as f:
+            f.write(up.getbuffer())
+        saved_photos.append({'stored_path': fpath, 'filename': os.path.basename(fpath), 'original_name': original_name})
+    caption_rows = _parse_photo_caption_lines(payload.get('photo_captions') or '')
+    caption_map = {}
+    for row in caption_rows:
+        caption_map[(row.get('filename') or '').strip().lower()] = row
+    photo_items = []
+    for ph in saved_photos:
+        key1 = (ph.get('original_name') or '').strip().lower()
+        key2 = (ph.get('filename') or '').strip().lower()
+        meta = caption_map.get(key1) or caption_map.get(key2) or {'filename': ph.get('original_name') or ph.get('filename'), 'element': '', 'level': '', 'date': ''}
+        photo_items.append({'filename': ph.get('original_name') or ph.get('filename'), 'stored_filename': ph.get('filename'), 'element': meta.get('element',''), 'level': meta.get('level',''), 'date': meta.get('date','')})
+    payload = dict(payload)
+    payload['photo_items'] = photo_items
+    payload['photo_count'] = len(photo_items)
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    summary_path = os.path.join(folder, 'README.txt')
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write(_build_biweekly_summary_text(payload))
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.write(json_path, arcname='report.json')
+        zf.write(summary_path, arcname='README.txt')
+        for ph in saved_photos:
+            zf.write(ph['stored_path'], arcname=os.path.join('photos', os.path.basename(ph['stored_path'])))
+    return zip_path, json_path
+
+def _load_biweekly_meta(file_path: str):
+    if not file_path:
+        return None
+    candidates = [file_path + '.json', os.path.join(os.path.dirname(file_path), 'report.json')]
+    for cand in candidates:
+        try:
+            if os.path.exists(cand):
+                with open(cand, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+    return None
+
 # ---------- Dashboard ----------
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
@@ -3406,37 +3537,70 @@ def page_projects():
                                     st.error("Select a file first.")
 
                 st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
-                if st.button("⬆️ Upload Report", key="bw_up"):
+                st.info("Biweekly reports are now completed directly in WorkNest. No Excel macro or PDF conversion is required for current submissions.")
+                register_seed = pd.DataFrame([{'type':'RFI','ref':'','date':'','status':'','notes':''}])
+                ncr_seed = pd.DataFrame([{'ncr_no':'','status':'','action':'','owner':''}])
+                with st.form(key=f"bw_form_submit_{pid}"):
+                    nil_report = st.checkbox("No structural activity this period (submit as NIL)", key=f"bw_nil_{pid}")
+                    activity_summary = st.text_area("Structural activities / progress summary", key=f"bw_act_{pid}", height=130, placeholder="State what was done during the period. If NIL, state site condition and reason.")
+                    reinforcement_checks = st.text_area("Reinforcement checks", key=f"bw_rebar_{pid}", height=100, placeholder="Sizes, spacing, laps, cover, deviations and rectifications.")
+                    hse_summary = st.text_area("HSE observations / actions", key=f"bw_hse_{pid}", height=100, placeholder="PPE, housekeeping, work-at-height, permits, incidents / near misses, corrective actions.")
+                    register_items = st.data_editor(register_seed, key=f"bw_reg_{pid}", num_rows="dynamic", width='stretch', column_config={
+                        'type': st.column_config.SelectboxColumn('Type', options=['RFI','SI','EI']),
+                        'ref': 'Reference / No.',
+                        'date': 'Date',
+                        'status': st.column_config.SelectboxColumn('Status', options=['Open','Closed','Pending','Awaiting Reply']),
+                        'notes': 'Notes'
+                    })
+                    ncr_items = st.data_editor(ncr_seed, key=f"bw_ncr_{pid}", num_rows="dynamic", width='stretch', column_config={
+                        'ncr_no': 'NCR No.',
+                        'status': st.column_config.SelectboxColumn('Status', options=['Open','Closed','None']),
+                        'action': 'Corrective Action',
+                        'owner': 'Owner'
+                    })
+                    photo_files = st.file_uploader("Upload site photos", type=['png','jpg','jpeg'], accept_multiple_files=True, key=f"bw_photos_{pid}")
+                    st.caption("Photo captions: one line per file in this format → filename | Element | Level | Date")
+                    photo_captions = st.text_area("Photo captions register", key=f"bw_photo_caps_{pid}", height=120, placeholder="photo1.jpg | Column starter bars | Ground Floor | 01/02/2026")
+                    additional_notes = st.text_area("Additional notes / constraints", key=f"bw_notes_{pid}", height=90)
+                    submitted = st.form_submit_button("⬆️ Submit Biweekly Report")
+                if submitted:
                     if not allowed:
-                        st.error("You don't have permission to upload to this project.")
+                        st.error("You don't have permission to submit to this project.")
                     elif current_cycle is None:
                         st.error(cycle_reason or "No open reporting cycle is available.")
+                    elif (not nil_report) and not str(activity_summary or '').strip():
+                        st.error("Enter the structural activities / progress summary, or mark the report as NIL.")
                     else:
-                        path=save_uploaded_file(up, f"project_{pid}/reports")
-                        if path:
-                            submitted_on = _today()
-                            timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
-                            execute(
-                                "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (
-                                    pid,
-                                    str(current_cycle['due_date']),
-                                    path,
-                                    datetime.now().isoformat(timespec="seconds"),
-                                    str(submitted_on),
-                                    current_staff_id(),
-                                    "PENDING",
-                                    int(current_cycle['cycle_no']),
-                                    str(current_cycle['window_start']),
-                                    str(current_cycle['window_end']),
-                                    str(current_cycle['due_date']),
-                                    timing_status,
-                                ),
-                            )
-                            st.success(f"Report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
-                        else:
-                            st.error("Select a file first.")
+                        submitted_on = _today()
+                        timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
+                        uploader = current_user() or {}
+                        payload = {
+                            'project_id': pid,
+                            'project_name': selected['name'],
+                            'cycle_no': int(current_cycle['cycle_no']),
+                            'window_start': str(current_cycle['window_start']),
+                            'window_end': str(current_cycle['window_end']),
+                            'due_date': str(current_cycle['due_date']),
+                            'submitted_on': str(submitted_on),
+                            'uploaded_at': datetime.now().isoformat(timespec='seconds'),
+                            'uploader_staff_id': current_staff_id(),
+                            'uploader_name': uploader.get('name') or uploader.get('username') or '—',
+                            'nil_report': bool(nil_report),
+                            'activity_summary': activity_summary,
+                            'reinforcement_checks': reinforcement_checks,
+                            'hse_summary': hse_summary,
+                            'register_items': register_items.fillna('').to_dict('records') if hasattr(register_items, 'fillna') else [],
+                            'ncr_items': ncr_items.fillna('').to_dict('records') if hasattr(ncr_items, 'fillna') else [],
+                            'photo_captions': photo_captions,
+                            'additional_notes': additional_notes,
+                        }
+                        package_path, _meta_path = save_biweekly_form_package(pid, payload, photo_files or [])
+                        execute(
+                            "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (pid, str(current_cycle['due_date']), package_path, datetime.now().isoformat(timespec="seconds"), str(submitted_on), current_staff_id(), "PENDING", int(current_cycle['cycle_no']), str(current_cycle['window_start']), str(current_cycle['window_end']), str(current_cycle['due_date']), timing_status),
+                        )
+                        st.success(f"Biweekly report submitted in WorkNest. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                        st.rerun()
             rdf=fetch_df("SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no, window_start, window_end, due_date, timing_status FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC",(pid, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
