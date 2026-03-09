@@ -8,3 +8,5 @@ joblib
 streamlit-cookies-manager
 requests
 streamlit-javascript
+
+fpdf
