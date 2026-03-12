@@ -3,7 +3,7 @@ try:
     from streamlit_javascript import st_javascript
 except Exception:
     st_javascript = None
-import os, hashlib, secrets, html, json, zipfile
+import os, hashlib, secrets, html
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -131,6 +131,10 @@ def try_auto_login_from_cookie():
     # Touch last_used_at (best-effort)
     try:
         execute("UPDATE auth_tokens SET last_used_at=? WHERE token_hash=?", (_utcnow_iso(), token_hash))
+    except Exception:
+        pass
+    try:
+        log_login_event(st.session_state["user"], method="remember_me")
     except Exception:
         pass
     return True
@@ -571,6 +575,16 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
   last_used_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS login_activity (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
+  username TEXT,
+  login_at TEXT NOT NULL,
+  login_method TEXT,
+  session_key TEXT
+);
+
 CREATE TABLE IF NOT EXISTS performance_index (
   id SERIAL PRIMARY KEY,
   staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
@@ -789,6 +803,7 @@ CREATE TABLE IF NOT EXISTS test_results (
 );
 CREATE TABLE IF NOT EXISTS points (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, source TEXT NOT NULL, source_id INTEGER NOT NULL, points INTEGER NOT NULL, awarded_at TEXT NOT NULL, UNIQUE(staff_id, source, source_id));
 CREATE TABLE IF NOT EXISTS auth_tokens (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT);
+CREATE TABLE IF NOT EXISTS login_activity (id INTEGER PRIMARY KEY, user_id INTEGER, staff_id INTEGER, username TEXT, login_at TEXT NOT NULL, login_method TEXT, session_key TEXT);
 CREATE TABLE IF NOT EXISTS performance_index (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, month TEXT NOT NULL, task_points INTEGER DEFAULT 0, report_points INTEGER DEFAULT 0, test_points INTEGER DEFAULT 0, reliability_score INTEGER DEFAULT 0, attention_to_detail_score INTEGER DEFAULT 0, UNIQUE(staff_id, month));
 CREATE TABLE IF NOT EXISTS staff_of_month_posts (id INTEGER PRIMARY KEY, month TEXT NOT NULL UNIQUE, staff_id INTEGER, total_score INTEGER DEFAULT 0, posted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, image_path TEXT, posted_at TEXT NOT NULL);
@@ -2240,6 +2255,10 @@ def login_ui():
                     pass
 
             try:
+                log_login_event(st.session_state["user"], method="password")
+            except Exception:
+                pass
+            try:
                 if int(st.session_state["user"].get("must_change_password") or 0)==1:
                     st.session_state["force_pw_change"]=True
                     st.session_state["nav_radio"]="⚙️ Account"
@@ -2354,156 +2373,200 @@ def file_download_button(label, file_path, key):
     except Exception as e:
         st.error(f"Missing file: {file_path}")
 
-
-def _safe_slug(value: str) -> str:
-    value = (value or '').strip()
-    safe = ''.join(ch if ch.isalnum() or ch in ('-','_','.') else '_' for ch in value)
-    while '__' in safe:
-        safe = safe.replace('__', '_')
-    return safe.strip('_') or 'item'
-
-def _biweekly_package_paths(project_id: int, cycle_no: int | None) -> tuple[str, str, str]:
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    cyc = f"cycle_{int(cycle_no)}" if cycle_no is not None else 'cycle_x'
-    folder = os.path.join(UPLOAD_DIR, f"project_{project_id}", 'reports', f"{cyc}_{ts}_{uuid.uuid4().hex[:6]}")
-    os.makedirs(folder, exist_ok=True)
-    zip_path = os.path.join(folder, f"biweekly_{cyc}_{ts}.zip")
-    json_path = zip_path + '.json'
-    return folder, zip_path, json_path
-
-def _parse_photo_caption_lines(lines_text: str) -> list[dict]:
-    rows = []
-    for raw in (lines_text or '').splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split('|')]
-        if len(parts) >= 4:
-            rows.append({'filename': parts[0], 'element': parts[1], 'level': parts[2], 'date': parts[3]})
-        else:
-            rows.append({'filename': line, 'element': '', 'level': '', 'date': ''})
-    return rows
-
-def _build_biweekly_summary_text(payload: dict) -> str:
-    lines = []
-    lines.append(f"Project: {payload.get('project_name','—')}")
-    lines.append(f"Cycle No: {payload.get('cycle_no','—')}")
-    lines.append(f"Reporting Window: {payload.get('window_start','—')} to {payload.get('window_end','—')}")
-    lines.append(f"Due Date: {payload.get('due_date','—')}")
-    lines.append(f"Submitted By: {payload.get('uploader_name','—')}")
-    lines.append(f"Submitted At: {payload.get('uploaded_at','—')}")
-    lines.append(f"NIL Report: {'Yes' if payload.get('nil_report') else 'No'}")
-    lines.append('')
-    lines.append('Structural Activities / Progress')
-    lines.append(payload.get('activity_summary') or '—')
-    lines.append('')
-    lines.append('Reinforcement Checks')
-    lines.append(payload.get('reinforcement_checks') or '—')
-    lines.append('')
-    lines.append('HSE')
-    lines.append(payload.get('hse_summary') or '—')
-    lines.append('')
-    lines.append('Additional Notes / Constraints')
-    lines.append(payload.get('additional_notes') or '—')
-    lines.append('')
-    lines.append('RFI / SI / EI Register')
-    regs = payload.get('register_items') or []
-    if regs:
-        for item in regs:
-            if any(str(item.get(k,'')).strip() for k in ['type','ref','status','notes','date']):
-                lines.append(f"- {item.get('type','')} | {item.get('ref','')} | {item.get('date','')} | {item.get('status','')} | {item.get('notes','')}")
-    else:
-        lines.append('—')
-    lines.append('')
-    lines.append('NCR Register')
-    ncrs = payload.get('ncr_items') or []
-    if ncrs:
-        for item in ncrs:
-            if any(str(item.get(k,'')).strip() for k in ['ncr_no','status','action','owner']):
-                lines.append(f"- {item.get('ncr_no','')} | {item.get('status','')} | {item.get('action','')} | {item.get('owner','')}")
-    else:
-        lines.append('—')
-    lines.append('')
-    lines.append('Photo Captions')
-    photos = payload.get('photo_items') or []
-    if photos:
-        for item in photos:
-            lines.append(f"- {item.get('filename','')} | {item.get('element','')} | {item.get('level','')} | {item.get('date','')}")
-    else:
-        lines.append('—')
-    return '\n'.join(lines)
-
-def save_biweekly_form_package(project_id: int, payload: dict, uploaded_files: list) -> tuple[str, str]:
-    folder, zip_path, json_path = _biweekly_package_paths(int(project_id), payload.get('cycle_no'))
-    photo_dir = os.path.join(folder, 'photos')
-    os.makedirs(photo_dir, exist_ok=True)
-    saved_photos = []
-    for up in (uploaded_files or []):
-        if up is None:
-            continue
-        original_name = getattr(up, 'name', 'photo')
-        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_slug(original_name)}"
-        fpath = os.path.join(photo_dir, fname)
-        with open(fpath, 'wb') as f:
-            f.write(up.getbuffer())
-        saved_photos.append({'stored_path': fpath, 'filename': os.path.basename(fpath), 'original_name': original_name})
-    caption_rows = _parse_photo_caption_lines(payload.get('photo_captions') or '')
-    caption_map = {}
-    for row in caption_rows:
-        caption_map[(row.get('filename') or '').strip().lower()] = row
-    photo_items = []
-    for ph in saved_photos:
-        key1 = (ph.get('original_name') or '').strip().lower()
-        key2 = (ph.get('filename') or '').strip().lower()
-        meta = caption_map.get(key1) or caption_map.get(key2) or {'filename': ph.get('original_name') or ph.get('filename'), 'element': '', 'level': '', 'date': ''}
-        photo_items.append({'filename': ph.get('original_name') or ph.get('filename'), 'stored_filename': ph.get('filename'), 'element': meta.get('element',''), 'level': meta.get('level',''), 'date': meta.get('date','')})
-    payload = dict(payload)
-    payload['photo_items'] = photo_items
-    payload['photo_count'] = len(photo_items)
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    summary_path = os.path.join(folder, 'README.txt')
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        f.write(_build_biweekly_summary_text(payload))
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.write(json_path, arcname='report.json')
-        zf.write(summary_path, arcname='README.txt')
-        for ph in saved_photos:
-            zf.write(ph['stored_path'], arcname=os.path.join('photos', os.path.basename(ph['stored_path'])))
-    return zip_path, json_path
-
-def _load_biweekly_meta(file_path: str):
-    if not file_path:
-        return None
-    candidates = [file_path + '.json', os.path.join(os.path.dirname(file_path), 'report.json')]
-    for cand in candidates:
-        try:
-            if os.path.exists(cand):
-                with open(cand, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-    return None
-
 # ---------- Dashboard ----------
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
-    sid=current_staff_id()
-    admin=is_admin()
-    selected = None  # ensure defined for all branches
-    col1,col2,col3,col4=st.columns(4)
-    projects=fetch_df("SELECT *, COALESCE(status,'ACTIVE') AS proj_status FROM projects")
-    staff=fetch_df("SELECT * FROM staff")
-    open_tasks=fetch_df("SELECT * FROM task_assignments WHERE status!='Completed'")
+    sid = current_staff_id()
+    admin = is_admin()
+    today = date.today()
+    selected = None
+
+    projects = fetch_df("SELECT *, COALESCE(status,'ACTIVE') AS proj_status FROM projects")
+    staff = fetch_df("SELECT * FROM staff")
+    open_tasks = fetch_df("SELECT * FROM task_assignments WHERE status!='Completed'")
     active_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="ACTIVE").sum())
     dormant_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="DORMANT").sum())
-    col1.metric("Projects", len(projects))
-    col2.metric("Active", active_projects)
-    col3.metric("Dormant", dormant_projects)
-    col4.metric("Open Tasks", len(open_tasks))
+
+    snap = obligations_snapshot(sid, today) if sid is not None else {"tasks": [], "reports": [], "leave": [], "last_report": None}
+    comp = compliance_snapshot(today)
+
+    ctop1, ctop2, ctop3, ctop4 = st.columns(4)
+    ctop1.metric("Projects", len(projects))
+    ctop2.metric("Active", active_projects)
+    ctop3.metric("Dormant", dormant_projects)
+    ctop4.metric("Open Tasks", len(open_tasks))
+
+    st.markdown("### 🎯 Today's Obligations")
+    ob1, ob2 = st.columns([2,1])
+    with ob1:
+        if sid is None:
+            st.info("Log in to view personal obligations.")
+        else:
+            reports = sorted(snap.get("reports") or [], key=lambda x: (x.get("days_left") is None, x.get("days_left", 9999)))
+            if reports:
+                r0 = reports[0]
+                dl = r0.get("days_left")
+                due_text = "due today" if dl == 0 else (f"overdue by {abs(dl)} day(s)" if dl is not None and dl < 0 else f"due in {dl} day(s)")
+                st.warning(f"Biweekly Report No. {r0['cycle_no']} — {due_text}")
+                st.caption(f"{r0['project']} | {r0['window_start'].isoformat()} → {r0['window_end'].isoformat()} | deadline {r0['due_date'].isoformat()}")
+            else:
+                st.success("No outstanding biweekly report obligation right now.")
+
+            tasks = sorted(snap.get("tasks") or [], key=lambda x: (x.get("days_left") is None, x.get("days_left", 9999)))
+            if tasks:
+                t0 = tasks[0]
+                dd = t0.get("days_left")
+                due_text = "no due date" if dd is None else ("due today" if dd == 0 else (f"overdue by {abs(dd)} day(s)" if dd < 0 else f"due in {dd} day(s)"))
+                st.info(f"Task pending: {t0['label']} — {due_text}")
+            else:
+                st.caption("No pending tasks assigned to you.")
+
+            leave_items = sorted(snap.get("leave") or [], key=lambda x: (x.get("start_date") or date.max))
+            if leave_items:
+                l0 = leave_items[0]
+                start_txt = l0['start_date'].isoformat() if l0.get('start_date') else 'n/a'
+                who = l0.get('covering_name') or 'another officer'
+                st.info(f"Relief duty ahead: covering {who} from {start_txt}.")
+            else:
+                st.caption("No upcoming relief assignment recorded.")
+
+            last_report = snap.get("last_report")
+            if last_report:
+                when = last_report.get("submitted_on")
+                when_txt = when.isoformat() if when else "date unavailable"
+                pfx = str(last_report.get("project_code") or "").strip()
+                proj = f"{pfx} — {last_report.get('project_name') or ''}".strip(" —")
+                cyc = last_report.get("cycle_no")
+                cyc_txt = f"Report No. {int(cyc)}" if pd.notna(cyc) else "Latest report"
+                st.success(f"{cyc_txt} submitted on {when_txt}" + (f" | {proj}" if proj else ""))
+            else:
+                st.caption("No biweekly report submission has been recorded under your login yet.")
+    with ob2:
+        st.markdown("**Compliance radar**")
+        st.progress(float(comp.get("ratio") or 0.0))
+        st.metric("Compliant staff", f"{comp.get('compliant', 0)}/{comp.get('total_staff', 0)}")
+        st.caption(f"Outstanding: {comp.get('outstanding', 0)}")
+
+    st.markdown("### 📊 Branch Situational Awareness")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Report compliance", f"{int(round((comp.get('ratio',0.0))*100))}%")
+    b2.metric("Outstanding reports", comp.get("outstanding", 0))
+    my_pending_tasks = len(snap.get("tasks") or []) if sid is not None else 0
+    b3.metric("My pending tasks", my_pending_tasks)
+    recent_task_done = fetch_df("SELECT COUNT(*) AS n FROM task_assignments WHERE status='Completed' AND completed_date IS NOT NULL AND date(completed_date) >= date(?)", ((today - timedelta(days=7)).isoformat(),))
+    b4.metric("Tasks completed (7d)", int(recent_task_done["n"].iloc[0]) if not recent_task_done.empty else 0)
+
+    st.markdown("### 🕒 Recent Activity")
+    a1, a2 = st.columns(2)
+    with a1:
+        recent_reports = fetch_df(
+            """
+            SELECT COALESCE(s.name, u.username, 'Unknown') AS officer, p.code AS project_code, p.name AS project_name,
+                   r.cycle_no, COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp
+            FROM biweekly_reports r
+            LEFT JOIN staff s ON s.id=r.uploader_staff_id
+            LEFT JOIN users u ON u.staff_id=r.uploader_staff_id
+            LEFT JOIN projects p ON p.id=r.project_id
+            ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
+            LIMIT 6
+            """
+        )
+        if recent_reports.empty:
+            st.caption("No recent report submissions yet.")
+        else:
+            for _, rr in recent_reports.iterrows():
+                cyc = rr.get("cycle_no")
+                cyc_txt = f"Report No. {int(cyc)}" if pd.notna(cyc) else "Biweekly report"
+                proj = " — ".join([x for x in [str(rr.get("project_code") or "").strip(), str(rr.get("project_name") or "").strip()] if x])
+                st.write(f"• {rr['officer']} submitted {cyc_txt}" + (f" for {proj}" if proj else ""))
+                st.caption(str(rr.get("stamp") or ""))
+    with a2:
+        recent_tasks = fetch_df(
+            """
+            SELECT s.name AS staff_name, t.title, ta.completed_date, p.code AS project_code
+            FROM task_assignments ta
+            JOIN tasks t ON t.id=ta.task_id
+            JOIN staff s ON s.id=ta.staff_id
+            LEFT JOIN projects p ON p.id=t.project_id
+            WHERE ta.status='Completed' AND ta.completed_date IS NOT NULL
+            ORDER BY ta.completed_date DESC, ta.id DESC
+            LIMIT 6
+            """
+        )
+        if recent_tasks.empty:
+            st.caption("No recently completed tasks yet.")
+        else:
+            for _, tr in recent_tasks.iterrows():
+                label = tr['title']
+                pcode = str(tr.get('project_code') or '').strip()
+                if pcode:
+                    label = f"{pcode} — {label}"
+                st.write(f"• {tr['staff_name']} completed {label}")
+                st.caption(str(tr.get('completed_date') or ''))
+
+    st.markdown("### 👤 My Performance")
+    if sid is not None:
+        pts = fetch_df(
+            "SELECT COALESCE(SUM(points),0) AS total_points, COUNT(*) AS entries FROM points WHERE staff_id=?",
+            (int(sid),),
+        )
+        rp = fetch_df("SELECT COUNT(*) AS n FROM biweekly_reports WHERE uploader_staff_id=?", (int(sid),))
+        tp = fetch_df(
+            """
+            SELECT COUNT(*) AS n
+            FROM task_assignments ta
+            WHERE ta.staff_id=? AND ta.status='Completed'
+            """,
+            (int(sid),),
+        )
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Biweekly reports", int(rp["n"].iloc[0]) if not rp.empty else 0)
+        p2.metric("Tasks completed", int(tp["n"].iloc[0]) if not tp.empty else 0)
+        p3.metric("Total points", int(pts["total_points"].iloc[0]) if not pts.empty else 0)
+    else:
+        st.caption("No personal performance record available.")
+
+    if admin:
+        st.markdown("### 🎯 Precision Follow-up")
+        out_df = comp.get("rows")
+        if isinstance(out_df, pd.DataFrame) and not out_df.empty:
+            st.markdown("**Staff with Outstanding Reports**")
+            st.dataframe(out_df, hide_index=True, width='stretch')
+        else:
+            st.success("No staff currently sitting on an outstanding biweekly report obligation.")
+
+        st.markdown("**Login Activity**")
+        latest = latest_login_activity()
+        staff_users = fetch_df(
+            """
+            SELECT u.id AS user_id, s.id AS staff_id, s.name, COALESCE(u.username, s.email, s.name) AS username
+            FROM users u
+            LEFT JOIN staff s ON s.id=u.staff_id
+            WHERE COALESCE(u.is_active,1)=1
+            ORDER BY s.name, u.username
+            """
+        )
+        if staff_users.empty:
+            st.caption("No login accounts found.")
+        else:
+            merged = staff_users.merge(latest, on="user_id", how="left", suffixes=("", "_last"))
+            merged["last_login"] = merged["login_at"].fillna("Never")
+            st.dataframe(
+                merged[["name", "username", "last_login", "login_method"]].rename(columns={
+                    "name": "Staff",
+                    "username": "Login",
+                    "last_login": "Last login",
+                    "login_method": "Method",
+                }),
+                hide_index=True,
+                width='stretch'
+            )
+            never = merged[merged["login_at"].isna()]
+            if not never.empty:
+                st.warning("No login recorded yet: " + ", ".join([str(x) for x in never["name"].fillna(never["username"]).tolist()]))
 
     def project_core_docs_status(pid):
-        df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid, current_staff_id() or -1,))
+        df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid,))
         present=set(df["category"]) if not df.empty else set()
         missing=[c for c in CORE_DOC_CATEGORIES if c not in present]
         return present, missing
@@ -2515,14 +2578,10 @@ def page_dashboard():
         overdue = date.today() > cyc["due_date"]
         return (overdue, cyc["window_end"], cyc["due_date"], reason)
 
-
-    # Action items: due/overdue project reports + tasks (no birthdays here 🙏)
     st.markdown("### ✅ Action Items (Due / Overdue)")
     items=[]
-    today=date.today()
     horizon=today+timedelta(days=7)
 
-    # 1) Bi-weekly reports / project outputs due for projects you are posted to
     if admin:
         proj_due=fetch_df("SELECT id,code,name,start_date,next_due_date,COALESCE(status,'ACTIVE') AS status FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT' ORDER BY code")
     else:
@@ -2542,7 +2601,6 @@ def page_dashboard():
                 "details":reason
             })
 
-    # 2) Tasks due / overdue assigned to you
     if sid is not None:
         tdf=fetch_df("""
             SELECT T.id, T.title, T.due_date, TA.status, P.code AS project_code, P.name AS project_name
@@ -2667,7 +2725,7 @@ def page_dashboard():
         cdf = pd.DataFrame(rows).sort_values(['Points','On-time','Engineer'], ascending=[False,False,True])
         st.dataframe(cdf, hide_index=True, width='stretch')
 
-    # --- Project Quick Edit (Admin only) ---
+# --- Project Quick Edit (Admin only) ---
     st.markdown("### Project Quick Edit")
     pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
     if not pdf.empty:
@@ -3013,7 +3071,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
@@ -3308,7 +3366,7 @@ def page_projects():
         name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key=f"proj_name{suffix}")
         client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key=f"proj_client{suffix}")
         location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key=f"proj_loc{suffix}")
-        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
         end=st.date_input("End Date", value=(safe_parse_date(selected["end_date"], date.today()) if selected is not None else date.today()), key=f"proj_end{suffix}")
         sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
         sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key=f"proj_sup{suffix}")
@@ -3537,70 +3595,37 @@ def page_projects():
                                     st.error("Select a file first.")
 
                 st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                st.info("Biweekly reports are now completed directly in WorkNest. No Excel macro or PDF conversion is required for current submissions.")
-                register_seed = pd.DataFrame([{'type':'RFI','ref':'','date':'','status':'','notes':''}])
-                ncr_seed = pd.DataFrame([{'ncr_no':'','status':'','action':'','owner':''}])
-                with st.form(key=f"bw_form_submit_{pid}"):
-                    nil_report = st.checkbox("No structural activity this period (submit as NIL)", key=f"bw_nil_{pid}")
-                    activity_summary = st.text_area("Structural activities / progress summary", key=f"bw_act_{pid}", height=130, placeholder="State what was done during the period. If NIL, state site condition and reason.")
-                    reinforcement_checks = st.text_area("Reinforcement checks", key=f"bw_rebar_{pid}", height=100, placeholder="Sizes, spacing, laps, cover, deviations and rectifications.")
-                    hse_summary = st.text_area("HSE observations / actions", key=f"bw_hse_{pid}", height=100, placeholder="PPE, housekeeping, work-at-height, permits, incidents / near misses, corrective actions.")
-                    register_items = st.data_editor(register_seed, key=f"bw_reg_{pid}", num_rows="dynamic", width='stretch', column_config={
-                        'type': st.column_config.SelectboxColumn('Type', options=['RFI','SI','EI']),
-                        'ref': 'Reference / No.',
-                        'date': 'Date',
-                        'status': st.column_config.SelectboxColumn('Status', options=['Open','Closed','Pending','Awaiting Reply']),
-                        'notes': 'Notes'
-                    })
-                    ncr_items = st.data_editor(ncr_seed, key=f"bw_ncr_{pid}", num_rows="dynamic", width='stretch', column_config={
-                        'ncr_no': 'NCR No.',
-                        'status': st.column_config.SelectboxColumn('Status', options=['Open','Closed','None']),
-                        'action': 'Corrective Action',
-                        'owner': 'Owner'
-                    })
-                    photo_files = st.file_uploader("Upload site photos", type=['png','jpg','jpeg'], accept_multiple_files=True, key=f"bw_photos_{pid}")
-                    st.caption("Photo captions: one line per file in this format → filename | Element | Level | Date")
-                    photo_captions = st.text_area("Photo captions register", key=f"bw_photo_caps_{pid}", height=120, placeholder="photo1.jpg | Column starter bars | Ground Floor | 01/02/2026")
-                    additional_notes = st.text_area("Additional notes / constraints", key=f"bw_notes_{pid}", height=90)
-                    submitted = st.form_submit_button("⬆️ Submit Biweekly Report")
-                if submitted:
+                up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
+                if st.button("⬆️ Upload Report", key="bw_up"):
                     if not allowed:
-                        st.error("You don't have permission to submit to this project.")
+                        st.error("You don't have permission to upload to this project.")
                     elif current_cycle is None:
                         st.error(cycle_reason or "No open reporting cycle is available.")
-                    elif (not nil_report) and not str(activity_summary or '').strip():
-                        st.error("Enter the structural activities / progress summary, or mark the report as NIL.")
                     else:
-                        submitted_on = _today()
-                        timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
-                        uploader = current_user() or {}
-                        payload = {
-                            'project_id': pid,
-                            'project_name': selected['name'],
-                            'cycle_no': int(current_cycle['cycle_no']),
-                            'window_start': str(current_cycle['window_start']),
-                            'window_end': str(current_cycle['window_end']),
-                            'due_date': str(current_cycle['due_date']),
-                            'submitted_on': str(submitted_on),
-                            'uploaded_at': datetime.now().isoformat(timespec='seconds'),
-                            'uploader_staff_id': current_staff_id(),
-                            'uploader_name': uploader.get('name') or uploader.get('username') or '—',
-                            'nil_report': bool(nil_report),
-                            'activity_summary': activity_summary,
-                            'reinforcement_checks': reinforcement_checks,
-                            'hse_summary': hse_summary,
-                            'register_items': register_items.fillna('').to_dict('records') if hasattr(register_items, 'fillna') else [],
-                            'ncr_items': ncr_items.fillna('').to_dict('records') if hasattr(ncr_items, 'fillna') else [],
-                            'photo_captions': photo_captions,
-                            'additional_notes': additional_notes,
-                        }
-                        package_path, _meta_path = save_biweekly_form_package(pid, payload, photo_files or [])
-                        execute(
-                            "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (pid, str(current_cycle['due_date']), package_path, datetime.now().isoformat(timespec="seconds"), str(submitted_on), current_staff_id(), "PENDING", int(current_cycle['cycle_no']), str(current_cycle['window_start']), str(current_cycle['window_end']), str(current_cycle['due_date']), timing_status),
-                        )
-                        st.success(f"Biweekly report submitted in WorkNest. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
-                        st.rerun()
+                        path=save_uploaded_file(up, f"project_{pid}/reports")
+                        if path:
+                            submitted_on = _today()
+                            timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
+                            execute(
+                                "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    pid,
+                                    str(current_cycle['due_date']),
+                                    path,
+                                    datetime.now().isoformat(timespec="seconds"),
+                                    str(submitted_on),
+                                    current_staff_id(),
+                                    "PENDING",
+                                    int(current_cycle['cycle_no']),
+                                    str(current_cycle['window_start']),
+                                    str(current_cycle['window_end']),
+                                    str(current_cycle['due_date']),
+                                    timing_status,
+                                ),
+                            )
+                            st.success(f"Report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                        else:
+                            st.error("Select a file first.")
             rdf=fetch_df("SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no, window_start, window_end, due_date, timing_status FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC",(pid, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
@@ -3693,7 +3718,7 @@ def page_leave():
             srow=staff_df[staff_df["id"]==int(sid)].iloc[0]
             st.write(f"Applicant: **{srow['name']}**")
         ltype=st.selectbox("Type", ["Annual","Casual","Sick","Maternity","Paternity","Other"], key="lv_type")
-        start=st.date_input("Start Date", value=(safe_parse_date(selected["start_date"], date.today()) if selected is not None else date.today()), key=f"proj_start{suffix}")
+        start=st.date_input("Start Date", value=date.today(), key="lv_start")
 
         yr=start.year
         casual_taken_row=fetch_df("SELECT SUM(working_days) d FROM leaves WHERE staff_id=? AND leave_type='Casual' AND substr(start_date,1,4)=?",
