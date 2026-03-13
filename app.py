@@ -386,7 +386,23 @@ def _exec_script(cur, sql_script: str):
         return
     stmts=[s.strip() for s in sql_script.split(";") if s.strip()]
     for stmt in stmts:
-        cur.execute(stmt)
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            msg = str(e).lower()
+            # Be tolerant of duplicate-object races / legacy schema remnants on hosted Postgres.
+            if (
+                "already exists" in msg
+                or "duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"" in msg
+                or "duplicate_table" in msg
+                or "duplicate_object" in msg
+            ):
+                try:
+                    cur.connection.rollback()
+                except Exception:
+                    pass
+                continue
+            raise
 
 def hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
@@ -2373,67 +2389,233 @@ def file_download_button(label, file_path, key):
     except Exception as e:
         st.error(f"Missing file: {file_path}")
 
-# ---------- Dashboard ----------
+def _to_date_or_none(val):
+    if val is None:
+        return None
+    if isinstance(val, dt.date):
+        return val
+    try:
+        return dtparser.parse(str(val)).date()
+    except Exception:
+        return None
+
+
+def log_login_event(user: dict | None, method: str = "password") -> None:
+    """Best-effort login audit trail."""
+    try:
+        if not user:
+            return
+        uid = user.get("id")
+        sid = user.get("staff_id")
+        username = user.get("username") or user.get("email") or user.get("name") or ""
+        if not st.session_state.get("session_key"):
+            st.session_state["session_key"] = str(uuid.uuid4())
+        execute(
+            "INSERT INTO login_activity (user_id, staff_id, username, login_at, login_method, session_key) VALUES (?,?,?,?,?,?)",
+            (
+                int(uid) if uid is not None and str(uid) != "" else None,
+                int(sid) if sid is not None and str(sid) != "" else None,
+                str(username),
+                datetime.now().isoformat(timespec='seconds'),
+                str(method or "password"),
+                str(st.session_state.get("session_key") or ""),
+            ),
+        )
+    except Exception:
+        pass
+
+
+def latest_login_activity() -> pd.DataFrame:
+    cols = ["user_id", "login_at", "login_method"]
+    try:
+        df = fetch_df(
+            "SELECT user_id, login_at, login_method FROM login_activity WHERE user_id IS NOT NULL ORDER BY login_at DESC, id DESC"
+        )
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        df = df.dropna(subset=["user_id"]).copy()
+        try:
+            df["user_id"] = df["user_id"].astype(int)
+        except Exception:
+            pass
+        latest = df.drop_duplicates(subset=["user_id"], keep="first")
+        return latest[cols]
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
 
 def obligations_snapshot(staff_id, today=None):
-    """Return lightweight dashboard obligations snapshot."""
-    from datetime import date
-
-    if today is None:
-        today = date.today()
-
-    snap = {
-        "tasks": [],
-        "reports": [],
-        "leave": [],
-        "last_report": None
-    }
-
+    """Return lightweight dashboard obligations for a staff member."""
+    today = today or date.today()
+    today = _to_date_or_none(today) or date.today()
+    snap = {"tasks": [], "reports": [], "leave": [], "last_report": None}
+    if staff_id is None:
+        return snap
     try:
-        conn = get_conn()
-        cur = conn.cursor()
+        sid = int(staff_id)
+    except Exception:
+        return snap
 
-        # Pending tasks
-        cur.execute("""
-            SELECT id, title, due_date
-            FROM tasks
-            WHERE assigned_to = %s
-              AND COALESCE(status,'') NOT IN ('Done','Completed')
-            ORDER BY due_date NULLS LAST
+    # Pending tasks
+    try:
+        tdf = fetch_df(
+            """
+            SELECT ta.id AS assignment_id, t.id AS task_id, t.title, t.due_date,
+                   p.code AS project_code, p.name AS project_name
+            FROM task_assignments ta
+            JOIN tasks t ON t.id=ta.task_id
+            LEFT JOIN projects p ON p.id=t.project_id
+            WHERE ta.staff_id=? AND COALESCE(ta.status,'In progress')!='Completed'
+            ORDER BY CASE WHEN t.due_date IS NULL OR t.due_date='' THEN 1 ELSE 0 END,
+                     date(t.due_date) ASC, ta.id DESC
+            LIMIT 10
+            """,
+            (sid,),
+        )
+        for _, row in tdf.iterrows():
+            due = _to_date_or_none(row.get("due_date"))
+            proj_bits = [str(row.get("project_code") or "").strip(), str(row.get("project_name") or "").strip()]
+            proj = " — ".join([x for x in proj_bits if x])
+            label = str(row.get("title") or "Task")
+            if proj:
+                label = f"{proj} — {label}"
+            snap["tasks"].append({
+                "assignment_id": row.get("assignment_id"),
+                "task_id": row.get("task_id"),
+                "label": label,
+                "due_date": due,
+                "days_left": ((due - today).days if due else None),
+            })
+    except Exception:
+        pass
+
+    # Outstanding report obligations (projects where the officer is posted)
+    try:
+        projects_df = fetch_df(
+            """
+            SELECT DISTINCT p.id, p.code, p.name
+            FROM project_staff ps
+            JOIN projects p ON p.id=ps.project_id
+            WHERE ps.staff_id=?
+            ORDER BY p.code, p.name
+            """,
+            (sid,),
+        )
+        for _, row in projects_df.iterrows():
+            pid = row.get("id")
+            if pd.isna(pid):
+                continue
+            cyc, reason = _project_open_biweekly_cycle(int(pid), today)
+            if not cyc:
+                continue
+            snap["reports"].append({
+                "project_id": int(pid),
+                "project": " — ".join([x for x in [str(row.get("code") or "").strip(), str(row.get("name") or "").strip()] if x]),
+                "project_code": str(row.get("code") or "").strip(),
+                "project_name": str(row.get("name") or "").strip(),
+                "cycle_no": int(cyc.get("cycle_no")),
+                "window_start": cyc.get("window_start"),
+                "window_end": cyc.get("window_end"),
+                "due_date": cyc.get("due_date"),
+                "days_left": ((cyc.get("due_date") - today).days if cyc.get("due_date") else None),
+                "reason": reason,
+            })
+    except Exception:
+        pass
+
+    # Upcoming relief duty where this staff is the relieving officer
+    try:
+        ldf = fetch_df(
+            """
+            SELECT l.start_date, l.end_date, s.name AS covering_name
+            FROM leaves l
+            LEFT JOIN staff s ON s.id=l.staff_id
+            WHERE l.relieving_staff_id=?
+              AND date(l.end_date) >= date(?)
+              AND COALESCE(l.status,'Pending') IN ('Pending','Approved')
+            ORDER BY date(l.start_date) ASC
             LIMIT 5
-        """, (staff_id,))
-        snap["tasks"] = cur.fetchall()
+            """,
+            (sid, today.isoformat()),
+        )
+        for _, row in ldf.iterrows():
+            snap["leave"].append({
+                "start_date": _to_date_or_none(row.get("start_date")),
+                "end_date": _to_date_or_none(row.get("end_date")),
+                "covering_name": row.get("covering_name"),
+            })
+    except Exception:
+        pass
 
-        # Last submitted report
-        cur.execute("""
-            SELECT report_no, submitted_at
-            FROM biweekly_reports
-            WHERE submitted_by = %s
-            ORDER BY submitted_at DESC
+    # Last submitted report by this officer
+    try:
+        rdf = fetch_df(
+            """
+            SELECT r.cycle_no, COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS submitted_on,
+                   p.code AS project_code, p.name AS project_name
+            FROM biweekly_reports r
+            LEFT JOIN projects p ON p.id=r.project_id
+            WHERE r.uploader_staff_id=?
+            ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
             LIMIT 1
-        """, (staff_id,))
-        row = cur.fetchone()
-        if row:
-            snap["last_report"] = row
-
-        # Leave info
-        cur.execute("""
-            SELECT start_date, end_date
-            FROM leave_requests
-            WHERE staff_id = %s
-              AND end_date >= %s
-            ORDER BY start_date
-            LIMIT 3
-        """, (staff_id, today))
-        snap["leave"] = cur.fetchall()
-
-        conn.close()
-
+            """,
+            (sid,),
+        )
+        if not rdf.empty:
+            rr = rdf.iloc[0].to_dict()
+            rr["submitted_on"] = _to_date_or_none(rr.get("submitted_on"))
+            snap["last_report"] = rr
     except Exception:
         pass
 
     return snap
 
+
+def compliance_snapshot(today=None):
+    """Branch-wide report compliance view based on all active staff accounts."""
+    today = _to_date_or_none(today) or date.today()
+    empty = pd.DataFrame(columns=["Staff", "Login", "Outstanding reports", "Next due"])
+    try:
+        sdf = fetch_df(
+            """
+            SELECT u.id AS user_id, u.username, s.id AS staff_id, s.name
+            FROM users u
+            LEFT JOIN staff s ON s.id=u.staff_id
+            WHERE COALESCE(u.is_active,1)=1
+            ORDER BY s.name, u.username
+            """
+        )
+        rows = []
+        total = len(sdf)
+        compliant = 0
+        for _, row in sdf.iterrows():
+            sid = row.get("staff_id")
+            snap = obligations_snapshot(sid, today) if pd.notna(sid) else {"reports": []}
+            reports = snap.get("reports") or []
+            if not reports:
+                compliant += 1
+                continue
+            first = sorted(reports, key=lambda x: (x.get("days_left") is None, x.get("days_left") if x.get("days_left") is not None else 9999))[0]
+            rows.append({
+                "Staff": row.get("name") or row.get("username") or "Unknown",
+                "Login": row.get("username") or "",
+                "Outstanding reports": len(reports),
+                "Next due": f"Report {first.get('cycle_no')} ({first.get('project_code') or first.get('project')})",
+            })
+        out = len(rows)
+        ratio = (compliant / total) if total else 1.0
+        return {
+            "ratio": ratio,
+            "compliant": compliant,
+            "outstanding": out,
+            "total_staff": total,
+            "rows": pd.DataFrame(rows) if rows else empty,
+        }
+    except Exception:
+        return {"ratio": 1.0, "compliant": 0, "outstanding": 0, "total_staff": 0, "rows": empty}
+
+
+# ---------- Dashboard ----------
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
     sid = current_staff_id()
