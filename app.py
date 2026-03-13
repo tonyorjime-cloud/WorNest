@@ -2374,6 +2374,66 @@ def file_download_button(label, file_path, key):
         st.error(f"Missing file: {file_path}")
 
 # ---------- Dashboard ----------
+
+def obligations_snapshot(staff_id, today=None):
+    """Return lightweight dashboard obligations snapshot."""
+    from datetime import date
+
+    if today is None:
+        today = date.today()
+
+    snap = {
+        "tasks": [],
+        "reports": [],
+        "leave": [],
+        "last_report": None
+    }
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # Pending tasks
+        cur.execute("""
+            SELECT id, title, due_date
+            FROM tasks
+            WHERE assigned_to = %s
+              AND COALESCE(status,'') NOT IN ('Done','Completed')
+            ORDER BY due_date NULLS LAST
+            LIMIT 5
+        """, (staff_id,))
+        snap["tasks"] = cur.fetchall()
+
+        # Last submitted report
+        cur.execute("""
+            SELECT report_no, submitted_at
+            FROM biweekly_reports
+            WHERE submitted_by = %s
+            ORDER BY submitted_at DESC
+            LIMIT 1
+        """, (staff_id,))
+        row = cur.fetchone()
+        if row:
+            snap["last_report"] = row
+
+        # Leave info
+        cur.execute("""
+            SELECT start_date, end_date
+            FROM leave_requests
+            WHERE staff_id = %s
+              AND end_date >= %s
+            ORDER BY start_date
+            LIMIT 3
+        """, (staff_id, today))
+        snap["leave"] = cur.fetchall()
+
+        conn.close()
+
+    except Exception:
+        pass
+
+    return snap
+
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
     sid = current_staff_id()
