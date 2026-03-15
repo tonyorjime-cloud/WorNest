@@ -378,6 +378,30 @@ def _adapt_query(q: str) -> str:
         return q.replace("?", "%s")
     return q
 
+@st.cache_data(ttl=45, show_spinner=False)
+def _fetch_df_cached(q: str, params: tuple = ()):
+    q = _adapt_query(q)
+    c = get_conn()
+    try:
+        if DB_IS_POSTGRES:
+            with c.cursor() as cur:
+                cur.execute(q, params or ())
+                cols = [d[0] for d in (cur.description or [])]
+                rows = cur.fetchall() if cur.description else []
+            return pd.DataFrame(rows, columns=cols)
+        return pd.read_sql_query(q, c, params=params)
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_runtime_initialized():
+    init_db()
+    return True
+
 def _exec_script(cur, sql_script: str):
     if not sql_script:
         return
@@ -990,21 +1014,8 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
     except Exception:
         pass
 def fetch_df(q, p=()):
-    q=_adapt_query(q)
-    c=get_conn()
-    try:
-        if DB_IS_POSTGRES:
-            with c.cursor() as cur:
-                cur.execute(q, p or ())
-                cols=[d[0] for d in (cur.description or [])]
-                rows=cur.fetchall() if cur.description else []
-            return pd.DataFrame(rows, columns=cols)
-        else:
-            df=pd.read_sql_query(q, c, params=p)
-            return df
-    finally:
-        try: c.close()
-        except Exception: pass
+    params = tuple(p) if isinstance(p, (list, tuple)) else ((p,) if p not in (None, ()) else ())
+    return _fetch_df_cached(str(q), params)
 
 
 def safe_parse_date(val, default=None):
@@ -1069,6 +1080,10 @@ def execute(q, p=()):
             c.commit()
             return cur.lastrowid
     finally:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
         try: c.close()
         except Exception: pass
 
@@ -1382,6 +1397,7 @@ def _biweekly_backfill_cutoff_cycle() -> int:
         return 10
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def _project_meta(pid: int) -> dict:
     df = fetch_df("SELECT id, start_date, COALESCE(status,'ACTIVE') AS status, dormant_since, dormant_reason FROM projects WHERE id=?", (int(pid),))
     if df.empty:
@@ -1428,6 +1444,7 @@ def _project_nonrejected_cycle_map(pid: int) -> dict:
     return existing
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def _project_current_due_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
     today = today or _today()
     if _project_is_dormant(int(pid)):
@@ -1479,6 +1496,7 @@ def _project_missing_historical_cycles(pid: int, today: dt.date | None = None) -
     return out
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def _project_report_rows(pid: int) -> pd.DataFrame:
     return fetch_df(
         """SELECT id, project_id, report_date, uploaded_at, submitted_on, COALESCE(status,'PENDING') AS status,
@@ -2425,6 +2443,7 @@ def log_login_event(user: dict | None, method: str = "password") -> None:
         pass
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def latest_login_activity() -> pd.DataFrame:
     cols = ["user_id", "login_at", "login_method"]
     try:
@@ -2444,6 +2463,7 @@ def latest_login_activity() -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def obligations_snapshot(staff_id, today=None):
     """Return lightweight dashboard obligations for a staff member."""
     today = today or date.today()
@@ -2571,6 +2591,7 @@ def obligations_snapshot(staff_id, today=None):
     return snap
 
 
+@st.cache_data(ttl=45, show_spinner=False)
 def compliance_snapshot(today=None):
     """Branch-wide report compliance view based on all active staff accounts."""
     today = _to_date_or_none(today) or date.today()
@@ -2616,6 +2637,41 @@ def compliance_snapshot(today=None):
 
 
 # ---------- Dashboard ----------
+@st.cache_data(ttl=30, show_spinner=False)
+def dashboard_summary_snapshot(today_iso: str):
+    out = {"projects": 0, "active_projects": 0, "dormant_projects": 0, "open_tasks": 0, "tasks_completed_7d": 0}
+    try:
+        pdf = fetch_df("""
+            SELECT
+                COUNT(*) AS projects,
+                SUM(CASE WHEN UPPER(COALESCE(status,'ACTIVE'))='ACTIVE' THEN 1 ELSE 0 END) AS active_projects,
+                SUM(CASE WHEN UPPER(COALESCE(status,'ACTIVE'))='DORMANT' THEN 1 ELSE 0 END) AS dormant_projects
+            FROM projects
+        """)
+        if not pdf.empty:
+            row = pdf.iloc[0]
+            out["projects"] = int(row.get("projects") or 0)
+            out["active_projects"] = int(row.get("active_projects") or 0)
+            out["dormant_projects"] = int(row.get("dormant_projects") or 0)
+    except Exception:
+        pass
+    try:
+        tdf = fetch_df("SELECT COUNT(*) AS n FROM task_assignments WHERE COALESCE(status,'')!='Completed'")
+        if not tdf.empty:
+            out["open_tasks"] = int(tdf["n"].iloc[0] or 0)
+    except Exception:
+        pass
+    try:
+        recent = fetch_df(
+            "SELECT COUNT(*) AS n FROM task_assignments WHERE status='Completed' AND completed_date IS NOT NULL AND date(completed_date) >= date(?)",
+            ((date.fromisoformat(today_iso) - timedelta(days=7)).isoformat(),)
+        )
+        if not recent.empty:
+            out["tasks_completed_7d"] = int(recent["n"].iloc[0] or 0)
+    except Exception:
+        pass
+    return out
+
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
     sid = current_staff_id()
@@ -2623,20 +2679,15 @@ def page_dashboard():
     today = date.today()
     selected = None
 
-    projects = fetch_df("SELECT *, COALESCE(status,'ACTIVE') AS proj_status FROM projects")
-    staff = fetch_df("SELECT * FROM staff")
-    open_tasks = fetch_df("SELECT * FROM task_assignments WHERE status!='Completed'")
-    active_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="ACTIVE").sum())
-    dormant_projects = 0 if projects.empty else int((projects["proj_status"].astype(str).str.upper()=="DORMANT").sum())
-
+    summary = dashboard_summary_snapshot(today.isoformat())
     snap = obligations_snapshot(sid, today) if sid is not None else {"tasks": [], "reports": [], "leave": [], "last_report": None}
     comp = compliance_snapshot(today)
 
     ctop1, ctop2, ctop3, ctop4 = st.columns(4)
-    ctop1.metric("Projects", len(projects))
-    ctop2.metric("Active", active_projects)
-    ctop3.metric("Dormant", dormant_projects)
-    ctop4.metric("Open Tasks", len(open_tasks))
+    ctop1.metric("Projects", summary.get("projects", 0))
+    ctop2.metric("Active", summary.get("active_projects", 0))
+    ctop3.metric("Dormant", summary.get("dormant_projects", 0))
+    ctop4.metric("Open Tasks", summary.get("open_tasks", 0))
 
     st.markdown("### 🎯 Today's Obligations")
     ob1, ob2 = st.columns([2,1])
@@ -2695,8 +2746,7 @@ def page_dashboard():
     b2.metric("Outstanding reports", comp.get("outstanding", 0))
     my_pending_tasks = len(snap.get("tasks") or []) if sid is not None else 0
     b3.metric("My pending tasks", my_pending_tasks)
-    recent_task_done = fetch_df("SELECT COUNT(*) AS n FROM task_assignments WHERE status='Completed' AND completed_date IS NOT NULL AND date(completed_date) >= date(?)", ((today - timedelta(days=7)).isoformat(),))
-    b4.metric("Tasks completed (7d)", int(recent_task_done["n"].iloc[0]) if not recent_task_done.empty else 0)
+    b4.metric("Tasks completed (7d)", summary.get("tasks_completed_7d", 0))
 
     st.markdown("### 🕒 Recent Activity")
     a1, a2 = st.columns(2)
@@ -5384,7 +5434,7 @@ def page_ml():
                 st.json(metrics)
 
 def main():
-    init_db(); apply_styles()
+    ensure_runtime_initialized(); apply_styles()
     # Restore login from remember-token cookie (if present)
     try_auto_login_from_cookie()
     if not current_user():
