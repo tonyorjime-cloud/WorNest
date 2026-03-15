@@ -3123,32 +3123,33 @@ def page_dashboard():
         st.dataframe(cdf, hide_index=True, width='stretch')
 
 # --- Project Quick Edit (Admin only) ---
-    st.markdown("### Project Quick Edit")
-    pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
-    if not pdf.empty:
-        options = ["— Select project —"] + [f"{r['code']} — {r['name']}" for _, r in pdf.iterrows()]
-        pick = st.selectbox("Project", options, key="dash_proj_pick")
-        if pick != "— Select project —":
-            sel_code = pick.split(" — ")[0].strip()
-            row = pdf[pdf["code"] == sel_code]
-            if not row.empty:
-                selected = row.iloc[0].to_dict()
-    else:
-        st.info("No projects found yet. Import projects via Import CSVs (admin).")
+    if can_manage_projects():
+        st.markdown("### Project Quick Edit")
+        pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
+        staff = fetch_df("SELECT id,name FROM staff ORDER BY name")
+        if not pdf.empty:
+            options = ["— Select project —"] + [f"{r['code']} — {r['name']}" for _, r in pdf.iterrows()]
+            pick = st.selectbox("Project", options, key="dash_proj_pick")
+            if pick != "— Select project —":
+                sel_code = pick.split(" — ")[0].strip()
+                row = pdf[pdf["code"] == sel_code]
+                if not row.empty:
+                    selected = row.iloc[0].to_dict()
+        else:
+            st.info("No projects found yet. Import projects via Import CSVs (admin).")
 
-    # Basic edit form (admin only)
-    sup_name_by_id = {int(r["id"]): r["name"] for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
-    sup_id_by_name = {r["name"]: int(r["id"]) for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
-    sup_options = [""] + sorted([n for n in staff["name"].dropna().tolist() if str(n).strip()])
+        # Basic edit form (admin only)
+        sup_name_by_id = {int(r["id"]): r["name"] for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
+        sup_id_by_name = {r["name"]: int(r["id"]) for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
+        sup_options = [""] + sorted([n for n in staff["name"].dropna().tolist() if str(n).strip()]) if not staff.empty and "name" in staff.columns else [""]
 
-    default_sup = ""
-    if selected is not None and selected.get("supervisor_staff_id"):
-        try:
-            default_sup = sup_name_by_id.get(int(selected["supervisor_staff_id"]), "") or ""
-        except Exception:
-            default_sup = ""
+        default_sup = ""
+        if selected is not None and selected.get("supervisor_staff_id"):
+            try:
+                default_sup = sup_name_by_id.get(int(selected["supervisor_staff_id"]), "") or ""
+            except Exception:
+                default_sup = ""
 
-    if can_manage_projects:
         with st.expander("Create / Edit Project", expanded=False):
             code = st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
             name = st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
