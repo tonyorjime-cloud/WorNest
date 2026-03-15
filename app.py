@@ -961,6 +961,9 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_by_staff_id INTEGER")
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
             execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS review_note TEXT")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS result_summary TEXT")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS notes TEXT")
+            execute("ALTER TABLE test_results ADD COLUMN IF NOT EXISTS updated_at TEXT")
             # Backfill NULL statuses to APPROVED for legacy rows (so existing history doesn't vanish)
             execute("UPDATE biweekly_reports SET status='APPROVED' WHERE status IS NULL")
             execute("UPDATE test_results SET status='APPROVED' WHERE status IS NULL")
@@ -985,6 +988,9 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 "ALTER TABLE test_results ADD COLUMN reviewed_by_staff_id INTEGER",
                 "ALTER TABLE test_results ADD COLUMN reviewed_at TEXT",
                 "ALTER TABLE test_results ADD COLUMN review_note TEXT",
+                "ALTER TABLE test_results ADD COLUMN result_summary TEXT",
+                "ALTER TABLE test_results ADD COLUMN notes TEXT",
+                "ALTER TABLE test_results ADD COLUMN updated_at TEXT",
             ]:
                 try: execute(q)
                 except Exception: pass
@@ -1025,6 +1031,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             "ALTER TABLE biweekly_reports ADD COLUMN general_remarks TEXT",
             "ALTER TABLE biweekly_reports ADD COLUMN updated_at TEXT",
             "ALTER TABLE test_results ADD COLUMN result_summary TEXT",
+            "ALTER TABLE test_results ADD COLUMN notes TEXT",
             "ALTER TABLE test_results ADD COLUMN updated_at TEXT",
         ]
         for q in extra_cols:
