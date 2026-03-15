@@ -4019,82 +4019,123 @@ def page_projects():
         # Tests upload/list
         with tabs[2]:
             st.subheader("Test Results (per building & stage)")
-            bdf=fetch_df("SELECT id,name FROM buildings WHERE project_id=? ORDER BY name",(pid,))
-            b_opts = ["— (no specific building) —"] + (bdf["name"].tolist() if not bdf.empty else [])
-            b_pick = st.selectbox("Building", b_opts, key="t_building")
-            bid = None
-            if b_pick!="— (no specific building) —" and (not bdf.empty):
-                bid = int(bdf[bdf["name"]==b_pick]["id"].iloc[0])
-
-            stage = st.selectbox("Stage", STAGES, key="t_stage")
-            ttype_label = st.selectbox("Test Type", [x[1] for x in TEST_TYPES_DISPLAY], key="t_type")
-            ttype = [k for k,v in TEST_TYPES_DISPLAY if v==ttype_label][0]
-            batch_needed = (ttype in ["steel","reinforcement"])
-            batch_id = st.text_input("Batch ID (required for batch tests)", key="t_batch") if batch_needed else None
-
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
 
-            up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="t_file")
-            if st.button("⬆️ Upload Test", key="t_upload"):
+            edit_test_id = st.session_state.get(f"test_edit_{pid}")
+            edit_test = None
+            if edit_test_id:
+                tedit = fetch_df("SELECT * FROM test_results WHERE id=? AND project_id=?", (int(edit_test_id), pid))
+                if not tedit.empty:
+                    edit_test = tedit.iloc[0]
+
+            bdf=fetch_df("SELECT id,name FROM buildings WHERE project_id=? ORDER BY name",(pid,))
+            b_opts = ["— (no specific building) —"] + (bdf["name"].tolist() if not bdf.empty else [])
+            selected_b = "— (no specific building) —"
+            if edit_test is not None and pd.notna(edit_test.get('building_id')) and not bdf.empty:
+                mt = bdf[bdf['id']==int(edit_test['building_id'])]
+                if not mt.empty:
+                    selected_b = str(mt['name'].iloc[0])
+            with st.form(f"test_form_{pid}"):
+                b_pick = st.selectbox("Building", b_opts, index=(b_opts.index(selected_b) if selected_b in b_opts else 0), key=f"t_building_{pid}")
+                bid = None
+                if b_pick!="— (no specific building) —" and (not bdf.empty):
+                    bid = int(bdf[bdf["name"]==b_pick]["id"].iloc[0])
+                stage_default = str(edit_test.get('stage') or STAGES[0]) if edit_test is not None else STAGES[0]
+                stage = st.selectbox("Stage", STAGES, index=(STAGES.index(stage_default) if stage_default in STAGES else 0), key=f"t_stage_{pid}")
+                labels = [x[1] for x in TEST_TYPES_DISPLAY]
+                reverse = {v:k for k,v in TEST_TYPES_DISPLAY}
+                default_label = next((v for k,v in TEST_TYPES_DISPLAY if edit_test is not None and k == str(edit_test.get('test_type') or '')), labels[0])
+                ttype_label = st.selectbox("Test Type", labels, index=(labels.index(default_label) if default_label in labels else 0), key=f"t_type_{pid}")
+                ttype = reverse[ttype_label]
+                batch_needed = (ttype in ["steel","reinforcement"])
+                batch_id = st.text_input("Batch ID (required for batch tests)", value=(str(edit_test.get('batch_id') or '') if edit_test is not None else ''), key=f"t_batch_{pid}") if batch_needed else None
+                test_date_val = safe_parse_date(edit_test.get('test_date'), date.today()) if edit_test is not None else date.today()
+                test_date = st.date_input("Test Date", value=test_date_val, key=f"t_date_{pid}")
+                result_summary = st.text_area("Result Summary / Notes", value=(str(edit_test.get('result_summary') or edit_test.get('notes') or '') if edit_test is not None else ''), key=f"t_summary_{pid}")
+                attachment_caption = st.text_input("Attachment caption", value='', key=f"t_caption_{pid}")
+                up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
+                c1, c2 = st.columns(2)
+                submit_label = "💾 Update Test Result" if edit_test is not None else "⬆️ Save Test Result"
+                save_test = c1.form_submit_button(submit_label)
+                cancel_test = c2.form_submit_button("Cancel Edit") if edit_test is not None else False
+            if cancel_test:
+                st.session_state.pop(f"test_edit_{pid}", None)
+                st.rerun()
+            if save_test:
                 if not allowed:
                     st.error("You don't have permission to upload to this project.")
+                elif batch_needed and (not batch_id or not str(batch_id).strip()):
+                    st.error("Batch ID is required for steel/reinforcement tests.")
                 else:
-                    if batch_needed and (not batch_id or not batch_id.strip()):
-                        st.error("Batch ID is required for steel/reinforcement tests.")
+                    now_iso = datetime.now().isoformat(timespec='seconds')
+                    if edit_test is not None and _editable_status(edit_test.get('status')) and int(edit_test.get('uploader_staff_id') or -1) == int(current_staff_id() or -999) or is_admin():
+                        path = str(edit_test.get('file_path') or '')
+                        if up is not None:
+                            path = save_uploaded_file(up, f"project_{pid}/tests") or path
+                        execute("UPDATE test_results SET building_id=?, stage=?, test_type=?, batch_id=?, file_path=?, test_date=?, result_summary=?, notes=?, updated_at=?, status=? WHERE id=?",
+                                (bid, stage, ttype, batch_id, path, str(test_date), result_summary, result_summary, now_iso, 'PENDING', int(edit_test['id'])))
+                        rid = int(edit_test['id'])
+                        if up is not None:
+                            _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
+                        st.success("Test result updated and resubmitted for admin review.")
+                        st.session_state.pop(f"test_edit_{pid}", None)
+                        st.rerun()
                     else:
-                        path=save_uploaded_file(up, f"project_{pid}/tests")
-                        if path:
-                            execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,status)
-                                       VALUES (?,?,?,?,?,?,?,?,?)""",(pid, bid, stage, ttype, batch_id, path, datetime.now().isoformat(timespec="seconds"), current_staff_id(), "PENDING"))
-                            st.success("Test uploaded.")
-                        else:
-                            st.error("Select a file first.")
+                        path = save_uploaded_file(up, f"project_{pid}/tests") if up is not None else ''
+                        rid = execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,test_date,result_summary,notes,status,updated_at)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                      (pid, bid, stage, ttype, batch_id, path or '', now_iso, current_staff_id(), str(test_date), result_summary, result_summary, 'PENDING', now_iso))
+                        if up is not None:
+                            _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
+                        st.success("Test result saved — pending admin approval.")
+                        st.rerun()
 
-            # List
             tdf=fetch_df("""
-                SELECT tr.id, b.name AS building, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at, COALESCE(tr.status,'APPROVED') AS status
+                SELECT tr.id, b.name AS building, tr.building_id, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at, tr.test_date,
+                       COALESCE(tr.result_summary,tr.notes,'') AS result_summary, COALESCE(tr.status,'APPROVED') AS status, tr.uploader_staff_id
                 FROM test_results tr
                 LEFT JOIN buildings b ON b.id=tr.building_id
                 WHERE tr.project_id=?
-                  AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=?)
-                ORDER BY tr.uploaded_at DESC
-            """,(pid, current_staff_id() or -1,))
+                  AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=? OR ?=1)
+                ORDER BY COALESCE(tr.updated_at,tr.uploaded_at) DESC, tr.id DESC
+            """,(pid, current_staff_id() or -1, 1 if is_admin() else 0))
             if tdf.empty:
                 st.info("No tests uploaded yet.")
             else:
                 for _,r in tdf.iterrows():
-                    colA,colB,colC=st.columns([3,1,1])
+                    ctop, cstat = st.columns([4,1])
                     bname = r["building"] if pd.notna(r["building"]) else "—"
-                    lab = r["test_type"].capitalize()
+                    lab = str(r["test_type"]).capitalize()
                     if r["test_type"] in ["steel","reinforcement"] and pd.notna(r["batch_id"]):
                         lab += f" (Batch: {r['batch_id']})"
-                    with colA: st.write(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n*{r['uploaded_at']}*")
-                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"tdl{r['id']}")
-                    with colC:
+                    with ctop:
+                        st.markdown(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n**Test Date:** {r.get('test_date') or '—'}  \n{r.get('result_summary') or ''}")
+                    with cstat:
                         st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
-                        if is_admin():
-                            a1,a2,a3 = st.columns([1,1,1])
-                            with a1:
-                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"tapp{r['id']}"):
-                                    execute("UPDATE test_results SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
-                                    st.rerun()
-                            with a2:
-                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"trej{r['id']}"):
-                                    execute("UPDATE test_results SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r["id"])))
-                                    st.rerun()
-                            with a3:
-                                if st.button("🗑️ Delete", key=f"tdel{r['id']}"):
-                                    # remove file too
-                                    try:
-                                        fp=str(r.get("file_path") or "")
-                                        if fp and os.path.exists(fp): os.remove(fp)
-                                    except Exception:
-                                        pass
-                                    execute("DELETE FROM test_results WHERE id=?", (int(r["id"]),))
-                                    st.rerun()
+                    cols = st.columns([1,1,1,1])
+                    if str(r.get('file_path') or '').strip():
+                        with cols[0]:
+                            file_download_button("⬇️ Main File", r["file_path"], key=f"tdl{r['id']}")
+                    editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
+                    if editable:
+                        with cols[1]:
+                            if st.button("✏️ Edit", key=f"tedit_{r['id']}"):
+                                st.session_state[f"test_edit_{pid}"] = int(r['id'])
+                                st.rerun()
+                    if is_admin():
+                        with cols[2]:
+                            if r['status']!='APPROVED' and st.button("✅ Approve", key=f"tapp{r['id']}"):
+                                execute("UPDATE test_results SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=?, approved_at=?, approved_by_staff_id=? WHERE id=?",
+                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
+                                st.rerun()
+                        with cols[3]:
+                            if r['status']!='REJECTED' and st.button("✖ Reject", key=f"trej{r['id']}"):
+                                execute("UPDATE test_results SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                st.rerun()
+                    _render_attachment_list('test', int(r['id']), f"tatt_{r['id']}")
+                    st.markdown('---')
 
         # Biweekly Reports
         with tabs[3]:
@@ -4121,95 +4162,163 @@ def page_projects():
                 else:
                     st.info(cycle_reason or "No report window is currently available for upload.")
 
-                hist = _project_missing_historical_cycles(pid)
-                if hist:
-                    with st.expander("Historical Backfill (old report cycles)", expanded=False):
-                        options = {f"Report {c['cycle_no']} — {c['window_start'].isoformat()} → {c['window_end'].isoformat()} — Due {c['due_date'].isoformat()}": c for c in hist}
-                        pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
-                        chosen = options[pick]
-                        manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
-                        up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
-                        if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
-                            if not allowed:
-                                st.error("You don't have permission to upload to this project.")
+            hist = _project_missing_historical_cycles(pid)
+            if hist:
+                with st.expander("Historical Backfill (old report cycles)", expanded=False):
+                    options = {f"Report {c['cycle_no']} — {c['window_start'].isoformat()} → {c['window_end'].isoformat()} — Due {c['due_date'].isoformat()}": c for c in hist}
+                    pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
+                    chosen = options[pick]
+                    manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
+                    up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
+                    if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
+                        if not allowed:
+                            st.error("You don't have permission to upload to this project.")
+                        else:
+                            path = save_uploaded_file(up_hist, f"project_{pid}/reports")
+                            if path:
+                                timing_status = "LATE" if manual_sub > chosen['due_date'] else "ON_TIME"
+                                execute(
+                                    "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                    (pid, str(chosen['due_date']), path, datetime.now().isoformat(timespec='seconds'), str(manual_sub), current_staff_id(), 'PENDING', int(chosen['cycle_no']), str(chosen['window_start']), str(chosen['window_end']), str(chosen['due_date']), timing_status)
+                                )
+                                st.success(f"Historical report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                                st.rerun()
                             else:
-                                path = save_uploaded_file(up_hist, f"project_{pid}/reports")
-                                if path:
-                                    timing_status = "LATE" if manual_sub > chosen['due_date'] else "ON_TIME"
-                                    execute(
-                                        "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                        (pid, str(chosen['due_date']), path, datetime.now().isoformat(timespec='seconds'), str(manual_sub), current_staff_id(), 'PENDING', int(chosen['cycle_no']), str(chosen['window_start']), str(chosen['window_end']), str(chosen['due_date']), timing_status)
-                                    )
-                                    st.success(f"Historical report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
-                                    st.rerun()
-                                else:
-                                    st.error("Select a file first.")
+                                st.error("Select a file first.")
 
-                st.caption(f"Submitted at (auto): {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                up = st.file_uploader("Upload biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="bw_file")
-                if st.button("⬆️ Upload Report", key="bw_up"):
+            edit_report_id = st.session_state.get(f"bw_edit_{pid}")
+            edit_report = None
+            if edit_report_id:
+                edf = fetch_df("SELECT * FROM biweekly_reports WHERE id=? AND project_id=?", (int(edit_report_id), pid))
+                if not edf.empty:
+                    edit_report = edf.iloc[0]
+            elif current_cycle is not None and current_staff_id() is not None:
+                draft_df = fetch_df("""SELECT * FROM biweekly_reports
+                                       WHERE project_id=? AND uploader_staff_id=? AND cycle_no=? AND COALESCE(status,'PENDING') <> 'APPROVED'
+                                       ORDER BY id DESC LIMIT 1""",
+                                    (pid, current_staff_id(), int(current_cycle['cycle_no'])))
+                if not draft_df.empty:
+                    edit_report = draft_df.iloc[0]
+
+            if current_cycle is not None or edit_report is not None:
+                default_cycle = int(edit_report['cycle_no']) if edit_report is not None and pd.notna(edit_report.get('cycle_no')) else (int(current_cycle['cycle_no']) if current_cycle is not None else None)
+                default_start = safe_parse_date(edit_report.get('window_start'), current_cycle['window_start'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_start'] if current_cycle is not None else date.today())
+                default_end = safe_parse_date(edit_report.get('window_end'), current_cycle['window_end'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_end'] if current_cycle is not None else date.today())
+                default_due = safe_parse_date(edit_report.get('due_date'), current_cycle['due_date'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['due_date'] if current_cycle is not None else date.today())
+                with st.form(f"bw_form_{pid}"):
+                    st.markdown("#### Complete report in WorkNest")
+                    st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
+                    cmeta1, cmeta2, cmeta3 = st.columns(3)
+                    cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
+                    cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
+                    cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
+                    report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
+                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
+                    site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
+                    reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
+                    concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
+                    hse_observations = st.text_area("HSE Observations", value=(str(edit_report.get('hse_observations') or '') if edit_report is not None else ''), height=80, key=f"bw_hse_{pid}")
+                    rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
+                    general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
+                    st.markdown("**Photos and attachments**")
+                    photo_files = st.file_uploader("Upload site photos / files", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
+                    camera_file = st.camera_input("Take site photo now", key=f"bw_cam_{pid}")
+                    caption_register = st.text_area("Photo caption register (one line per file)", value='', help="Write captions line by line in the same order as the uploaded photos. Example: Column starter at grid A3 | Ground floor slab steel | Cube test labels", key=f"bw_caps_{pid}")
+                    f1, f2 = st.columns(2)
+                    submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
+                    do_save = f1.form_submit_button(submit_text)
+                    do_cancel = f2.form_submit_button("Cancel Edit") if edit_report is not None else False
+                if do_cancel:
+                    st.session_state.pop(f"bw_edit_{pid}", None)
+                    st.rerun()
+                if do_save:
                     if not allowed:
                         st.error("You don't have permission to upload to this project.")
-                    elif current_cycle is None:
+                    elif current_cycle is None and edit_report is None:
                         st.error(cycle_reason or "No open reporting cycle is available.")
                     else:
-                        path=save_uploaded_file(up, f"project_{pid}/reports")
-                        if path:
-                            submitted_on = _today()
-                            timing_status = "LATE" if submitted_on > current_cycle['due_date'] else "ON_TIME"
-                            execute(
-                                "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (
-                                    pid,
-                                    str(current_cycle['due_date']),
-                                    path,
-                                    datetime.now().isoformat(timespec="seconds"),
-                                    str(submitted_on),
-                                    current_staff_id(),
-                                    "PENDING",
-                                    int(current_cycle['cycle_no']),
-                                    str(current_cycle['window_start']),
-                                    str(current_cycle['window_end']),
-                                    str(current_cycle['due_date']),
-                                    timing_status,
-                                ),
-                            )
-                            st.success(f"Report uploaded. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                        now_iso = datetime.now().isoformat(timespec='seconds')
+                        target_cycle = default_cycle
+                        target_start = default_start
+                        target_end = default_end
+                        target_due = default_due
+                        submitted_on = _today()
+                        timing_status = "LATE" if submitted_on > target_due else "ON_TIME"
+                        if edit_report is not None and (_editable_status(edit_report.get('status')) and (is_admin() or int(edit_report.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))):
+                            base_path = str(edit_report.get('file_path') or '')
+                            first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
+                            if first_new:
+                                base_path = first_new
+                            elif camera_file is not None:
+                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                                if cam_path:
+                                    base_path = cam_path
+                            execute("""UPDATE biweekly_reports
+                                       SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
+                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?
+                                       WHERE id=?""",
+                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
+                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
+                            _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            st.success("Report updated and resubmitted for admin review.")
+                            st.session_state.pop(f"bw_edit_{pid}", None)
+                            st.rerun()
                         else:
-                            st.error("Select a file first.")
-            rdf=fetch_df("SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no, window_start, window_end, due_date, timing_status FROM biweekly_reports WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?) ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC",(pid, current_staff_id()))
+                            base_path = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
+                            if (base_path is None or str(base_path).strip()=='') and camera_file is not None:
+                                base_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                            rid = execute(
+                                """INSERT INTO biweekly_reports
+                                   (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
+                            )
+                            _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                            st.rerun()
+
+            rdf=fetch_df("""SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
+                                   window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
+                                   hse_observations, rfi_notes, general_remarks
+                            FROM biweekly_reports
+                            WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=? OR ?=1)
+                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, current_staff_id(), 1 if is_admin() else 0))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
                 for _,r in rdf.iterrows():
-                    colA,colB,colC = st.columns([3,1,2])
                     sub = r['uploaded_at'] if pd.notna(r.get('uploaded_at')) and str(r.get('uploaded_at')).strip() else r['report_date']
-                    with colA:
-                        st.markdown(f"**Period:** {r['report_date']}  \n**Submitted:** {sub}  \n{os.path.basename(r['file_path'])}")
-                    with colB:
-                        file_download_button("⬇️ Download", r["file_path"], key=f"bw{r['id']}")
-                    with colC:
-                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
-                        if is_admin():
-                            c1,c2,c3 = st.columns([1,1,1])
-                            with c1:
-                                if r['status']!='APPROVED' and st.button("✅ Approve", key=f"bapp{r['id']}"):
-                                    approve_biweekly_report(int(r['id']), current_staff_id())
-                                    st.rerun()
-                            with c2:
-                                if r['status']!='REJECTED' and st.button("✖ Reject", key=f"brej{r['id']}"):
-                                    execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                            (current_staff_id(), datetime.now().isoformat(timespec="seconds"), int(r['id'])))
-                                    st.rerun()
-                            with c3:
-                                if st.button("🗑️ Delete", key=f"bdel{r['id']}"):
-                                    try:
-                                        fp=str(r.get("file_path") or "")
-                                        if fp and os.path.exists(fp): os.remove(fp)
-                                    except Exception:
-                                        pass
-                                    execute("DELETE FROM biweekly_reports WHERE id=?", (int(r['id']),))
-                                    st.rerun()
+                    st.markdown(f"**Report No.** {int(r['cycle_no']) if pd.notna(r.get('cycle_no')) else '—'}  \n**Period:** {r.get('window_start') or r['report_date']} → {r.get('window_end') or r['report_date']}  \n**Submitted:** {sub}  \n**Status:** {r['status']}  \n**Timing:** {r.get('timing_status') or '—'}")
+                    with st.expander('Report details', expanded=False):
+                        st.markdown(f"**Site Activities**\n\n{r.get('site_activities') or '—'}")
+                        st.markdown(f"**Reinforcement Observations**\n\n{r.get('reinforcement_observations') or '—'}")
+                        st.markdown(f"**Concrete / Test Observations**\n\n{r.get('concrete_observations') or '—'}")
+                        st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
+                        st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
+                        st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
+                    btns = st.columns([1,1,1,1])
+                    if str(r.get('file_path') or '').strip():
+                        with btns[0]:
+                            file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
+                    editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
+                    if editable:
+                        with btns[1]:
+                            if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
+                                st.session_state[f"bw_edit_{pid}"] = int(r['id'])
+                                st.rerun()
+                    if is_admin():
+                        with btns[2]:
+                            if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
+                                approve_biweekly_report(int(r['id']), current_staff_id())
+                                execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
+                                st.rerun()
+                        with btns[3]:
+                            if r['status']!='REJECTED' and st.button('✖ Reject', key=f"brej{r['id']}"):
+                                execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
+                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                st.rerun()
+                    _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
+                    st.markdown('---')
 # ---------- Staff ----------
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
