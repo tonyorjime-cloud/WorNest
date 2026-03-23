@@ -595,6 +595,20 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS chat_mentions (
+  id SERIAL PRIMARY KEY,
+  message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+  mentioned_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  mentioned_name TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(message_id, mentioned_staff_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_reads (
+  staff_id INTEGER PRIMARY KEY REFERENCES staff(id) ON DELETE CASCADE,
+  last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS points (
   id SERIAL PRIMARY KEY,
   staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
@@ -771,6 +785,24 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_name TEXT")
         if not _pg_has_column('chat_messages', 'attachment_type'):
             _pg_add_column("ALTER TABLE chat_messages ADD COLUMN attachment_type TEXT")
+        if not _pg_has_column('chat_messages', 'created_at'):
+            _pg_add_column("ALTER TABLE chat_messages ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+        cur.execute("""CREATE TABLE IF NOT EXISTS chat_mentions (
+          id SERIAL PRIMARY KEY,
+          message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+          mentioned_staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+          mentioned_name TEXT,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          UNIQUE(message_id, mentioned_staff_id)
+        );""")
+        if not _pg_has_column('chat_mentions', 'mentioned_name'):
+            _pg_add_column("ALTER TABLE chat_mentions ADD COLUMN mentioned_name TEXT")
+        if not _pg_has_column('chat_mentions', 'created_at'):
+            _pg_add_column("ALTER TABLE chat_mentions ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+        cur.execute("""CREATE TABLE IF NOT EXISTS chat_reads (
+          staff_id INTEGER PRIMARY KEY REFERENCES staff(id) ON DELETE CASCADE,
+          last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );""")
 
         # ---- Content approval workflow hardening (older DBs may miss these)
         # biweekly_reports
@@ -849,6 +881,8 @@ CREATE TABLE IF NOT EXISTS staff_of_month_posts (id INTEGER PRIMARY KEY, month T
 CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, image_path TEXT, posted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notice_comments (id INTEGER PRIMARY KEY, notice_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, comment TEXT NOT NULL, posted_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY, staff_id INTEGER NOT NULL, message TEXT, image_path TEXT, attachment_path TEXT, attachment_name TEXT, attachment_type TEXT, posted_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_mentions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, mentioned_staff_id INTEGER NOT NULL, mentioned_name TEXT, created_at TEXT NOT NULL, UNIQUE(message_id, mentioned_staff_id));
+CREATE TABLE IF NOT EXISTS chat_reads (staff_id INTEGER PRIMARY KEY, last_seen_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTEGER, token_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0);
 """
@@ -925,9 +959,24 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 ("attachment_path", "ALTER TABLE chat_messages ADD COLUMN attachment_path TEXT"),
                 ("attachment_name", "ALTER TABLE chat_messages ADD COLUMN attachment_name TEXT"),
                 ("attachment_type", "ALTER TABLE chat_messages ADD COLUMN attachment_type TEXT"),
+                ("created_at", "ALTER TABLE chat_messages ADD COLUMN created_at TEXT"),
             ]:
                 if col not in cols:
                     cur.execute(ddl)
+            if "created_at" not in cols:
+                try:
+                    cur.execute("UPDATE chat_messages SET created_at = COALESCE(posted_at, datetime('now')) WHERE created_at IS NULL")
+                except Exception:
+                    pass
+            cur.execute("CREATE TABLE IF NOT EXISTS chat_mentions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, mentioned_staff_id INTEGER NOT NULL, mentioned_name TEXT, created_at TEXT NOT NULL, UNIQUE(message_id, mentioned_staff_id))")
+            mcols = [r[1] for r in cur.execute("PRAGMA table_info(chat_mentions)").fetchall()]
+            for col, ddl in [
+                ("mentioned_name", "ALTER TABLE chat_mentions ADD COLUMN mentioned_name TEXT"),
+                ("created_at", "ALTER TABLE chat_mentions ADD COLUMN created_at TEXT"),
+            ]:
+                if col not in mcols:
+                    cur.execute(ddl)
+            cur.execute("CREATE TABLE IF NOT EXISTS chat_reads (staff_id INTEGER PRIMARY KEY, last_seen_at TEXT NOT NULL)")
         except Exception:
             pass
 
@@ -2197,6 +2246,11 @@ def apply_styles():
     st.markdown("""<style>
     .worknest-header{background:linear-gradient(90deg,#00B09B,#96C93D);color:#fff;padding:12px 16px;border-radius:14px}
     .pill{display:inline-block;padding:2px 10px;border-radius:999px;background:#eef}
+    .wn-chat-card{padding:12px 14px;border:1px solid rgba(0,0,0,.08);border-radius:14px;background:#fff;margin-bottom:10px}
+    .wn-chat-card.mentioned{background:#eef6ff;border-color:#8bbcff}
+    .wn-chat-meta{font-size:.88rem;color:#5b6470;margin-bottom:4px}
+    .wn-mention{color:#1565c0;font-weight:700}
+    .wn-chat-badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef6ff;color:#1565c0;font-size:.78rem;font-weight:700;margin-left:8px}
     </style>""", unsafe_allow_html=True)
 
 def current_user(): return st.session_state.get("user")
@@ -2260,6 +2314,136 @@ def current_staff_id():
 def current_user_id():
     """Backward-compatible alias for older code paths."""
     return current_staff_id()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def staff_lookup_options():
+    df = fetch_df("SELECT id, name FROM staff WHERE COALESCE(name,'')<>'' ORDER BY name")
+    if df.empty:
+        return []
+    out=[]
+    for _, r in df.iterrows():
+        try:
+            out.append({"id": int(r["id"]), "name": str(r["name"]).strip()})
+        except Exception:
+            pass
+    return out
+
+def _normalize_handle_name(name:str)->str:
+    return " ".join(str(name or "").strip().split()).lower()
+
+def chat_name_to_id_map():
+    return {_normalize_handle_name(x["name"]): x["id"] for x in staff_lookup_options()}
+
+def compose_chat_message(raw_message:str, mentioned_names:list[str]):
+    msg=(raw_message or '').strip()
+    prefixes=[]
+    lower_msg=msg.lower()
+    for nm in mentioned_names or []:
+        token=f"@{nm}".strip()
+        if token.lower() not in lower_msg:
+            prefixes.append(token)
+    prefix_text = (" ".join(prefixes)).strip()
+    if prefix_text and msg:
+        return f"{prefix_text} {msg}".strip()
+    return prefix_text or msg
+
+def extract_mentions_from_message(message:str):
+    msg=str(message or '')
+    norm_msg=_normalize_handle_name(msg.replace('\n',' '))
+    mapping=chat_name_to_id_map()
+    found=[]
+    options_by_id={x['id']: x['name'] for x in staff_lookup_options()}
+    for norm_name, sid in mapping.items():
+        token='@'+norm_name
+        if token in norm_msg:
+            found.append((sid, options_by_id.get(sid, norm_name.title())))
+    seen=set(); out=[]
+    for sid,name in found:
+        if sid not in seen:
+            seen.add(sid); out.append((sid,name))
+    return out
+
+def record_chat_mentions(message_id:int, mentions:list[tuple[int,str]]):
+    for sid, name in mentions or []:
+        try:
+            execute("INSERT OR IGNORE INTO chat_mentions (message_id, mentioned_staff_id, mentioned_name, created_at) VALUES (?,?,?,?)",
+                    (int(message_id), int(sid), str(name), _utcnow_iso()))
+        except Exception:
+            pass
+
+def mark_chat_seen(staff_id:int|None):
+    if staff_id is None:
+        return
+    now=_utcnow_iso()
+    try:
+        execute("INSERT OR IGNORE INTO chat_reads (staff_id, last_seen_at) VALUES (?,?)", (int(staff_id), now))
+        execute("UPDATE chat_reads SET last_seen_at=? WHERE staff_id=?", (now, int(staff_id)))
+    except Exception:
+        pass
+
+def _get_chat_last_seen(staff_id:int|None):
+    if staff_id is None:
+        return None
+    df=fetch_df("SELECT last_seen_at FROM chat_reads WHERE staff_id=? LIMIT 1", (int(staff_id),))
+    if df.empty:
+        return None
+    return str(df.iloc[0].get('last_seen_at') or '') or None
+
+def chat_visibility_counts(staff_id:int|None):
+    if staff_id is None:
+        return {"unread":0, "mentions":0}
+    last_seen=_get_chat_last_seen(staff_id)
+    params=[]
+    where=[]
+    if last_seen:
+        where.append("C.created_at > ?")
+        params.append(last_seen)
+    where_sql=("WHERE " + " AND ".join(where)) if where else ""
+    unread_df=fetch_df(f"SELECT COUNT(1) AS n FROM chat_messages C {where_sql}", tuple(params))
+    unread=int(unread_df.iloc[0]['n']) if not unread_df.empty else 0
+    mention_params=[int(staff_id)] + params
+    mention_where=["M.mentioned_staff_id = ?"] + where
+    mention_sql="WHERE " + " AND ".join(mention_where)
+    mention_df=fetch_df(f"SELECT COUNT(DISTINCT M.message_id) AS n FROM chat_mentions M JOIN chat_messages C ON C.id=M.message_id {mention_sql}", tuple(mention_params))
+    mentions=int(mention_df.iloc[0]['n']) if not mention_df.empty else 0
+    return {"unread": unread, "mentions": mentions}
+
+def chat_page_label():
+    counts=chat_visibility_counts(current_staff_id())
+    unread=max(0,int(counts.get('unread',0) or 0))
+    mentions=max(0,int(counts.get('mentions',0) or 0))
+    if unread or mentions:
+        return f"💬 Chat ({unread} | @{mentions})"
+    return "💬 Chat"
+
+def render_chat_message_html(message:str, mention_names:list[str]):
+    txt=html.escape(str(message or '')).replace('\n','<br>')
+    for name in sorted(set([str(x).strip() for x in (mention_names or []) if str(x).strip()]), key=len, reverse=True):
+        token=html.escape('@'+name)
+        txt=txt.replace(token, f'<span class="wn-mention">{token}</span>')
+    return txt
+
+def chat_mentions_map(message_ids:list[int]):
+    if not message_ids:
+        return {}
+    placeholders=','.join(['?']*len(message_ids))
+    out={}
+    try:
+        df=fetch_df(f"SELECT message_id, mentioned_staff_id, mentioned_name FROM chat_mentions WHERE message_id IN ({placeholders})", tuple(message_ids))
+    except Exception:
+        try:
+            df=fetch_df(f"SELECT message_id, mentioned_staff_id FROM chat_mentions WHERE message_id IN ({placeholders})", tuple(message_ids))
+        except Exception:
+            return out
+    if df.empty:
+        return out
+    for _, r in df.iterrows():
+        mid=int(r['message_id'])
+        out.setdefault(mid, []).append({
+            'staff_id': int(r['mentioned_staff_id']),
+            'name': str(r.get('mentioned_name') or '').strip()
+        })
+    return out
 
 def _get_user_permissions(user_id:int)->dict:
     if user_id is None:
@@ -2373,7 +2557,7 @@ def sidebar_nav():
     except Exception:
         pass
 
-    base_pages = BASE_PAGES
+    base_pages = [chat_page_label() if p.startswith("💬") else p for p in BASE_PAGES]
     admin_pages = ADMIN_PAGES
     pages = base_pages + (admin_pages if is_admin() else [])
 
@@ -2800,6 +2984,16 @@ def page_dashboard():
     ctop2.metric("Active", summary.get("active_projects", 0))
     ctop3.metric("Dormant", summary.get("dormant_projects", 0))
     ctop4.metric("Open Tasks", summary.get("open_tasks", 0))
+
+    if sid is not None:
+        cc = chat_visibility_counts(sid)
+        unread = int(cc.get("unread", 0) or 0)
+        mentions = int(cc.get("mentions", 0) or 0)
+        if unread or mentions:
+            alert = f"📩 You have {unread} unread chat message(s)"
+            if mentions:
+                alert += f" and {mentions} mention(s)"
+            st.info(alert)
 
     st.markdown("### 🎯 Today's Obligations")
     ob1, ob2 = st.columns([2,1])
@@ -3770,12 +3964,33 @@ def page_chat():
         st.info('Please login to use chat.')
         return
 
+    counts=chat_visibility_counts(sid)
+    if counts.get('unread') or counts.get('mentions'):
+        msg=f"Unread messages: {int(counts.get('unread',0) or 0)}"
+        if counts.get('mentions'):
+            msg += f" | Mentions for you: {int(counts.get('mentions',0) or 0)}"
+        st.caption(msg)
+
+    staff_opts = staff_lookup_options()
+    mention_names = [x['name'] for x in staff_opts if x['id'] != sid]
+    mention_name_to_id = {x['name']: x['id'] for x in staff_opts}
+
     with st.form('chat_send', clear_on_submit=True):
+        selected_mentions = st.multiselect(
+            'Tag staff (optional — type to search, full name will be inserted automatically)',
+            options=mention_names,
+            default=[],
+            key='chat_mentions_picker'
+        )
         msg=st.text_area('Message', height=90, placeholder='Type your message…')
         img=st.file_uploader('Optional image', type=['png','jpg','jpeg','webp','gif'])
         sent=st.form_submit_button('Send')
         if sent:
-            m=(msg or '').strip()
+            chosen = [(int(mention_name_to_id[nm]), nm) for nm in selected_mentions if nm in mention_name_to_id]
+            manual = extract_mentions_from_message(msg)
+            merged = {sid_: nm for sid_, nm in (chosen + manual)}
+            final_mentions=[(int(k), v) for k,v in merged.items() if int(k) != int(sid)]
+            m=compose_chat_message(msg, [nm for _, nm in final_mentions])
             if not m and img is None:
                 st.warning('Type a message or attach an image.')
             else:
@@ -3791,7 +4006,10 @@ def page_chat():
                 attachment_path=None
                 attachment_name=None
                 attachment_type=None
-                execute('INSERT INTO chat_messages (staff_id,message,image_path,attachment_path,attachment_name,attachment_type) VALUES (?,?,?,?,?,?)', (sid, m if m else None, image_path, attachment_path, attachment_name, attachment_type))
+                message_id = execute('INSERT INTO chat_messages (staff_id,message,image_path,attachment_path,attachment_name,attachment_type) VALUES (?,?,?,?,?,?)', (sid, m if m else None, image_path, attachment_path, attachment_name, attachment_type))
+                if message_id is not None:
+                    record_chat_mentions(int(message_id), final_mentions)
+                mark_chat_seen(sid)
                 st.success('Sent')
                 st.rerun()
 
@@ -3805,19 +4023,38 @@ def page_chat():
 
     if df.empty:
         st.info('No messages yet. Say hi 👋')
+        mark_chat_seen(sid)
         return
 
-    # show oldest -> newest
-    for r in (df.to_dict('records')):
+    ids=[]
+    for _, rr in df.iterrows():
+        try:
+            ids.append(int(rr['id']))
+        except Exception:
+            pass
+    mention_map = chat_mentions_map(ids)
+
+    for r in df.to_dict('records'):
+        mid = int(r.get('id')) if r.get('id') is not None else None
+        msg_mentions = mention_map.get(mid, [])
+        mention_names_here = [m.get('name') for m in msg_mentions if m.get('name')]
+        mentioned_here = any(int(m.get('staff_id')) == int(sid) for m in msg_mentions if m.get('staff_id') is not None)
         ts=str(r.get('created_at') or '')
-        st.markdown(f"**{r.get('staff_name','(Unknown)')}**  \n{ts}")
-        if r.get('message'):
-            st.write(r['message'])
+        meta = f"<div class='wn-chat-meta'><strong>{html.escape(str(r.get('staff_name','(Unknown)')))}</strong> &nbsp; {html.escape(ts)}"
+        if mentioned_here:
+            meta += "<span class='wn-chat-badge'>mentioned you</span>"
+        meta += "</div>"
+        body = render_chat_message_html(r.get('message') or '', mention_names_here) if r.get('message') else ''
+        classes = 'wn-chat-card mentioned' if mentioned_here else 'wn-chat-card'
+        st.markdown(f"<div class='{classes}'>{meta}<div>{body}</div></div>", unsafe_allow_html=True)
         if r.get('image_path') and os.path.exists(r['image_path']):
             st.image(r['image_path'])
         st.divider()
 
+    mark_chat_seen(sid)
+
 def page_leave_table():
+
     st.markdown("<div class='worknest-header'><h2>📄 Leave Table</h2></div>", unsafe_allow_html=True)
     df=fetch_df("""
         SELECT L.id, S.name AS staff, S.rank, L.leave_type, L.start_date, L.end_date, L.working_days,
