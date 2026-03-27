@@ -159,7 +159,7 @@ def clear_remember_cookie_and_token():
 
 
 # --- Navigation constants (avoid accidental indentation bugs) ---
-BASE_PAGES = ["🏠 Dashboard","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","📄 Leave Table","💬 Chat","⚙️ Account","❓ Help"]
+BASE_PAGES = ["🏠 Dashboard","🔎 Search","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","📄 Leave Table","💬 Chat","⚙️ Account","❓ Help"]
 ADMIN_PAGES = ["👥 Staff","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights","📥 Admin Inbox"]
 
 
@@ -3765,6 +3765,159 @@ def page_dashboard():
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
 # ---------- Staff ----------
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def worknest_search(query: str):
+    q = str(query or '').strip()
+    if len(q) < 2:
+        return {
+            'projects': pd.DataFrame(),
+            'documents': pd.DataFrame(),
+            'reports': pd.DataFrame(),
+            'tests': pd.DataFrame(),
+            'chat': pd.DataFrame(),
+        }
+    like = f"%{q.lower()}%"
+    results = {}
+    try:
+        results['projects'] = fetch_df(
+            """SELECT id, code, name, client, location, COALESCE(status,'ACTIVE') AS status
+                   FROM projects
+                   WHERE LOWER(COALESCE(code,'')) LIKE ?
+                      OR LOWER(COALESCE(name,'')) LIKE ?
+                      OR LOWER(COALESCE(client,'')) LIKE ?
+                      OR LOWER(COALESCE(location,'')) LIKE ?
+                   ORDER BY code, name
+                   LIMIT 25""",
+            (like, like, like, like)
+        )
+    except Exception:
+        results['projects'] = pd.DataFrame()
+    try:
+        results['documents'] = fetch_df(
+            """SELECT d.id, p.code AS project_code, p.name AS project_name, d.category, d.file_path, d.uploaded_at
+                   FROM documents d
+                   LEFT JOIN projects p ON p.id=d.project_id
+                   WHERE LOWER(COALESCE(d.category,'')) LIKE ?
+                      OR LOWER(COALESCE(d.file_path,'')) LIKE ?
+                      OR LOWER(COALESCE(p.code,'')) LIKE ?
+                      OR LOWER(COALESCE(p.name,'')) LIKE ?
+                   ORDER BY d.uploaded_at DESC, d.id DESC
+                   LIMIT 40""",
+            (like, like, like, like)
+        )
+    except Exception:
+        results['documents'] = pd.DataFrame()
+    try:
+        results['reports'] = fetch_df(
+            """SELECT r.id, p.code AS project_code, p.name AS project_name,
+                          COALESCE(r.cycle_no, 0) AS cycle_no,
+                          COALESCE(r.status,'APPROVED') AS status,
+                          COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp,
+                          LEFT(COALESCE(r.site_activities,'') || ' ' || COALESCE(r.reinforcement_observations,'') || ' ' ||
+                               COALESCE(r.concrete_observations,'') || ' ' || COALESCE(r.hse_observations,'') || ' ' ||
+                               COALESCE(r.rfi_notes,'') || ' ' || COALESCE(r.general_remarks,''), 220) AS snippet
+                   FROM biweekly_reports r
+                   LEFT JOIN projects p ON p.id=r.project_id
+                   WHERE LOWER(COALESCE(p.code,'')) LIKE ?
+                      OR LOWER(COALESCE(p.name,'')) LIKE ?
+                      OR LOWER(COALESCE(r.site_activities,'')) LIKE ?
+                      OR LOWER(COALESCE(r.reinforcement_observations,'')) LIKE ?
+                      OR LOWER(COALESCE(r.concrete_observations,'')) LIKE ?
+                      OR LOWER(COALESCE(r.hse_observations,'')) LIKE ?
+                      OR LOWER(COALESCE(r.rfi_notes,'')) LIKE ?
+                      OR LOWER(COALESCE(r.general_remarks,'')) LIKE ?
+                   ORDER BY stamp DESC, r.id DESC
+                   LIMIT 25""",
+            (like, like, like, like, like, like, like, like)
+        )
+    except Exception:
+        results['reports'] = pd.DataFrame()
+    try:
+        results['tests'] = fetch_df(
+            """SELECT tr.id, p.code AS project_code, p.name AS project_name, tr.test_type, tr.batch_id,
+                          COALESCE(tr.status,'APPROVED') AS status, COALESCE(tr.test_date, tr.uploaded_at) AS stamp,
+                          LEFT(COALESCE(tr.result_summary, tr.notes, ''), 220) AS snippet
+                   FROM test_results tr
+                   LEFT JOIN projects p ON p.id=tr.project_id
+                   WHERE LOWER(COALESCE(p.code,'')) LIKE ?
+                      OR LOWER(COALESCE(p.name,'')) LIKE ?
+                      OR LOWER(COALESCE(tr.test_type,'')) LIKE ?
+                      OR LOWER(COALESCE(tr.batch_id,'')) LIKE ?
+                      OR LOWER(COALESCE(tr.result_summary, tr.notes, '')) LIKE ?
+                   ORDER BY stamp DESC, tr.id DESC
+                   LIMIT 25""",
+            (like, like, like, like, like)
+        )
+    except Exception:
+        results['tests'] = pd.DataFrame()
+    try:
+        results['chat'] = fetch_df(
+            """SELECT c.id, COALESCE(s.name,'Unknown') AS staff_name, c.created_at, LEFT(COALESCE(c.message,''), 220) AS snippet
+                   FROM chat_messages c
+                   LEFT JOIN staff s ON s.id=c.staff_id
+                   WHERE LOWER(COALESCE(c.message,'')) LIKE ?
+                   ORDER BY c.created_at DESC, c.id DESC
+                   LIMIT 25""",
+            (like,)
+        )
+    except Exception:
+        results['chat'] = pd.DataFrame()
+    return results
+
+
+def page_search():
+    st.markdown("<div class='worknest-header'><h2>🔎 Search</h2></div>", unsafe_allow_html=True)
+    st.caption("Search across projects, uploaded drawings/documents, biweekly reports, test results, and chat. For full drawing sets like 'Jabi Magistrate Court Structural Drawings', search by project name or file name.")
+    q = st.text_input('Search WorkNest', placeholder='Try: Jabi, magistrate, structural drawings, cube test, Ayuba')
+    if len(str(q or '').strip()) < 2:
+        st.info('Type at least 2 characters to search.')
+        return
+    res = worknest_search(q)
+    total = sum(0 if getattr(df, 'empty', True) else len(df) for df in res.values())
+    st.caption(f"Results for: {q} — {total} match(es)")
+
+    if not res['projects'].empty:
+        st.markdown('### Projects')
+        st.dataframe(res['projects'], hide_index=True, width='stretch')
+
+    if not res['documents'].empty:
+        st.markdown('### Drawings / Documents')
+        ddf = res['documents'].copy()
+        ddf['file_name'] = ddf['file_path'].apply(lambda x: os.path.basename(str(x)))
+        show = ddf[['project_code','project_name','category','file_name','uploaded_at']].rename(columns={
+            'project_code':'Project Code','project_name':'Project Name','category':'Category','file_name':'File','uploaded_at':'Uploaded'
+        })
+        st.dataframe(show, hide_index=True, width='stretch')
+        with st.expander('Download matching drawings/documents'):
+            for _, r in ddf.iterrows():
+                label = f"⬇️ {r.get('project_code') or ''} {os.path.basename(str(r.get('file_path') or ''))}".strip()
+                file_download_button(label, str(r.get('file_path') or ''), key=f"search_doc_{int(r['id'])}")
+
+    if not res['reports'].empty:
+        st.markdown('### Biweekly Reports')
+        rdf = res['reports'].rename(columns={
+            'project_code':'Project Code','project_name':'Project Name','cycle_no':'Report No','status':'Status','stamp':'Submitted','snippet':'Excerpt'
+        })
+        st.dataframe(rdf[['Project Code','Project Name','Report No','Status','Submitted','Excerpt']], hide_index=True, width='stretch')
+
+    if not res['tests'].empty:
+        st.markdown('### Test Results')
+        tdf = res['tests'].rename(columns={
+            'project_code':'Project Code','project_name':'Project Name','test_type':'Test Type','batch_id':'Batch','status':'Status','stamp':'Date','snippet':'Excerpt'
+        })
+        st.dataframe(tdf[['Project Code','Project Name','Test Type','Batch','Status','Date','Excerpt']], hide_index=True, width='stretch')
+
+    if not res['chat'].empty:
+        st.markdown('### Chat')
+        cdf = res['chat'].rename(columns={
+            'staff_name':'Staff','created_at':'When','snippet':'Message'
+        })
+        st.dataframe(cdf[['Staff','When','Message']], hide_index=True, width='stretch')
+
+    if all(getattr(df, 'empty', True) for df in res.values()):
+        st.warning('No results found.')
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
     staff=fetch_df("SELECT id,name,rank,email,section FROM staff ORDER BY name")
@@ -6079,6 +6232,7 @@ def main():
 
     page = sidebar_nav() or "🏠 Dashboard"
     if page.startswith("🏠"): page_dashboard()
+    elif page.startswith("🔎"): page_search()
     elif page.startswith("🏗️"): page_projects()
     elif page.startswith("👥"): page_staff()
     elif page.startswith("🧳"): page_leave()
