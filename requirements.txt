@@ -8,5 +8,3 @@ joblib
 streamlit-cookies-manager
 requests
 streamlit-javascript
-fpdf2
-Pillow
