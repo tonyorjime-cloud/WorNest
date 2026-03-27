@@ -1,4 +1,13 @@
 
+
+# 🔗 Search navigation routing
+def navigate_to(page, project_id=None, tab=None):
+    st.session_state["nav_radio"] = page
+    if project_id:
+        st.session_state["selected_project_id"] = project_id
+    if tab:
+        st.session_state["selected_project_tab"] = tab
+
 try:
     from streamlit_javascript import st_javascript
 except Exception:
