@@ -14,6 +14,7 @@ import pandas as pd, numpy as np, streamlit as st
 from streamlit_cookies_manager import CookieManager
 import uuid
 import streamlit.components.v1 as components
+from report_pdf import build_biweekly_report_pdf
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -3585,6 +3586,10 @@ def page_dashboard():
         # Biweekly Reports
         with tabs[3]:
             st.subheader("Biweekly Reports")
+            recent_rid = st.session_state.pop(f"bw_recent_{pid}", None)
+            if recent_rid:
+                st.success("Report submitted successfully. You can generate the PDF now.")
+                _biweekly_pdf_download_button(int(recent_rid), "🖨️ Generate PDF", key=f"bw_pdf_recent_{pid}_{recent_rid}")
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if _project_is_dormant(pid):
@@ -3705,6 +3710,7 @@ def page_dashboard():
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
                             _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            st.session_state[f"bw_recent_{pid}"] = int(edit_report['id'])
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -3719,6 +3725,7 @@ def page_dashboard():
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
                             _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            st.session_state[f"bw_recent_{pid}"] = int(rid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
@@ -3741,29 +3748,90 @@ def page_dashboard():
                         st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
                         st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
                         st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
-                    btns = st.columns([1,1,1,1])
+                    btns = st.columns([1,1,1,1,1])
                     if str(r.get('file_path') or '').strip():
                         with btns[0]:
                             file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
+                    with btns[1]:
+                        _biweekly_pdf_download_button(int(r['id']), '🖨️ PDF', key=f"bwpdf_{r['id']}")
                     editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
                     if editable:
-                        with btns[1]:
+                        with btns[2]:
                             if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
                                 st.session_state[f"bw_edit_{pid}"] = int(r['id'])
                                 st.rerun()
                     if is_admin():
-                        with btns[2]:
+                        with btns[3]:
                             if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
                                 approve_biweekly_report(int(r['id']), current_staff_id())
                                 execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
                                 st.rerun()
-                        with btns[3]:
+                        with btns[4]:
                             if r['status']!='REJECTED' and st.button('✖ Reject', key=f"brej{r['id']}"):
                                 execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
                                         (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
                                 st.rerun()
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
+
+
+def _project_row(project_id:int):
+    try:
+        df = fetch_df("SELECT id, code, name, location, client FROM projects WHERE id=? LIMIT 1", (int(project_id),))
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return {"id": project_id, "code": str(project_id), "name": f"Project {project_id}", "location": "", "client": ""}
+
+def _biweekly_report_row(report_id:int):
+    try:
+        df = fetch_df("""SELECT id, project_id, report_date, uploaded_at, submitted_on, status, uploader_staff_id, cycle_no,
+                               window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations,
+                               concrete_observations, hse_observations, rfi_notes, general_remarks, approved_at, approved_by_staff_id
+                        FROM biweekly_reports WHERE id=? LIMIT 1""", (int(report_id),))
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return None
+
+def _staff_name_by_id(staff_id):
+    try:
+        if staff_id is None:
+            return ''
+        df = fetch_df("SELECT name FROM staff WHERE id=? LIMIT 1", (int(staff_id),))
+        if not df.empty:
+            return str(df.iloc[0].get('name') or '')
+    except Exception:
+        pass
+    return ''
+
+def _biweekly_pdf_bytes(report_id:int):
+    row = _biweekly_report_row(int(report_id))
+    if not row:
+        return None
+    project = _project_row(int(row.get('project_id') or 0))
+    attachments_df = _attachment_rows('biweekly', int(report_id))
+    attachments = attachments_df.to_dict('records') if attachments_df is not None and not attachments_df.empty else []
+    prepared_by = _staff_name_by_id(row.get('uploader_staff_id')) or _staff_name_by_id(current_staff_id()) or ''
+    approved_by = _staff_name_by_id(row.get('approved_by_staff_id')) if row.get('approved_by_staff_id') else ''
+    return build_biweekly_report_pdf(project=project, report=row, attachments=attachments, prepared_by=prepared_by, approved_by=approved_by)
+
+def _biweekly_pdf_download_button(report_id:int, label:str, key:str):
+    try:
+        pdf_bytes = _biweekly_pdf_bytes(int(report_id))
+        if pdf_bytes:
+            row = _biweekly_report_row(int(report_id)) or {}
+            project = _project_row(int(row.get('project_id') or 0))
+            cyc = row.get('cycle_no')
+            stem = f"{project.get('code') or 'PROJECT'}_report_{cyc if cyc not in (None, '', 'nan') else report_id}.pdf"
+            st.download_button(label, data=pdf_bytes, file_name=stem.replace(' ','_'), mime='application/pdf', key=key)
+        else:
+            st.error('Could not generate PDF for this report.')
+    except Exception as e:
+        st.error(f'PDF generation failed: {e}')
+
 # ---------- Staff ----------
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
@@ -4384,6 +4452,10 @@ def page_projects():
         # Biweekly Reports
         with tabs[3]:
             st.subheader("Biweekly Reports")
+            recent_rid = st.session_state.pop(f"bw_recent_{pid}", None)
+            if recent_rid:
+                st.success("Report submitted successfully. You can generate the PDF now.")
+                _biweekly_pdf_download_button(int(recent_rid), "🖨️ Generate PDF", key=f"bw_pdf_recent_{pid}_{recent_rid}")
             allowed = can_upload_project_outputs(pid)
             st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if _project_is_dormant(pid):
@@ -4504,6 +4576,7 @@ def page_projects():
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
                             _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            st.session_state[f"bw_recent_{pid}"] = int(edit_report['id'])
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -4518,6 +4591,7 @@ def page_projects():
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
                             _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            st.session_state[f"bw_recent_{pid}"] = int(rid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
@@ -4540,29 +4614,90 @@ def page_projects():
                         st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
                         st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
                         st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
-                    btns = st.columns([1,1,1,1])
+                    btns = st.columns([1,1,1,1,1])
                     if str(r.get('file_path') or '').strip():
                         with btns[0]:
                             file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
+                    with btns[1]:
+                        _biweekly_pdf_download_button(int(r['id']), '🖨️ PDF', key=f"bwpdf_{r['id']}")
                     editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
                     if editable:
-                        with btns[1]:
+                        with btns[2]:
                             if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
                                 st.session_state[f"bw_edit_{pid}"] = int(r['id'])
                                 st.rerun()
                     if is_admin():
-                        with btns[2]:
+                        with btns[3]:
                             if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
                                 approve_biweekly_report(int(r['id']), current_staff_id())
                                 execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
                                 st.rerun()
-                        with btns[3]:
+                        with btns[4]:
                             if r['status']!='REJECTED' and st.button('✖ Reject', key=f"brej{r['id']}"):
                                 execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
                                         (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
                                 st.rerun()
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
+
+
+def _project_row(project_id:int):
+    try:
+        df = fetch_df("SELECT id, code, name, location, client FROM projects WHERE id=? LIMIT 1", (int(project_id),))
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return {"id": project_id, "code": str(project_id), "name": f"Project {project_id}", "location": "", "client": ""}
+
+def _biweekly_report_row(report_id:int):
+    try:
+        df = fetch_df("""SELECT id, project_id, report_date, uploaded_at, submitted_on, status, uploader_staff_id, cycle_no,
+                               window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations,
+                               concrete_observations, hse_observations, rfi_notes, general_remarks, approved_at, approved_by_staff_id
+                        FROM biweekly_reports WHERE id=? LIMIT 1""", (int(report_id),))
+        if not df.empty:
+            return df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return None
+
+def _staff_name_by_id(staff_id):
+    try:
+        if staff_id is None:
+            return ''
+        df = fetch_df("SELECT name FROM staff WHERE id=? LIMIT 1", (int(staff_id),))
+        if not df.empty:
+            return str(df.iloc[0].get('name') or '')
+    except Exception:
+        pass
+    return ''
+
+def _biweekly_pdf_bytes(report_id:int):
+    row = _biweekly_report_row(int(report_id))
+    if not row:
+        return None
+    project = _project_row(int(row.get('project_id') or 0))
+    attachments_df = _attachment_rows('biweekly', int(report_id))
+    attachments = attachments_df.to_dict('records') if attachments_df is not None and not attachments_df.empty else []
+    prepared_by = _staff_name_by_id(row.get('uploader_staff_id')) or _staff_name_by_id(current_staff_id()) or ''
+    approved_by = _staff_name_by_id(row.get('approved_by_staff_id')) if row.get('approved_by_staff_id') else ''
+    return build_biweekly_report_pdf(project=project, report=row, attachments=attachments, prepared_by=prepared_by, approved_by=approved_by)
+
+def _biweekly_pdf_download_button(report_id:int, label:str, key:str):
+    try:
+        pdf_bytes = _biweekly_pdf_bytes(int(report_id))
+        if pdf_bytes:
+            row = _biweekly_report_row(int(report_id)) or {}
+            project = _project_row(int(row.get('project_id') or 0))
+            cyc = row.get('cycle_no')
+            stem = f"{project.get('code') or 'PROJECT'}_report_{cyc if cyc not in (None, '', 'nan') else report_id}.pdf"
+            st.download_button(label, data=pdf_bytes, file_name=stem.replace(' ','_'), mime='application/pdf', key=key)
+        else:
+            st.error('Could not generate PDF for this report.')
+    except Exception as e:
+        st.error(f'PDF generation failed: {e}')
+
 # ---------- Staff ----------
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
