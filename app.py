@@ -1,13 +1,4 @@
 
-
-# 🔗 Search navigation routing
-def navigate_to(page, project_id=None, tab=None):
-    st.session_state["nav_radio"] = page
-    if project_id:
-        st.session_state["selected_project_id"] = project_id
-    if tab:
-        st.session_state["selected_project_tab"] = tab
-
 try:
     from streamlit_javascript import st_javascript
 except Exception:
@@ -2977,6 +2968,19 @@ def dashboard_summary_snapshot(today_iso: str):
         pass
     return out
 
+
+
+def navigate_to_search_result(page: str, project_id=None, tab_index=None):
+    st.session_state["nav_radio"] = page
+    if project_id is not None:
+        try:
+            st.session_state["selected_project_id"] = int(project_id)
+        except Exception:
+            pass
+    if tab_index is not None:
+        st.session_state["selected_project_tab_index"] = int(tab_index)
+    st.rerun()
+
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
     sid = current_staff_id()
@@ -3411,7 +3415,11 @@ def page_dashboard():
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), width='stretch')
 
         st.markdown("---")
-        tabs = st.tabs(["🏢 Buildings","📄 Core Docs","🧪 Tests","📝 Biweekly Reports"])
+        _tab_labels = ["🏢 Buildings","📄 Core Docs","🧪 Tests","📝 Biweekly Reports"]
+        _desired_tab = st.session_state.pop("selected_project_tab_index", None)
+        if _desired_tab is not None and 0 <= int(_desired_tab) < len(_tab_labels):
+            st.caption(f"Opened from search → {_tab_labels[int(_desired_tab)]}")
+        tabs = st.tabs(_tab_labels)
 
         # Buildings
         with tabs[0]:
@@ -3889,7 +3897,16 @@ def page_search():
 
     if not res['projects'].empty:
         st.markdown('### Projects')
-        st.dataframe(res['projects'], hide_index=True, width='stretch')
+        for _, r in res['projects'].iterrows():
+            c1, c2 = st.columns([6,1])
+            with c1:
+                st.write(f"**{r.get('code','')} — {r.get('name','')}**")
+                meta = " | ".join([x for x in [str(r.get('client') or '').strip(), str(r.get('location') or '').strip(), str(r.get('status') or '').strip()] if x])
+                if meta:
+                    st.caption(meta)
+            with c2:
+                if st.button('Open', key=f"srch_proj_{int(r['id'])}"):
+                    navigate_to_search_result('🏗️ Projects', project_id=int(r['id']))
 
     if not res['documents'].empty:
         st.markdown('### Drawings / Documents')
@@ -3898,9 +3915,19 @@ def page_search():
         show = ddf[['project_code','project_name','category','file_name','uploaded_at']].rename(columns={
             'project_code':'Project Code','project_name':'Project Name','category':'Category','file_name':'File','uploaded_at':'Uploaded'
         })
-        st.dataframe(show, hide_index=True, width='stretch')
-        with st.expander('Download matching drawings/documents'):
-            for _, r in ddf.iterrows():
+        for _, r in ddf.iterrows():
+            c1, c2, c3 = st.columns([6,1,1])
+            with c1:
+                st.write(f"**{r.get('project_code','')} — {r.get('project_name','')}** | {r.get('category','')} | {os.path.basename(str(r.get('file_path') or ''))}")
+                st.caption(str(r.get('uploaded_at') or ''))
+            with c2:
+                if st.button('Open', key=f"srch_doc_open_{int(r['id'])}"):
+                    pid_df = fetch_df("SELECT project_id FROM documents WHERE id=? LIMIT 1", (int(r['id']),))
+                    if not pid_df.empty and pd.notna(pid_df.iloc[0].get('project_id')):
+                        navigate_to_search_result('🏗️ Projects', project_id=int(pid_df.iloc[0]['project_id']), tab_index=1)
+            with c3:
+                file_download_button('⬇️ File', str(r.get('file_path') or ''), key=f"srch_doc_dl_{int(r['id'])}")
+
                 label = f"⬇️ {r.get('project_code') or ''} {os.path.basename(str(r.get('file_path') or ''))}".strip()
                 file_download_button(label, str(r.get('file_path') or ''), key=f"search_doc_{int(r['id'])}")
 
@@ -4306,7 +4333,16 @@ def page_projects():
             selected=None
         else:
             labels=[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
-            selected_label=st.selectbox("Select a project", labels, key="proj_select")
+            pre_idx = 0
+            try:
+                target_pid = st.session_state.get("selected_project_id")
+                if target_pid is not None:
+                    match_idx = next((i for i, (_, rr) in enumerate(projects.iterrows()) if int(rr["id"]) == int(target_pid)), None)
+                    if match_idx is not None:
+                        pre_idx = match_idx
+            except Exception:
+                pre_idx = 0
+            selected_label=st.selectbox("Select a project", labels, index=pre_idx if labels else 0, key="proj_select")
             selected=projects.iloc[labels.index(selected_label)] if labels else None
     with right:
         st.subheader("Create / Update Project")
