@@ -1,6 +1,6 @@
 
 def navigate_to(page, project_id=None, tab=None):
-    st.session_state["nav_radio"] = page
+    st.session_state["_pending_nav"] = page
     if project_id:
         st.session_state["selected_project_id"] = project_id
     if tab:
@@ -2977,16 +2977,14 @@ def dashboard_summary_snapshot(today_iso: str):
 
 
 
-def navigate_to_search_result(page: str, project_id=None, tab_index=None):
-    st.session_state["nav_radio"] = page
+def navigate_to_search_result(page, project_id=None, tab=None):
+    st.session_state["_pending_nav"] = page
     if project_id is not None:
-        try:
-            st.session_state["selected_project_id"] = int(project_id)
-        except Exception:
-            pass
-    if tab_index is not None:
-        st.session_state["selected_project_tab_index"] = int(tab_index)
+        st.session_state["selected_project_id"] = int(project_id)
+    if tab:
+        st.session_state["selected_project_tab"] = tab
     st.rerun()
+
 
 def page_dashboard():
     st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
