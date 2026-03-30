@@ -1,4 +1,52 @@
 
+def _all_staff_phones():
+    try:
+        df = fetch_df("SELECT phone FROM staff WHERE phone IS NOT NULL")
+        return [r["phone"] for _, r in df.iterrows() if r.get("phone")]
+    except Exception:
+        return []
+
+
+# ===== SMS (Termii) =====
+import os, requests
+
+SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
+TERMII_API_KEY = os.getenv("TERMII_API_KEY", "")
+TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "WorkNest")
+TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic")
+
+def _normalize_ng(phone):
+    if not phone: return None
+    p = str(phone).strip().replace(" ", "")
+    if p.startswith("+234"): return p[1:]
+    if p.startswith("234"): return p
+    if p.startswith("0") and len(p)>=10: return "234"+p[1:]
+    return p
+
+def send_sms_termii(to_numbers, message):
+    if not SMS_ENABLED or not TERMII_API_KEY or not to_numbers:
+        return
+    nums = []
+    for n in to_numbers:
+        nn = _normalize_ng(n)
+        if nn: nums.append(nn)
+    if not nums:
+        return
+    url = "https://api.ng.termii.com/api/sms/send"
+    payload = {
+        "to": nums,
+        "from": TERMII_SENDER_ID,
+        "sms": message,
+        "type": "plain",
+        "channel": TERMII_CHANNEL,
+        "api_key": TERMII_API_KEY
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
+
+
 def navigate_to(page, project_id=None, tab=None):
     st.session_state["_pending_nav"] = page
     if project_id:
