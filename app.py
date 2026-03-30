@@ -1,3 +1,17 @@
+
+# ===== FIX ATTACHMENT ID AUTO-INCREMENT (Postgres) =====
+def _fix_attachment_id_sequences():
+    try:
+        execute("CREATE SEQUENCE IF NOT EXISTS biweekly_report_attachments_id_seq")
+        execute("ALTER TABLE biweekly_report_attachments ALTER COLUMN id SET DEFAULT nextval('biweekly_report_attachments_id_seq')")
+        execute("SELECT setval('biweekly_report_attachments_id_seq', COALESCE((SELECT MAX(id) FROM biweekly_report_attachments),0)+1, false)")
+
+        execute("CREATE SEQUENCE IF NOT EXISTS test_result_attachments_id_seq")
+        execute("ALTER TABLE test_result_attachments ALTER COLUMN id SET DEFAULT nextval('test_result_attachments_id_seq')")
+        execute("SELECT setval('test_result_attachments_id_seq', COALESCE((SELECT MAX(id) FROM test_result_attachments),0)+1, false)")
+    except Exception as e:
+        print("SEQ FIX ERROR:", e)
+
 # ===== SMS (SendChamp) =====
 import os, requests
 
@@ -504,6 +518,7 @@ def _fetch_df_cached(q: str, params: tuple = ()):
 @st.cache_resource(show_spinner=False)
 def ensure_runtime_initialized():
     init_db()
+    _fix_attachment_id_sequences()
     return True
 
 def _exec_script(cur, sql_script: str):
@@ -535,7 +550,8 @@ def _exec_script(cur, sql_script: str):
 def hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
 
-def init_db():
+def init_db()
+    _fix_attachment_id_sequences():
     c = get_conn()
     cur = c.cursor()
 
@@ -2755,7 +2771,10 @@ def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
         f.write(data)
     return path
 
-def _save_biweekly_attachments(report_id: int, uploads=None, camera_file=None, captions_text: str = "", pid: int | None = None):
+def if len(photo_files or []) + (1 if camera_file else 0) > 5:
+        st.error('Maximum of 5 photos allowed')
+    else:
+        _save_biweekly_attachments(report_id: int, uploads=None, camera_file=None, captions_text: str = "", pid: int | None = None):
     uploads = uploads or []
     captions = [ln.strip() for ln in str(captions_text or '').splitlines()]
     saved = []
@@ -3831,7 +3850,10 @@ def page_dashboard():
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
+        st.error('Maximum of 5 photos allowed')
+    else:
+        _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -3845,7 +3867,10 @@ def page_dashboard():
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
+        st.error('Maximum of 5 photos allowed')
+    else:
+        _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
@@ -4811,7 +4836,10 @@ def page_projects():
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
+        st.error('Maximum of 5 photos allowed')
+    else:
+        _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -4825,7 +4853,10 @@ def page_projects():
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
+        st.error('Maximum of 5 photos allowed')
+    else:
+        _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
