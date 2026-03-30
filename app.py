@@ -2638,7 +2638,7 @@ def file_download_button(label, file_path, key):
     try:
         with open(file_path, "rb") as f:
             data=f.read()
-        st.download_button(label, data=data, file_name=os.path.basename(file_path), key=key)
+        st.download_button('⬇ Download Drawing', label, data=data, file_name=os.path.basename(file_path), key=key)
     except Exception as e:
         st.error(f"Missing file: {file_path}")
 
@@ -5533,7 +5533,7 @@ def page_admin_inbox():
                     if file_path and os.path.exists(file_path):
                         try:
                             with open(file_path, "rb") as f:
-                                st.download_button(
+                                st.download_button('⬇ Download Drawing', 
                                     "⬇️ Download",
                                     f,
                                     file_name=os.path.basename(file_path),
@@ -6013,20 +6013,20 @@ def page_help():
     tabs = st.tabs(["Quick Start", "Tasks", "Leave", "Passwords", "Admin"])
     with tabs[0]:
         st.markdown(_read_help_md("quick_start.md"))
-        st.download_button("Download Quick Start (MD)", _read_help_md("quick_start.md"), file_name="WorkNest_Quick_Start.md")
+        st.download_button('⬇ Download Drawing', "Download Quick Start (MD)", _read_help_md("quick_start.md"), file_name="WorkNest_Quick_Start.md")
     with tabs[1]:
         st.markdown(_read_help_md("tasks.md"))
-        st.download_button("Download Tasks Guide (MD)", _read_help_md("tasks.md"), file_name="WorkNest_Tasks_Guide.md")
+        st.download_button('⬇ Download Drawing', "Download Tasks Guide (MD)", _read_help_md("tasks.md"), file_name="WorkNest_Tasks_Guide.md")
     with tabs[2]:
         st.markdown(_read_help_md("leave.md"))
-        st.download_button("Download Leave Guide (MD)", _read_help_md("leave.md"), file_name="WorkNest_Leave_Guide.md")
+        st.download_button('⬇ Download Drawing', "Download Leave Guide (MD)", _read_help_md("leave.md"), file_name="WorkNest_Leave_Guide.md")
     with tabs[3]:
         st.markdown(_read_help_md("passwords.md"))
-        st.download_button("Download Passwords Guide (MD)", _read_help_md("passwords.md"), file_name="WorkNest_Passwords_Guide.md")
+        st.download_button('⬇ Download Drawing', "Download Passwords Guide (MD)", _read_help_md("passwords.md"), file_name="WorkNest_Passwords_Guide.md")
     with tabs[4]:
         if is_admin() or is_sub_admin() or is_section_head():
             st.markdown(_read_help_md("admin.md"))
-            st.download_button("Download Admin Guide (MD)", _read_help_md("admin.md"), file_name="WorkNest_Admin_Guide.md")
+            st.download_button('⬇ Download Drawing', "Download Admin Guide (MD)", _read_help_md("admin.md"), file_name="WorkNest_Admin_Guide.md")
         else:
             st.info("Admin help is restricted.")
 
