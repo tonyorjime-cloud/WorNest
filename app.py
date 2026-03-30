@@ -1,3 +1,52 @@
+# ===== SMS (SendChamp) =====
+import os, requests
+
+SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
+SENDCHAMP_API_KEY = os.getenv("SENDCHAMP_API_KEY", "")
+SENDCHAMP_SENDER_ID = os.getenv("SENDCHAMP_SENDER_ID", "WorkNest")
+
+def _normalize_ng(phone):
+    if not phone:
+        return None
+    p = str(phone).strip().replace(" ", "")
+    if p.startswith("+234"):
+        return p[1:]
+    if p.startswith("234"):
+        return p
+    if len(p) == 10:
+        p = "0" + p
+    if p.startswith("0") and len(p) >= 11:
+        return "234" + p[1:]
+    return p
+
+def send_sms_sendchamp(to_numbers, message):
+    if not SMS_ENABLED or not SENDCHAMP_API_KEY or not to_numbers:
+        return
+    nums = []
+    for n in to_numbers:
+        nn = _normalize_ng(n)
+        if nn:
+            nums.append(nn)
+    if not nums:
+        return
+    url = "https://api.sendchamp.com/api/v1/sms/send"
+    payload = {
+        "to": nums,
+        "sender_name": SENDCHAMP_SENDER_ID,
+        "message": message,
+        "route": "international"
+    }
+    headers = {
+        "Authorization": f"Bearer {SENDCHAMP_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        print("SENDCHAMP SMS RESPONSE:", resp.status_code, resp.text[:500])
+    except Exception as e:
+        print("SENDCHAMP SMS ERROR:", str(e))
+
+
 
 def _all_staff_phones():
     try:
@@ -23,7 +72,7 @@ def _normalize_ng(phone):
     if p.startswith("0") and len(p)>=10: return "234"+p[1:]
     return p
 
-def send_sms_termii(to_numbers, message):
+def send_sms_sendchamp(to_numbers, message):
     if not SMS_ENABLED or not TERMII_API_KEY or not to_numbers:
         return
     nums = []
