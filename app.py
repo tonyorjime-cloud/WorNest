@@ -550,8 +550,7 @@ def _exec_script(cur, sql_script: str):
 def hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
 
-def init_db()
-    _fix_attachment_id_sequences():
+def init_db()::
     c = get_conn()
     cur = c.cursor()
 
