@@ -2771,6 +2771,117 @@ def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
     return path
 
 
+
+
+def _bw_queue_key(pid: int) -> str:
+    return f"bw_photos_{int(pid)}"
+
+def _bw_pending_cam_key(pid: int) -> str:
+    return f"bw_pending_cam_{int(pid)}"
+
+def _bw_get_queue(pid: int):
+    key = _bw_queue_key(pid)
+    if key not in st.session_state:
+        st.session_state[key] = []
+    return st.session_state[key]
+
+def _bw_clear_queue(pid: int):
+    st.session_state.pop(_bw_queue_key(pid), None)
+    st.session_state.pop(_bw_pending_cam_key(pid), None)
+
+def _bw_add_photo(pid: int, data: bytes, name: str, mime: str = "image/jpeg", caption: str = ""):
+    q = _bw_get_queue(pid)
+    if len(q) >= 5:
+        return False
+    q.append({"data": data, "name": name, "mime": mime, "caption": caption})
+    st.session_state[_bw_queue_key(pid)] = q
+    return True
+
+def _bw_render_photo_flow(pid: int):
+    st.markdown("### 📸 Biweekly Report Pictures")
+    q = _bw_get_queue(pid)
+    st.info(f"You can upload a maximum of 5 pictures. Current total: {len(q)}/5")
+    if q:
+        st.markdown("**Queued pictures**")
+        remove_idx = None
+        for i, item in enumerate(q):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                try:
+                    if str(item.get("mime") or "").startswith("image/"):
+                        st.image(item.get("data"), width=120)
+                    else:
+                        st.write("File queued")
+                except Exception:
+                    st.write("Preview unavailable")
+            with c2:
+                st.text_input("File", value=str(item.get("name") or f"Picture {i+1}"), disabled=True, key=f"bw_qfile_{pid}_{i}")
+                item["caption"] = st.text_input("Caption", value=str(item.get("caption") or ""), key=f"bw_qcap_{pid}_{i}")
+                if st.button("Remove", key=f"bw_qrm_{pid}_{i}"):
+                    remove_idx = i
+        if remove_idx is not None:
+            q.pop(remove_idx)
+            st.session_state[_bw_queue_key(pid)] = q
+            st.rerun()
+
+    remaining = 5 - len(q)
+    if remaining <= 0:
+        st.warning("Maximum of 5 pictures reached.")
+        return
+
+    st.markdown("**Phone camera**")
+    st.caption("Take one picture, preview it, then choose Upload Photo or Cancel. After upload, you can take the next one until you reach 5.")
+    cam = st.camera_input("Open camera", key=f"bw_cam_{pid}")
+    if cam is not None:
+        pending = {
+            "data": cam.getvalue() if hasattr(cam, "getvalue") else cam.read(),
+            "name": getattr(cam, "name", None) or f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+            "mime": getattr(cam, "type", None) or "image/jpeg",
+            "caption": ""
+        }
+        st.session_state[_bw_pending_cam_key(pid)] = pending
+
+    pending = st.session_state.get(_bw_pending_cam_key(pid))
+    if pending:
+        st.markdown("**Preview**")
+        try:
+            st.image(pending["data"])
+        except Exception:
+            st.write("Preview unavailable")
+        c1, c2, c3 = st.columns([1,1,2])
+        if c1.button("Upload Photo", key=f"bw_cam_up_{pid}"):
+            _bw_add_photo(pid, pending["data"], pending["name"], pending["mime"], "")
+            st.session_state.pop(_bw_pending_cam_key(pid), None)
+            st.rerun()
+        if c2.button("Cancel", key=f"bw_cam_cancel_{pid}"):
+            st.session_state.pop(_bw_pending_cam_key(pid), None)
+            st.rerun()
+        c3.write(f"You can still add {max(0, 5 - len(_bw_get_queue(pid)))} more.")
+
+    st.markdown("**Upload from phone/computer storage**")
+    files = st.file_uploader(f"Select up to {remaining} picture(s)", type=["png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
+    if files:
+        if st.button("Add Selected Pictures", key=f"bw_add_files_{pid}"):
+            added = 0
+            for f in files[:remaining]:
+                data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+                if _bw_add_photo(pid, data, getattr(f, "name", f"upload_{added+1}.jpg"), getattr(f, "type", "image/jpeg"), ""):
+                    added += 1
+            st.success(f"{added} picture(s) added.")
+            st.rerun()
+
+def _bw_save_queue(report_id: int, pid: int):
+    q = list(_bw_get_queue(pid))
+    saved = []
+    for i, item in enumerate(q):
+        ext = os.path.splitext(str(item.get("name") or ""))[1] or ".jpg"
+        path = _save_uploaded_bytes(item.get("data") or b"", f"project_{pid}/reports", forced_name=f"report_{int(report_id)}_{i+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}")
+        if path:
+            execute("INSERT INTO biweekly_report_attachments (report_id,file_path,caption,uploaded_at,uploader_staff_id) VALUES (?,?,?,?,?)",
+                    (int(report_id), path, str(item.get("caption") or ""), datetime.now().isoformat(timespec='seconds'), current_staff_id()))
+            saved.append(path)
+    return saved
+
 def _save_biweekly_attachments(report_id: int, uploads=None, camera_file=None, captions_text: str = "", pid: int | None = None):
     uploads = uploads or []
     captions = [ln.strip() for ln in str(captions_text or '').splitlines()]
@@ -3793,6 +3904,8 @@ def page_dashboard():
                 default_start = safe_parse_date(edit_report.get('window_start'), current_cycle['window_start'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_start'] if current_cycle is not None else date.today())
                 default_end = safe_parse_date(edit_report.get('window_end'), current_cycle['window_end'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_end'] if current_cycle is not None else date.today())
                 default_due = safe_parse_date(edit_report.get('due_date'), current_cycle['due_date'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['due_date'] if current_cycle is not None else date.today())
+                _bw_render_photo_flow(pid)
+
                 with st.form(f"bw_form_{pid}"):
                     st.markdown("#### Complete report in WorkNest")
                     st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
@@ -3808,54 +3921,8 @@ def page_dashboard():
                     hse_observations = st.text_area("HSE Observations", value=(str(edit_report.get('hse_observations') or '') if edit_report is not None else ''), height=80, key=f"bw_hse_{pid}")
                     rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
                     general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
-                    st.markdown("**Photos and attachments**")
-                    photo_files = st.file_uploader("Upload site photos / files", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
-                    camera_file = st.camera_input("Take site photo now", key=f"bw_cam_{pid}")
-                    caption_register = st.text_area("Photo caption register (one line per file)", value='', help="Write captions line by line in the same order as the uploaded photos. Example: Column starter at grid A3 | Ground floor slab steel | Cube test labels", key=f"bw_caps_{pid}")
                     f1, f2 = st.columns(2)
-                    submit_text = "💾 Update Report" if edit_report is not None else "⬆️ 
-# ===== PHOTO SYSTEM =====
-if "bw_photos" not in st.session_state:
-    st.session_state.bw_photos = []
-
-st.markdown("### 📸 Photos (Max 5)")
-st.write(f"{len(st.session_state.bw_photos)}/5 added")
-
-for i, p in enumerate(st.session_state.bw_photos):
-    c1,c2 = st.columns([1,2])
-    with c1:
-        st.image(p["data"], width=120)
-    with c2:
-        p["caption"] = st.text_input("Caption", p.get("caption",""), key=f"cap_{i}")
-        if st.button("Remove", key=f"rm_{i}"):
-            st.session_state.bw_photos.pop(i)
-            st.rerun()
-
-if len(st.session_state.bw_photos) < 5:
-
-    cam = st.camera_input("Take Photo")
-
-    if cam is not None:
-        st.image(cam)
-        c1,c2 = st.columns(2)
-
-        if c1.button("Upload Photo"):
-            st.session_state.bw_photos.append({"data": cam.getvalue(),"caption": ""})
-            st.rerun()
-
-        if c2.button("Cancel"):
-            st.rerun()
-
-    remaining = 5 - len(st.session_state.bw_photos)
-
-    files = st.file_uploader(f"Upload (max {remaining})", accept_multiple_files=True)
-
-    if files:
-        for f in files[:remaining]:
-            st.session_state.bw_photos.append({"data": f.getvalue(),"caption": ""})
-        st.rerun()
-
-Submit Report"
+                    submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
                     do_save = f1.form_submit_button(submit_text)
                     do_cancel = f2.form_submit_button("Cancel Edit") if edit_report is not None else False
                 if do_cancel:
@@ -3876,41 +3943,33 @@ Submit Report"
                         timing_status = "LATE" if submitted_on > target_due else "ON_TIME"
                         if edit_report is not None and (_editable_status(edit_report.get('status')) and (is_admin() or int(edit_report.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))):
                             base_path = str(edit_report.get('file_path') or '')
-                            first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            if first_new:
-                                base_path = first_new
-                            elif camera_file is not None:
-                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-                                if cam_path:
-                                    base_path = cam_path
                             execute("""UPDATE biweekly_reports
                                        SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
                                            site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
-                            else:
-                                _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            saved_paths = _bw_save_queue(int(edit_report['id']), pid)
+                            if saved_paths and (not base_path or not str(base_path).strip()):
+                                base_path = saved_paths[0]
+                                execute("UPDATE biweekly_reports SET file_path=? WHERE id=?", (base_path, int(edit_report['id'])))
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
+                            _bw_clear_queue(pid)
                             st.rerun()
                         else:
-                            base_path = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            if (base_path is None or str(base_path).strip()=='') and camera_file is not None:
-                                base_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                            base_path = ''
                             rid = execute(
                                 """INSERT INTO biweekly_reports
                                    (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
-                            else:
-                                _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            saved_paths = _bw_save_queue(int(rid), pid)
+                            if saved_paths:
+                                execute("UPDATE biweekly_reports SET file_path=? WHERE id=?", (saved_paths[0], int(rid)))
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                            _bw_clear_queue(pid)
                             st.rerun()
 
             rdf=fetch_df("""SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
@@ -4836,10 +4895,6 @@ def page_projects():
                     hse_observations = st.text_area("HSE Observations", value=(str(edit_report.get('hse_observations') or '') if edit_report is not None else ''), height=80, key=f"bw_hse_{pid}")
                     rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
                     general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
-                    st.markdown("**Photos and attachments**")
-                    photo_files = st.file_uploader("Upload site photos / files", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
-                    camera_file = st.camera_input("Take site photo now", key=f"bw_cam_{pid}")
-                    caption_register = st.text_area("Photo caption register (one line per file)", value='', help="Write captions line by line in the same order as the uploaded photos. Example: Column starter at grid A3 | Ground floor slab steel | Cube test labels", key=f"bw_caps_{pid}")
                     f1, f2 = st.columns(2)
                     submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
                     do_save = f1.form_submit_button(submit_text)
@@ -4862,41 +4917,33 @@ def page_projects():
                         timing_status = "LATE" if submitted_on > target_due else "ON_TIME"
                         if edit_report is not None and (_editable_status(edit_report.get('status')) and (is_admin() or int(edit_report.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))):
                             base_path = str(edit_report.get('file_path') or '')
-                            first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            if first_new:
-                                base_path = first_new
-                            elif camera_file is not None:
-                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-                                if cam_path:
-                                    base_path = cam_path
                             execute("""UPDATE biweekly_reports
                                        SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
                                            site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
-                            else:
-                                _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
+                            saved_paths = _bw_save_queue(int(edit_report['id']), pid)
+                            if saved_paths and (not base_path or not str(base_path).strip()):
+                                base_path = saved_paths[0]
+                                execute("UPDATE biweekly_reports SET file_path=? WHERE id=?", (base_path, int(edit_report['id'])))
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
+                            _bw_clear_queue(pid)
                             st.rerun()
                         else:
-                            base_path = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            if (base_path is None or str(base_path).strip()=='') and camera_file is not None:
-                                base_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                            base_path = ''
                             rid = execute(
                                 """INSERT INTO biweekly_reports
                                    (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
-                            else:
-                                _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
+                            saved_paths = _bw_save_queue(int(rid), pid)
+                            if saved_paths:
+                                execute("UPDATE biweekly_reports SET file_path=? WHERE id=?", (saved_paths[0], int(rid)))
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
+                            _bw_clear_queue(pid)
                             st.rerun()
 
             rdf=fetch_df("""SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
