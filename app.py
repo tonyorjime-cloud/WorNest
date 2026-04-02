@@ -2771,8 +2771,7 @@ def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
     return path
 
 
-def _save_biweekly_attachments(report_id: int, uploads=None, camera_file=None, captions_text: str = "", pid: int | None = None):
-    uploads = uploads or []
+def _save_biweekly_attachments(report_id: int, uploads=None,     uploads = uploads or []
     captions = [ln.strip() for ln in str(captions_text or '').splitlines()]
     saved = []
     for i, up in enumerate([u for u in uploads if u is not None]):
@@ -2782,8 +2781,7 @@ def _save_biweekly_attachments(report_id: int, uploads=None, camera_file=None, c
             execute("INSERT INTO biweekly_report_attachments (report_id,file_path,caption,uploaded_at,uploader_staff_id) VALUES (?,?,?,?,?)",
                     (int(report_id), path, cap, datetime.now().isoformat(timespec='seconds'), current_staff_id()))
             saved.append(path)
-    if camera_file is not None:
-        path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports" if pid is not None else "reports", forced_name=f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+            path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports" if pid is not None else "reports", forced_name=f"camera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
         if path:
             cap = captions[len(saved)] if len(captions) > len(saved) else 'Camera capture'
             execute("INSERT INTO biweekly_report_attachments (report_id,file_path,caption,uploaded_at,uploader_staff_id) VALUES (?,?,?,?,?)",
@@ -3586,7 +3584,7 @@ def page_dashboard():
                 st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if allowed:
                 cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
-                up = st.file_uploader("Upload file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="doc_file")
+                up = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key="doc_file")
                 if st.button("⬆️ Upload Document", key="doc_up"):
                     path=save_uploaded_file(up, f"project_{pid}/docs")
                     if path:
@@ -3642,7 +3640,7 @@ def page_dashboard():
                 test_date = st.date_input("Test Date", value=test_date_val, key=f"t_date_{pid}")
                 result_summary = st.text_area("Result Summary / Notes", value=(str(edit_test.get('result_summary') or edit_test.get('notes') or '') if edit_test is not None else ''), key=f"t_summary_{pid}")
                 attachment_caption = st.text_input("Attachment caption", value='', key=f"t_caption_{pid}")
-                up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
+                up = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
                 c1, c2 = st.columns(2)
                 submit_label = "💾 Update Test Result" if edit_test is not None else "⬆️ Save Test Result"
                 save_test = c1.form_submit_button(submit_label)
@@ -3757,7 +3755,7 @@ def page_dashboard():
                     pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
                     chosen = options[pick]
                     manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
-                    up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
+                    up_hist = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
                     if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
                         if not allowed:
                             st.error("You don't have permission to upload to this project.")
@@ -3809,8 +3807,13 @@ def page_dashboard():
                     rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
                     general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
                     st.markdown("**Photos and attachments**")
-                    photo_files = st.file_uploader("Upload site photos / files", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
-                    camera_file = st.camera_input("Take site photo now", key=f"bw_cam_{pid}")
+                    photo_files = st.file_uploader
+                    if photo_files:
+                        if len(photo_files) > 5:
+                            st.error("Maximum of 5 images allowed. Only first 5 will be used.")
+                            photo_files = photo_files[:5]
+                        st.caption(f"{len(photo_files)}/5 images selected")
+("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
                     caption_register = st.text_area("Photo caption register (one line per file)", value='', help="Write captions line by line in the same order as the uploaded photos. Example: Column starter at grid A3 | Ground floor slab steel | Cube test labels", key=f"bw_caps_{pid}")
                     f1, f2 = st.columns(2)
                     submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
@@ -3837,8 +3840,7 @@ def page_dashboard():
                             first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
                             if first_new:
                                 base_path = first_new
-                            elif camera_file is not None:
-                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                            el                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
                                 if cam_path:
                                     base_path = cam_path
                             execute("""UPDATE biweekly_reports
@@ -3847,8 +3849,7 @@ def page_dashboard():
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
+                            if len(photo_files or []) + (1                                 st.error('Maximum of 5 photos allowed')
                             else:
                                 _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
                             st.success("Report updated and resubmitted for admin review.")
@@ -3864,8 +3865,7 @@ def page_dashboard():
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
+                            if len(photo_files or []) + (1                                 st.error('Maximum of 5 photos allowed')
                             else:
                                 _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
@@ -4304,7 +4304,7 @@ def page_chat():
             key='chat_mentions_picker'
         )
         msg=st.text_area('Message', height=90, placeholder='Type your message…')
-        img=st.file_uploader('Optional image', type=['png','jpg','jpeg','webp','gif'])
+        img=st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
         sent=st.form_submit_button('Send')
         if sent:
             chosen = [(int(mention_name_to_id[nm]), nm) for nm in selected_mentions if nm in mention_name_to_id]
@@ -4572,7 +4572,7 @@ def page_projects():
                 st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
             if allowed:
                 cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
-                up = st.file_uploader("Upload file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="doc_file")
+                up = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key="doc_file")
                 if st.button("⬆️ Upload Document", key="doc_up"):
                     path=save_uploaded_file(up, f"project_{pid}/docs")
                     if path:
@@ -4628,7 +4628,7 @@ def page_projects():
                 test_date = st.date_input("Test Date", value=test_date_val, key=f"t_date_{pid}")
                 result_summary = st.text_area("Result Summary / Notes", value=(str(edit_test.get('result_summary') or edit_test.get('notes') or '') if edit_test is not None else ''), key=f"t_summary_{pid}")
                 attachment_caption = st.text_input("Attachment caption", value='', key=f"t_caption_{pid}")
-                up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
+                up = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
                 c1, c2 = st.columns(2)
                 submit_label = "💾 Update Test Result" if edit_test is not None else "⬆️ Save Test Result"
                 save_test = c1.form_submit_button(submit_label)
@@ -4743,7 +4743,7 @@ def page_projects():
                     pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
                     chosen = options[pick]
                     manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
-                    up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
+                    up_hist = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
                     if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
                         if not allowed:
                             st.error("You don't have permission to upload to this project.")
@@ -4795,8 +4795,13 @@ def page_projects():
                     rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
                     general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
                     st.markdown("**Photos and attachments**")
-                    photo_files = st.file_uploader("Upload site photos / files", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
-                    camera_file = st.camera_input("Take site photo now", key=f"bw_cam_{pid}")
+                    photo_files = st.file_uploader
+                    if photo_files:
+                        if len(photo_files) > 5:
+                            st.error("Maximum of 5 images allowed. Only first 5 will be used.")
+                            photo_files = photo_files[:5]
+                        st.caption(f"{len(photo_files)}/5 images selected")
+("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
                     caption_register = st.text_area("Photo caption register (one line per file)", value='', help="Write captions line by line in the same order as the uploaded photos. Example: Column starter at grid A3 | Ground floor slab steel | Cube test labels", key=f"bw_caps_{pid}")
                     f1, f2 = st.columns(2)
                     submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
@@ -4823,8 +4828,7 @@ def page_projects():
                             first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
                             if first_new:
                                 base_path = first_new
-                            elif camera_file is not None:
-                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+                            el                                cam_path = _save_uploaded_bytes(camera_file, f"project_{pid}/reports", forced_name=f"camera_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
                                 if cam_path:
                                     base_path = cam_path
                             execute("""UPDATE biweekly_reports
@@ -4833,8 +4837,7 @@ def page_projects():
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
                                      site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
+                            if len(photo_files or []) + (1                                 st.error('Maximum of 5 photos allowed')
                             else:
                                 _save_biweekly_attachments(int(edit_report['id']), photo_files, camera_file, caption_register, pid=pid)
                             st.success("Report updated and resubmitted for admin review.")
@@ -4850,8 +4853,7 @@ def page_projects():
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
-                            if len(photo_files or []) + (1 if camera_file else 0) > 5:
-                                st.error('Maximum of 5 photos allowed')
+                            if len(photo_files or []) + (1                                 st.error('Maximum of 5 photos allowed')
                             else:
                                 _save_biweekly_attachments(int(rid), photo_files, camera_file, caption_register, pid=pid)
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
@@ -5335,7 +5337,7 @@ def page_tasks():
     if mode=="Edit existing":
         # --- Task Attachments ---
         st.markdown("#### 📎 Task Attachments")
-        attach_files = st.file_uploader("Attach files (PDF/Image)", type=["pdf","png","jpg","jpeg"],
+        attach_files = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)", type=["pdf","png","jpg","jpeg"],
                                         accept_multiple_files=True,
                                         key=f"tsk_attach_{tid}")
         if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
@@ -5715,9 +5717,9 @@ def page_import():
     st.markdown("<div class='worknest-header'><h2>⬆️ Import CSVs</h2></div>", unsafe_allow_html=True)
     st.caption("Upload your CSV templates below (recommended for Render), or place them inside a local <b>data</b> folder next to app.py.", unsafe_allow_html=True)
 
-    up_staff = st.file_uploader("Upload staff_template.csv", type=["csv"], key="up_staff")
-    up_projects = st.file_uploader("Upload structural_project_info_min.csv", type=["csv"], key="up_projects")
-    up_holidays = st.file_uploader("Upload nigeria_public_holidays_2025_2026.csv", type=["csv"], key="up_holidays")
+    up_staff = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    up_projects = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    up_holidays = st.file_uploader("Upload images (maximum 5)", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
     c1,c2=st.columns(2)
     c3,c4=st.columns(2)
