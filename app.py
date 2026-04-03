@@ -3801,7 +3801,7 @@ def page_dashboard():
                     cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
                     cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
                     report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
-                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
+                    report_date = st.date_input("Report Date", value=date.today(), key=f"bw_report_date_{pid}")
                     site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
                     reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
                     concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
@@ -4780,7 +4780,7 @@ def page_projects():
                     cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
                     cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
                     report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
-                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
+                    report_date = st.date_input("Report Date", value=date.today(), key=f"bw_report_date_{pid}")
                     site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
                     reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
                     concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
