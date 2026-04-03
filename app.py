@@ -2757,6 +2757,111 @@ def file_download_button(label, file_path, key):
 def _editable_status(status: str | None) -> bool:
     return str(status or "PENDING").upper() in {"DRAFT", "PENDING", "SUBMITTED", "REJECTED", "NEEDS_REVISION"}
 
+
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+
+def _safe_pdf_text(v):
+    s = "" if v is None else str(v)
+    return s.replace("—", "-").replace("–", "-").replace("’", "'").replace("“", '"').replace("”", '"')
+
+def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name=""):
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    x = 18 * mm
+    y = height - 18 * mm
+
+    def line(text="", size=10, gap=6):
+        nonlocal y
+        c.setFont("Times-Roman", size)
+        c.drawString(x, y, _safe_pdf_text(text)[:170])
+        y -= gap * mm
+        if y < 20 * mm:
+            c.showPage()
+            y = height - 18 * mm
+
+    c.setFont("Times-Bold", 14)
+    c.drawString(x, y, "Biweekly Report")
+    y -= 8 * mm
+
+    fields = [
+        ("Project", project_name),
+        ("Report Date", report_row.get("report_date", "")),
+        ("Status", report_row.get("status", "")),
+        ("Cycle No", report_row.get("cycle_no", "")),
+        ("Window Start", report_row.get("window_start", "")),
+        ("Window End", report_row.get("window_end", "")),
+        ("Due Date", report_row.get("due_date", "")),
+        ("Timing", report_row.get("timing_status", "")),
+    ]
+    for k, v in fields:
+        line(f"{k}: {v}", 10, 5)
+
+    y -= 2 * mm
+    sections = [
+        ("Site Activities", report_row.get("site_activities", "")),
+        ("Reinforcement Observations", report_row.get("reinforcement_observations", "")),
+        ("Concrete / Test Observations", report_row.get("concrete_observations", "")),
+        ("HSE Observations", report_row.get("hse_observations", "")),
+        ("RFI / EI Notes", report_row.get("rfi_notes", "")),
+        ("General Remarks", report_row.get("general_remarks", "")),
+    ]
+
+    for title, body in sections:
+        c.setFont("Times-Bold", 11)
+        c.drawString(x, y, _safe_pdf_text(title))
+        y -= 5 * mm
+        text_obj = c.beginText(x, y)
+        text_obj.setFont("Times-Roman", 10)
+        for raw_line in _safe_pdf_text(body).splitlines() or [""]:
+            line_text = raw_line
+            while len(line_text) > 105:
+                text_obj.textLine(line_text[:105])
+                line_text = line_text[105:]
+                y -= 4.5 * mm
+                if y < 25 * mm:
+                    c.drawText(text_obj)
+                    c.showPage()
+                    y = height - 18 * mm
+                    text_obj = c.beginText(x, y)
+                    text_obj.setFont("Times-Roman", 10)
+            text_obj.textLine(line_text)
+            y -= 4.5 * mm
+            if y < 25 * mm:
+                c.drawText(text_obj)
+                c.showPage()
+                y = height - 18 * mm
+                text_obj = c.beginText(x, y)
+                text_obj.setFont("Times-Roman", 10)
+        c.drawText(text_obj)
+        y -= 3 * mm
+        if y < 25 * mm:
+            c.showPage()
+            y = height - 18 * mm
+
+    if attachments_df is not None and not getattr(attachments_df, "empty", True):
+        c.showPage()
+        y = height - 18 * mm
+        c.setFont("Times-Bold", 12)
+        c.drawString(x, y, "Attachments")
+        y -= 8 * mm
+        c.setFont("Times-Roman", 10)
+        for _, row in attachments_df.iterrows():
+            path = row.get("file_path", "")
+            cap = row.get("caption", "")
+            line(f"File: {os.path.basename(str(path))}", 10, 5)
+            if cap:
+                line(f"Caption: {cap}", 10, 5)
+            y -= 1 * mm
+
+    c.save()
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
 def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
     if uploaded_file is None:
         return None
