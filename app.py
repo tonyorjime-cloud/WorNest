@@ -4361,8 +4361,9 @@ def page_chat():
         body = render_chat_message_html(r.get('message') or '', mention_names_here) if r.get('message') else ''
         classes = 'wn-chat-card mentioned' if mentioned_here else 'wn-chat-card'
         st.markdown(f"<div class='{classes}'>{meta}<div>{body}</div></div>", unsafe_allow_html=True)
-        if r.get('image_path') and os.path.exists(r['image_path']):
-            st.image(r['image_path'])
+        img_path = r.get('image_path')
+        if isinstance(img_path, str) and img_path.strip() and os.path.exists(img_path):
+            st.image(img_path)
         st.divider()
 
     mark_chat_seen(sid)
