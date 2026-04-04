@@ -12,22 +12,25 @@ def _fix_attachment_id_sequences():
     except Exception as e:
         print("SEQ FIX ERROR:", e)
 
-# ===== SMS (SendChamp) =====
+# ===== SMS =====
 import os, requests
 
 SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
 SENDCHAMP_API_KEY = os.getenv("SENDCHAMP_API_KEY", "")
 SENDCHAMP_SENDER_ID = os.getenv("SENDCHAMP_SENDER_ID", "WorkNest")
+TERMII_API_KEY = os.getenv("TERMII_API_KEY", "")
+TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "WorkNest")
+TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic")
 
 def _normalize_ng(phone):
     if not phone:
         return None
     p = str(phone).strip().replace(" ", "")
-    if p.startswith("+234"):
-        return p[1:]
+    if p.startswith("+"):
+        p = p[1:]
     if p.startswith("234"):
         return p
-    if len(p) == 10:
+    if len(p) == 10 and p.isdigit():
         p = "0" + p
     if p.startswith("0") and len(p) >= 11:
         return "234" + p[1:]
@@ -35,20 +38,20 @@ def _normalize_ng(phone):
 
 def send_sms_sendchamp(to_numbers, message):
     if not SMS_ENABLED or not SENDCHAMP_API_KEY or not to_numbers:
-        return
+        return {"ok": False, "reason": "sendchamp_not_configured"}
     nums = []
     for n in to_numbers:
         nn = _normalize_ng(n)
         if nn:
             nums.append(nn)
     if not nums:
-        return
+        return {"ok": False, "reason": "no_valid_numbers"}
     url = "https://api.sendchamp.com/api/v1/sms/send"
     payload = {
-        "to": nums,
+        "to": nums if len(nums) > 1 else nums[0],
         "sender_name": SENDCHAMP_SENDER_ID,
         "message": message,
-        "route": "international"
+        "route": "dnd"
     }
     headers = {
         "Authorization": f"Bearer {SENDCHAMP_API_KEY}",
@@ -56,45 +59,27 @@ def send_sms_sendchamp(to_numbers, message):
     }
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        print("SENDCHAMP SMS RESPONSE:", resp.status_code, resp.text[:500])
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:500]}
+        print("SENDCHAMP SMS RESPONSE:", resp.status_code, str(body)[:500])
+        return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
     except Exception as e:
         print("SENDCHAMP SMS ERROR:", str(e))
+        return {"ok": False, "reason": str(e)}
 
-
-
-def _all_staff_phones():
-    try:
-        df = fetch_df("SELECT phone FROM staff WHERE phone IS NOT NULL")
-        return [r["phone"] for _, r in df.iterrows() if r.get("phone")]
-    except Exception:
-        return []
-
-
-# ===== SMS (Termii) =====
-import os, requests
-
-SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
-TERMII_API_KEY = os.getenv("TERMII_API_KEY", "")
-TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "WorkNest")
-TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic")
-
-def _normalize_ng(phone):
-    if not phone: return None
-    p = str(phone).strip().replace(" ", "")
-    if p.startswith("+234"): return p[1:]
-    if p.startswith("234"): return p
-    if p.startswith("0") and len(p)>=10: return "234"+p[1:]
-    return p
-
-def send_sms_sendchamp(to_numbers, message):
+def send_sms_termii(to_numbers, message):
     if not SMS_ENABLED or not TERMII_API_KEY or not to_numbers:
-        return
+        return {"ok": False, "reason": "termii_not_configured"}
     nums = []
     for n in to_numbers:
         nn = _normalize_ng(n)
-        if nn: nums.append(nn)
+        if nn:
+            nums.append(nn)
     if not nums:
-        return
+        return {"ok": False, "reason": "no_valid_numbers"}
     url = "https://api.ng.termii.com/api/sms/send"
     payload = {
         "to": nums,
@@ -105,10 +90,31 @@ def send_sms_sendchamp(to_numbers, message):
         "api_key": TERMII_API_KEY
     }
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
+        resp = requests.post(url, json=payload, timeout=10)
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:500]}
+        print("TERMII SMS RESPONSE:", resp.status_code, str(body)[:500])
+        return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+    except Exception as e:
+        print("TERMII SMS ERROR:", str(e))
+        return {"ok": False, "reason": str(e)}
 
+def send_sms(to_numbers, message):
+    if SENDCHAMP_API_KEY:
+        return send_sms_sendchamp(to_numbers, message)
+    if TERMII_API_KEY:
+        return send_sms_termii(to_numbers, message)
+    return {"ok": False, "reason": "no_sms_provider_configured"}
+
+def _all_staff_phones():
+    try:
+        df = fetch_df("SELECT phone FROM staff WHERE phone IS NOT NULL")
+        return [r["phone"] for _, r in df.iterrows() if r.get("phone")]
+    except Exception:
+        return []
 
 def navigate_to(page, project_id=None, tab=None):
     st.session_state["_pending_nav"] = page
@@ -3297,6 +3303,19 @@ def page_dashboard():
     my_pending_tasks = len(snap.get("tasks") or []) if sid is not None else 0
     b3.metric("My pending tasks", my_pending_tasks)
     b4.metric("Tasks completed (7d)", summary.get("tasks_completed_7d", 0))
+
+    if admin:
+        with st.expander("📱 SMS test (Admin only)", expanded=False):
+            st.caption("Use this once to confirm that WorkNest can send SMS before wiring it into live reminders.")
+            sms_test_number = st.text_input("Test phone number", value="", placeholder="2348012345678", key="dashboard_sms_test_number")
+            sms_test_message = st.text_area("Test message", value="WorkNest: Test SMS successful.", key="dashboard_sms_test_message")
+            if st.button("Send Test SMS", key="dashboard_send_test_sms"):
+                result = send_sms([sms_test_number], sms_test_message)
+                if result.get("ok"):
+                    st.success("SMS request sent. Check the phone and the Render logs for delivery details.")
+                else:
+                    st.error(f"SMS test failed: {result}")
+                st.write(result)
 
     st.markdown("### 🕒 Recent Activity")
     a1, a2 = st.columns(2)
