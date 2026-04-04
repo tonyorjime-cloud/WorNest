@@ -12,7 +12,7 @@ def send_sms(to, message):
     payload = {
         "to": to,
         "message": message,
-        "sender_name": os.getenv("SENDCHAMP_SENDER_ID"),
+        "sender_name": "Sendchamp",
         "route": "non_dnd"
     }
 
