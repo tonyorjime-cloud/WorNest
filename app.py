@@ -13,7 +13,7 @@ def _fix_attachment_id_sequences():
         print("SEQ FIX ERROR:", e)
 
 # ===== SMS =====
-import os, requests
+import os, requests, base64
 
 SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
 SENDCHAMP_API_KEY = os.getenv("SENDCHAMP_API_KEY", "")
@@ -1127,6 +1127,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS reviewed_at TEXT")
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS review_note TEXT")
             execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS submitted_on TEXT")
+            execute("ALTER TABLE biweekly_reports ADD COLUMN IF NOT EXISTS report_pdf_path TEXT")
             execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ACTIVE'")
             execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS dormant_since TEXT")
             execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS dormant_reason TEXT")
@@ -1155,6 +1156,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 "ALTER TABLE biweekly_reports ADD COLUMN reviewed_at TEXT",
                 "ALTER TABLE biweekly_reports ADD COLUMN review_note TEXT",
                 "ALTER TABLE biweekly_reports ADD COLUMN submitted_on TEXT",
+                "ALTER TABLE biweekly_reports ADD COLUMN report_pdf_path TEXT",
                 "ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'ACTIVE'",
                 "ALTER TABLE projects ADD COLUMN dormant_since TEXT",
                 "ALTER TABLE projects ADD COLUMN dormant_reason TEXT",
@@ -2761,7 +2763,7 @@ def file_download_button(label, file_path, key):
         st.error(f"Missing file: {file_path}")
 
 def _editable_status(status: str | None) -> bool:
-    return str(status or "PENDING").upper() in {"DRAFT", "PENDING", "SUBMITTED", "REJECTED", "NEEDS_REVISION"}
+    return str(status or "PENDING").upper() in {"DRAFT", "PENDING", "SUBMITTED", "NEEDS_REVISION"}
 
 
 from io import BytesIO
@@ -2867,6 +2869,56 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     pdf_bytes = buf.getvalue()
     buf.close()
     return pdf_bytes
+
+def _build_biweekly_pdf_file(report_row, project_name="", attachments_df=None):
+    try:
+        project_id = int(report_row.get("project_id") or 0)
+        report_id = int(report_row.get("id") or 0)
+    except Exception:
+        project_id = 0
+        report_id = 0
+    folder = os.path.join(UPLOAD_DIR, f"project_{project_id}/reports") if project_id else os.path.join(UPLOAD_DIR, "reports")
+    os.makedirs(folder, exist_ok=True)
+    fname = f"biweekly_report_{report_id or datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    out_path = os.path.join(folder, fname)
+    pdf_bytes = generate_biweekly_report_pdf(report_row, attachments_df=attachments_df, project_name=project_name)
+    with open(out_path, "wb") as f:
+        f.write(pdf_bytes)
+    return out_path
+
+def _ensure_biweekly_pdf(report_row, project_name="", attachments_df=None):
+    existing = str(report_row.get("report_pdf_path") or "").strip()
+    if existing and os.path.exists(existing):
+        return existing
+    try:
+        out_path = _build_biweekly_pdf_file(report_row, project_name=project_name, attachments_df=attachments_df)
+        if report_row.get("id") is not None:
+            execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (out_path, int(report_row.get("id"))))
+        return out_path
+    except Exception:
+        return existing
+
+def render_pdf_preview_and_download(label_prefix: str, pdf_path: str):
+    p = str(pdf_path or "").strip()
+    if not p:
+        st.caption("PDF not available yet.")
+        return
+    if not os.path.exists(p):
+        st.caption("PDF file could not be found.")
+        return
+    try:
+        with open(p, "rb") as f:
+            pdf_bytes = f.read()
+    except Exception:
+        st.caption("PDF file could not be opened.")
+        return
+    st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=os.path.basename(p), key=f"{label_prefix}_pdf_download")
+    with st.expander("👁️ View PDF", expanded=False):
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="700" type="application/pdf"></iframe>',
+            unsafe_allow_html=True,
+        )
 
 def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
     if uploaded_file is None:
@@ -3103,6 +3155,7 @@ def obligations_snapshot(staff_id, today=None):
             FROM biweekly_reports r
             LEFT JOIN projects p ON p.id=r.project_id
             WHERE r.uploader_staff_id=?
+              AND COALESCE(r.status,'PENDING') IN ('PENDING','SUBMITTED','NEEDS_REVISION','APPROVED')
             ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
             LIMIT 1
             """,
@@ -3119,47 +3172,193 @@ def obligations_snapshot(staff_id, today=None):
 
 
 @st.cache_data(ttl=45, show_spinner=False)
-def compliance_snapshot(today=None):
-    """Branch-wide report compliance view based on all active staff accounts."""
-    today = _to_date_or_none(today) or date.today()
-    empty = pd.DataFrame(columns=["Staff", "Login", "Outstanding reports", "Next due"])
+
+
+
+def _refresh_biweekly_reporting_views():
+    """Create lightweight views used to normalize valid biweekly submissions."""
     try:
-        sdf = fetch_df(
-            """
-            SELECT u.id AS user_id, u.username, s.id AS staff_id, s.name
-            FROM users u
-            LEFT JOIN staff s ON s.id=u.staff_id
-            WHERE COALESCE(u.is_active,1)=1
-            ORDER BY s.name, u.username
-            """
-        )
-        rows = []
-        total = len(sdf)
-        compliant = 0
-        for _, row in sdf.iterrows():
-            sid = row.get("staff_id")
-            snap = obligations_snapshot(sid, today) if pd.notna(sid) else {"reports": []}
-            reports = snap.get("reports") or []
-            if not reports:
-                compliant += 1
+        execute("""
+        CREATE OR REPLACE VIEW vw_valid_biweekly_reports AS
+        SELECT *
+        FROM (
+            SELECT br.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY br.project_id, br.cycle_no
+                       ORDER BY COALESCE(br.updated_at, br.uploaded_at, br.submitted_on, br.report_date) DESC, br.id DESC
+                   ) AS rn
+            FROM biweekly_reports br
+            WHERE COALESCE(br.status,'PENDING') IN ('APPROVED','PENDING')
+              AND br.cycle_no IS NOT NULL
+        ) t
+        WHERE rn = 1
+        """)
+    except Exception:
+        pass
+
+def _valid_biweekly_reports_df():
+    try:
+        return fetch_df("""
+            SELECT project_id, cycle_no,
+                   COALESCE(status,'PENDING') AS status,
+                   COALESCE(timing_status,'ON_TIME') AS timing_status,
+                   report_date, submitted_on, uploaded_at, uploader_staff_id
+            FROM vw_valid_biweekly_reports
+        """)
+    except Exception:
+        return fetch_df("""
+            SELECT project_id, cycle_no,
+                   COALESCE(status,'PENDING') AS status,
+                   COALESCE(timing_status,'ON_TIME') AS timing_status,
+                   report_date, submitted_on, uploaded_at, uploader_staff_id
+            FROM biweekly_reports
+            WHERE COALESCE(status,'PENDING') IN ('APPROVED','PENDING')
+              AND cycle_no IS NOT NULL
+        """)
+
+@st.cache_data(ttl=45, show_spinner=False)
+def unified_biweekly_snapshot(today_iso: str):
+    today = date.fromisoformat(today_iso)
+    cutoff = _biweekly_backfill_cutoff_cycle()
+    active_projects = fetch_df("""
+        SELECT id, code, name
+        FROM projects
+        WHERE COALESCE(status,'ACTIVE')!='DORMANT'
+        ORDER BY code
+    """)
+    valid = _valid_biweekly_reports_df()
+    valid_map = {}
+    if not valid.empty:
+        for _, rr in valid.iterrows():
+            try:
+                valid_map[(int(rr["project_id"]), int(rr["cycle_no"]))] = {
+                    "timing_status": str(rr.get("timing_status") or "ON_TIME").upper(),
+                    "status": str(rr.get("status") or "PENDING").upper(),
+                }
+            except Exception:
                 continue
-            first = sorted(reports, key=lambda x: (x.get("days_left") is None, x.get("days_left") if x.get("days_left") is not None else 9999))[0]
-            rows.append({
-                "Staff": row.get("name") or row.get("username") or "Unknown",
-                "Login": row.get("username") or "",
-                "Outstanding reports": len(reports),
-                "Next due": f"Report {first.get('cycle_no')} ({first.get('project_code') or first.get('project')})",
+
+    expected_rows = []
+    branch_queue = []
+    for _, pr in active_projects.iterrows():
+        pid = int(pr["id"])
+        code = str(pr.get("code") or "").strip()
+        name = str(pr.get("name") or "").strip()
+        first_idx = _project_first_cycle_index(pid)
+        for idx in range(first_idx, 500):
+            cyc = _biweekly_cycle_from_index(idx)
+            if cyc["cycle_no"] < cutoff:
+                continue
+            if cyc["due_date"] > today:
+                break
+            expected_rows.append({
+                "project_id": pid,
+                "project_code": code,
+                "project_name": name,
+                "cycle_no": int(cyc["cycle_no"]),
+                "due_date": cyc["due_date"],
             })
-        out = len(rows)
-        ratio = (compliant / total) if total else 1.0
+        live_cyc, _reason = _project_current_due_cycle(pid, today)
+        if live_cyc is not None:
+            branch_queue.append({
+                "project": f"{code} — {name}".strip(" —"),
+                "report_no": int(live_cyc["cycle_no"]),
+                "window": f"{live_cyc['window_start'].isoformat()} → {live_cyc['window_end'].isoformat()}",
+                "due": live_cyc["due_date"].isoformat(),
+                "status": "Overdue" if today > live_cyc["due_date"] else ("Due soon" if (live_cyc["due_date"]-today).days <= 7 else "Open")
+            })
+
+    expected_df = pd.DataFrame(expected_rows)
+    if expected_df.empty:
+        empty_rows = pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"])
+        return {"ratio": 1.0, "compliant": 0, "outstanding": 0, "total_staff": 0, "rows": empty_rows, "branch_queue": pd.DataFrame(branch_queue), "staff_compliance": pd.DataFrame(columns=["Engineer","On-time","Late","Missed","Points"])}
+
+    expected_df["key"] = expected_df.apply(lambda r: (int(r["project_id"]), int(r["cycle_no"])), axis=1)
+    expected_df["has_valid"] = expected_df["key"].map(lambda k: k in valid_map)
+    expected_df["timing_status"] = expected_df["key"].map(lambda k: valid_map.get(k, {}).get("timing_status"))
+    submitted_reports = int(expected_df["has_valid"].sum())
+    outstanding_reports = int((~expected_df["has_valid"]).sum())
+
+    staff_users = fetch_df("""
+        SELECT u.id AS user_id, u.username, s.id AS staff_id, s.name
+        FROM users u
+        LEFT JOIN staff s ON s.id=u.staff_id
+        WHERE COALESCE(u.is_active,1)=1
+        ORDER BY s.name, u.username
+    """)
+    posted = fetch_df("""
+        SELECT ps.staff_id, ps.project_id, p.code AS project_code
+        FROM project_staff ps
+        JOIN projects p ON p.id=ps.project_id
+        WHERE COALESCE(p.status,'ACTIVE')!='DORMANT'
+    """)
+    proj_by_staff = {}
+    if not posted.empty:
+        for _, rr in posted.iterrows():
+            try:
+                proj_by_staff.setdefault(int(rr["staff_id"]), []).append((int(rr["project_id"]), str(rr.get("project_code") or "")))
+            except Exception:
+                pass
+
+    out_rows = []
+    compliant = 0
+    total_staff = len(staff_users)
+    perf_rows = []
+    for _, row in staff_users.iterrows():
+        sid = row.get("staff_id")
+        staff_name = row.get("name") or row.get("username") or "Unknown"
+        if pd.isna(sid):
+            compliant += 1
+            continue
+        sid = int(sid)
+        outstanding = []
+        ontime = late = missed = points = 0
+        for pid, pcode in proj_by_staff.get(sid, []):
+            sdf = expected_df[expected_df["project_id"] == pid]
+            for _, er in sdf.iterrows():
+                if not er["has_valid"]:
+                    missed += 1
+                    outstanding.append((int(er["cycle_no"]), pcode))
+                else:
+                    timing = str(er["timing_status"] or "").upper()
+                    if timing == "LATE":
+                        late += 1
+                        points += 3
+                    else:
+                        ontime += 1
+                        points += 5
+        if outstanding:
+            first = sorted(outstanding, key=lambda x: x[0])[0]
+            out_rows.append({"Staff": staff_name, "Login": row.get("username") or "", "Outstanding reports": len(outstanding), "Next due": f"Report {first[0]} ({first[1]})"})
+        else:
+            compliant += 1
+        perf_rows.append({"Engineer": staff_name, "On-time": ontime, "Late": late, "Missed": missed, "Points": points})
+
+    ratio = (submitted_reports / len(expected_df)) if len(expected_df) else 1.0
+    return {
+        "ratio": ratio,
+        "compliant": compliant,
+        "outstanding": outstanding_reports,
+        "total_staff": total_staff,
+        "rows": pd.DataFrame(out_rows) if out_rows else pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"]),
+        "branch_queue": pd.DataFrame(branch_queue),
+        "staff_compliance": pd.DataFrame(perf_rows).sort_values(["Points","On-time","Engineer"], ascending=[False,False,True]) if perf_rows else pd.DataFrame(columns=["Engineer","On-time","Late","Missed","Points"]),
+    }
+
+def compliance_snapshot(today=None):
+    """Unified branch-wide report compliance view."""
+    today = _to_date_or_none(today) or date.today()
+    try:
+        snap = unified_biweekly_snapshot(today.isoformat())
         return {
-            "ratio": ratio,
-            "compliant": compliant,
-            "outstanding": out,
-            "total_staff": total,
-            "rows": pd.DataFrame(rows) if rows else empty,
+            "ratio": float(snap.get("ratio") or 0.0),
+            "compliant": int(snap.get("compliant") or 0),
+            "outstanding": int(snap.get("outstanding") or 0),
+            "total_staff": int(snap.get("total_staff") or 0),
+            "rows": snap.get("rows") if isinstance(snap.get("rows"), pd.DataFrame) else pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"]),
         }
     except Exception:
+        empty = pd.DataFrame(columns=["Staff", "Login", "Outstanding reports", "Next due"])
         return {"ratio": 1.0, "compliant": 0, "outstanding": 0, "total_staff": 0, "rows": empty}
 
 
@@ -3228,6 +3427,7 @@ def page_dashboard():
     summary = dashboard_summary_snapshot(today.isoformat())
     snap = obligations_snapshot(sid, today) if sid is not None else {"tasks": [], "reports": [], "leave": [], "last_report": None}
     comp = compliance_snapshot(today)
+    ubs = unified_biweekly_snapshot(today.isoformat())
 
     ctop1, ctop2, ctop3, ctop4 = st.columns(4)
     ctop1.metric("Projects", summary.get("projects", 0))
@@ -3290,6 +3490,35 @@ def page_dashboard():
                 st.success(f"{cyc_txt} submitted on {when_txt}" + (f" | {proj}" if proj else ""))
             else:
                 st.caption("No biweekly report submission has been recorded under your login yet.")
+
+            report_order_expr = (
+                "COALESCE(br.submitted_on::timestamp, br.uploaded_at::timestamp, br.report_date::timestamp)"
+                if DB_IS_POSTGRES else
+                "datetime(COALESCE(br.submitted_on, br.uploaded_at, br.report_date))"
+            )
+            my_reports_df = fetch_df(f"""
+                SELECT p.code, p.name AS project_name, br.id, br.cycle_no, br.window_start, br.window_end, br.submitted_on, br.uploaded_at,
+                       COALESCE(br.status,'PENDING') AS status, br.timing_status, br.report_pdf_path
+                FROM biweekly_reports br
+                JOIN projects p ON p.id = br.project_id
+                WHERE br.uploader_staff_id=?
+                  AND COALESCE(br.status,'PENDING') IN ('PENDING','SUBMITTED','NEEDS_REVISION','APPROVED')
+                ORDER BY {report_order_expr} DESC, br.id DESC
+                LIMIT 12
+            """, (int(sid),))
+            st.markdown("#### My Recent Biweekly Submissions")
+            if my_reports_df.empty:
+                st.caption("You have not submitted any biweekly report yet.")
+            else:
+                for _, mr in my_reports_df.iterrows():
+                    submitted_txt = mr.get('submitted_on') or mr.get('uploaded_at') or '—'
+                    proj_label = f"{mr.get('code') or ''} — {mr.get('project_name') or ''}".strip(' —')
+                    cyc_txt = f"Report No. {int(mr['cycle_no'])}" if pd.notna(mr.get('cycle_no')) else 'Report'
+                    st.markdown(f"**{cyc_txt}** | {proj_label}  \n**Window:** {mr.get('window_start') or '—'} → {mr.get('window_end') or '—'}  \n**Submitted:** {submitted_txt} | **Status:** {mr.get('status') or '—'} | **Timing:** {mr.get('timing_status') or '—'}")
+                    pdf_path = str(mr.get('report_pdf_path') or '').strip()
+                    if pdf_path:
+                        render_pdf_preview_and_download(f"dash_my_bw_{int(mr['id'])}", pdf_path)
+                    st.markdown('---')
     with ob2:
         st.markdown("**Compliance radar**")
         st.progress(float(comp.get("ratio") or 0.0))
@@ -3328,6 +3557,7 @@ def page_dashboard():
             LEFT JOIN staff s ON s.id=r.uploader_staff_id
             LEFT JOIN users u ON u.staff_id=r.uploader_staff_id
             LEFT JOIN projects p ON p.id=r.project_id
+            WHERE COALESCE(r.status,'PENDING') IN ('APPROVED','PENDING')
             ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
             LIMIT 6
             """
@@ -3344,7 +3574,7 @@ def page_dashboard():
     with a2:
         recent_tasks = fetch_df(
             """
-            SELECT s.name AS staff_name, t.title, ta.completed_date, p.code AS project_code
+            SELECT s.name AS staff_name, COALESCE(t.title, t.description, 'Task') AS title, ta.completed_date, p.code AS project_code
             FROM task_assignments ta
             JOIN tasks t ON t.id=ta.task_id
             JOIN staff s ON s.id=ta.staff_id
@@ -3358,7 +3588,7 @@ def page_dashboard():
             st.caption("No recently completed tasks yet.")
         else:
             for _, tr in recent_tasks.iterrows():
-                label = tr['title']
+                label = str(tr.get('title') or 'Task')
                 pcode = str(tr.get('project_code') or '').strip()
                 if pcode:
                     label = f"{pcode} — {label}"
@@ -3371,7 +3601,7 @@ def page_dashboard():
             "SELECT COALESCE(SUM(points),0) AS total_points, COUNT(*) AS entries FROM points WHERE staff_id=?",
             (int(sid),),
         )
-        rp = fetch_df("SELECT COUNT(*) AS n FROM biweekly_reports WHERE uploader_staff_id=?", (int(sid),))
+        rp = fetch_df("SELECT COUNT(*) AS n FROM biweekly_reports WHERE uploader_staff_id=? AND COALESCE(status,'PENDING') IN ('APPROVED','PENDING')", (int(sid),))
         tp = fetch_df(
             """
             SELECT COUNT(*) AS n
@@ -3493,100 +3723,48 @@ def page_dashboard():
     else:
         st.success("No due/overdue items in the next 7 days.")
 
-    def _queue_rows(for_staff_id=None):
-        q = []
-        if for_staff_id is None:
-            pdf_q = fetch_df("SELECT id, code, name FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT' ORDER BY code")
-        else:
-            pdf_q = fetch_df("SELECT p.id, p.code, p.name FROM projects p JOIN project_staff ps ON ps.project_id=p.id WHERE ps.staff_id=? AND COALESCE(p.status,'ACTIVE')!='DORMANT' ORDER BY p.code", (int(for_staff_id),))
-        for _, pr in pdf_q.iterrows():
-            cyc, reason = _project_current_due_cycle(int(pr['id']), today)
-            if cyc is None:
-                continue
-            q.append({
-                'project': f"{pr.get('code','')} — {pr.get('name','')}",
-                'report_no': int(cyc['cycle_no']),
-                'window': f"{cyc['window_start'].isoformat()} → {cyc['window_end'].isoformat()}",
-                'due': cyc['due_date'].isoformat(),
-                'status': 'Overdue' if today > cyc['due_date'] else ('Due soon' if (cyc['due_date']-today).days <= 7 else 'Open')
-            })
-        return pd.DataFrame(q)
+
+def _queue_rows(for_staff_id=None):
+    base = ubs.get("branch_queue")
+    if not isinstance(base, pd.DataFrame):
+        return pd.DataFrame(columns=['project','report_no','window','due','status'])
+    if for_staff_id is None:
+        return base
+    try:
+        my_projects = fetch_df("""
+            SELECT p.code, p.name
+            FROM projects p
+            JOIN project_staff ps ON ps.project_id=p.id
+            WHERE ps.staff_id=? AND COALESCE(p.status,'ACTIVE')!='DORMANT'
+        """, (int(for_staff_id),))
+        allowed = set((f"{str(r.get('code') or '').strip()} — {str(r.get('name') or '').strip()}").strip(" —") for _, r in my_projects.iterrows())
+        return base[base["project"].isin(allowed)].reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=['project','report_no','window','due','status'])
 
     st.markdown("### 🗂️ Report Queue")
     if sid is not None:
         myq = _queue_rows(sid)
         st.markdown("**My Pending Reports**")
         if myq.empty:
-            st.caption("No pending report obligations for you right now.")
+            st.caption("No pending report obligation for you right now.")
         else:
             st.dataframe(myq, hide_index=True, width='stretch')
     if admin:
-        bq = _queue_rows(None)
         st.markdown("**Branch Report Queue**")
+        bq = _queue_rows(None)
         if bq.empty:
-            st.caption("No pending report obligations across active projects.")
+            st.success("No open branch report obligations right now.")
         else:
             st.dataframe(bq, hide_index=True, width='stretch')
 
     st.markdown("### 📊 Reporting Compliance")
-    cutoff = _biweekly_backfill_cutoff_cycle()
-    active_pdf = fetch_df("SELECT id, code, name, start_date FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT'")
-    staff_pdf = fetch_df("SELECT DISTINCT s.id, s.name FROM staff s JOIN project_staff ps ON ps.staff_id=s.id JOIN projects p ON p.id=ps.project_id WHERE COALESCE(p.status,'ACTIVE')!='DORMANT' ORDER BY s.name")
-    if not active_pdf.empty and not staff_pdf.empty:
-        rows=[]
-        today_cycle = _project_current_due_cycle(int(active_pdf.iloc[0]['id']), today)[0]
-        latest_cycle_no = None
-        if today_cycle is not None:
-            latest_cycle_no = int(today_cycle['cycle_no']) if today <= today_cycle['due_date'] else int(today_cycle['cycle_no'])
-        else:
-            for idx in range(499, -1, -1):
-                cyc = _biweekly_cycle_from_index(idx)
-                if cyc['due_date'] <= today:
-                    latest_cycle_no = cyc['cycle_no']
-                    break
-        latest_cycle_no = latest_cycle_no or cutoff
-        approved = fetch_df("SELECT project_id, cycle_no, COALESCE(timing_status,'ON_TIME') AS timing_status, COALESCE(status,'PENDING') AS status FROM biweekly_reports WHERE COALESCE(status,'PENDING')='APPROVED'")
-        posted = fetch_df("SELECT project_id, staff_id FROM project_staff")
-        app_map = {}
-        if not approved.empty:
-            for _, rr in approved.iterrows():
-                try:
-                    app_map.setdefault((int(rr['project_id']), int(rr['cycle_no'])), str(rr['timing_status']).upper())
-                except Exception:
-                    pass
-        post_map = {}
-        if not posted.empty:
-            for _, rr in posted.iterrows():
-                try:
-                    post_map.setdefault(int(rr['staff_id']), set()).add(int(rr['project_id']))
-                except Exception:
-                    pass
-        for _, sr in staff_pdf.iterrows():
-            sid2 = int(sr['id'])
-            ontime = late = missed = 0
-            total_points = 0
-            for pid2 in post_map.get(sid2, set()):
-                first_idx = _project_first_cycle_index(pid2)
-                for idx in range(first_idx, 500):
-                    cyc = _biweekly_cycle_from_index(idx)
-                    if cyc['cycle_no'] < cutoff or cyc['cycle_no'] > latest_cycle_no:
-                        continue
-                    if cyc['due_date'] > today:
-                        continue
-                    timing = app_map.get((pid2, cyc['cycle_no']))
-                    if timing is None:
-                        missed += 1
-                    elif timing == 'LATE':
-                        late += 1
-                        total_points += 3
-                    else:
-                        ontime += 1
-                        total_points += 5
-            rows.append({'Engineer': sr['name'], 'On-time': ontime, 'Late': late, 'Missed': missed, 'Points': total_points})
-        cdf = pd.DataFrame(rows).sort_values(['Points','On-time','Engineer'], ascending=[False,False,True])
+    cdf = ubs.get("staff_compliance")
+    if isinstance(cdf, pd.DataFrame) and not cdf.empty:
         st.dataframe(cdf, hide_index=True, width='stretch')
 
 # --- Project Quick Edit (Admin only) ---
+
     if can_manage_projects():
         st.markdown("### Project Quick Edit")
         pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
@@ -3920,12 +4098,14 @@ def page_dashboard():
                 with st.form(f"bw_form_{pid}"):
                     st.markdown("#### Complete report in WorkNest")
                     st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
+                    if edit_report is not None and str(edit_report.get("status") or "").upper() == "NEEDS_REVISION":
+                        st.warning(f"Revision requested: {edit_report.get('review_note') or 'Please review and update this report before resubmitting.'}")
                     cmeta1, cmeta2, cmeta3 = st.columns(3)
                     cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
                     cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
                     cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
                     report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
-                    report_date = st.date_input("Report Date", value=date.today(), key=f"bw_report_date_{pid}")
+                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
                     site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
                     reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
                     concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
@@ -3968,11 +4148,16 @@ def page_dashboard():
                                 base_path = first_new
                             execute("""UPDATE biweekly_reports
                                        SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
-                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?
+                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?, review_note=?, reviewed_at=?, reviewed_by_staff_id=?
                                        WHERE id=?""",
-                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
-                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
+                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
+                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, None, None, None, int(edit_report['id'])))
                             _save_biweekly_attachments(int(edit_report['id']), photo_files, None, caption_register, pid=pid)
+                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(edit_report['id']),))
+                            if not refreshed.empty:
+                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(edit_report['id']),))
+                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
+                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(edit_report['id'])))
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -3982,18 +4167,30 @@ def page_dashboard():
                                 """INSERT INTO biweekly_reports
                                    (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
+                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
                             _save_biweekly_attachments(int(rid), photo_files, None, caption_register, pid=pid)
+                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(rid),))
+                            if not refreshed.empty:
+                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(rid),))
+                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
+                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(rid)))
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
-            rdf=fetch_df("""SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
+            rdf=fetch_df("""SELECT id,project_id,report_date,uploaded_at,submitted_on,file_path, report_pdf_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
                                    window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
-                                   hse_observations, rfi_notes, general_remarks
+                                   hse_observations, rfi_notes, general_remarks, reviewed_at, reviewed_by_staff_id, review_note
                             FROM biweekly_reports
-                            WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=? OR ?=1)
-                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, current_staff_id(), 1 if is_admin() else 0))
+                            WHERE project_id=?
+                              AND (
+                                    ?=1
+                                    OR (
+                                        COALESCE(status,'APPROVED') <> 'REJECTED'
+                                        AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?)
+                                    )
+                                  )
+                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, 1 if is_admin() else 0, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
@@ -4007,7 +4204,9 @@ def page_dashboard():
                         st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
                         st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
                         st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
-                    btns = st.columns([1,1,1,1])
+                    if str(r.get('review_note') or '').strip():
+                        st.caption(f"Review note: {r.get('review_note')}")
+                    btns = st.columns([1,1,1])
                     if str(r.get('file_path') or '').strip():
                         with btns[0]:
                             file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
@@ -4017,17 +4216,24 @@ def page_dashboard():
                             if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
                                 st.session_state[f"bw_edit_{pid}"] = int(r['id'])
                                 st.rerun()
+                    pdf_path = _ensure_biweekly_pdf(r.to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(r['id']),)))
+                    with btns[2]:
+                        render_pdf_preview_and_download(f"bw_{int(r['id'])}", pdf_path)
                     if is_admin():
-                        with btns[2]:
-                            if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
-                                approve_biweekly_report(int(r['id']), current_staff_id())
-                                execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
-                                st.rerun()
-                        with btns[3]:
-                            if r['status']!='REJECTED' and st.button('✖ Reject', key=f"brej{r['id']}"):
-                                execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
-                                st.rerun()
+                        with st.expander('🧾 Review / Approval', expanded=False):
+                            review_note_val = st.text_area('Review note / revision instruction', value=str(r.get('review_note') or ''), key=f"bw_note_{r['id']}", help='Use this when sending a report back for correction or for internal review comments.')
+                            ra, rr = st.columns(2)
+                            with ra:
+                                if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET review_note=?, reviewed_by_staff_id=?, reviewed_at=? WHERE id=?", (review_note_val or None, current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                    approve_biweekly_report(int(r['id']), current_staff_id())
+                                    execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
+                                    st.rerun()
+                            with rr:
+                                if r['status']!='NEEDS_REVISION' and st.button('🔁 Request Revision', key=f"brev{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='NEEDS_REVISION', review_note=?, reviewed_by_staff_id=?, reviewed_at=?, approved_at=NULL, approved_by_staff_id=NULL WHERE id=?",
+                                            ((review_note_val or 'Please review and update this report before resubmitting.'), current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                    st.rerun()
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
 # ---------- Staff ----------
@@ -4086,7 +4292,9 @@ def worknest_search(query: str):
                                COALESCE(r.rfi_notes,'') || ' ' || COALESCE(r.general_remarks,''), 220) AS snippet
                    FROM biweekly_reports r
                    LEFT JOIN projects p ON p.id=r.project_id
-                   WHERE LOWER(COALESCE(p.code,'')) LIKE ?
+                   WHERE COALESCE(r.status,'PENDING') <> 'REJECTED'
+                     AND (
+                         LOWER(COALESCE(p.code,'')) LIKE ?
                       OR LOWER(COALESCE(p.name,'')) LIKE ?
                       OR LOWER(COALESCE(r.site_activities,'')) LIKE ?
                       OR LOWER(COALESCE(r.reinforcement_observations,'')) LIKE ?
@@ -4094,6 +4302,7 @@ def worknest_search(query: str):
                       OR LOWER(COALESCE(r.hse_observations,'')) LIKE ?
                       OR LOWER(COALESCE(r.rfi_notes,'')) LIKE ?
                       OR LOWER(COALESCE(r.general_remarks,'')) LIKE ?
+                   )
                    ORDER BY stamp DESC, r.id DESC
                    LIMIT 25""",
             (like, like, like, like, like, like, like, like)
@@ -4900,12 +5109,14 @@ def page_projects():
                 with st.form(f"bw_form_{pid}"):
                     st.markdown("#### Complete report in WorkNest")
                     st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
+                    if edit_report is not None and str(edit_report.get("status") or "").upper() == "NEEDS_REVISION":
+                        st.warning(f"Revision requested: {edit_report.get('review_note') or 'Please review and update this report before resubmitting.'}")
                     cmeta1, cmeta2, cmeta3 = st.columns(3)
                     cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
                     cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
                     cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
                     report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
-                    report_date = st.date_input("Report Date", value=date.today(), key=f"bw_report_date_{pid}")
+                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
                     site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
                     reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
                     concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
@@ -4948,11 +5159,16 @@ def page_projects():
                                 base_path = first_new
                             execute("""UPDATE biweekly_reports
                                        SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
-                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?
+                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?, review_note=?, reviewed_at=?, reviewed_by_staff_id=?
                                        WHERE id=?""",
-                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
-                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, int(edit_report['id'])))
+                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
+                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, None, None, None, int(edit_report['id'])))
                             _save_biweekly_attachments(int(edit_report['id']), photo_files, None, caption_register, pid=pid)
+                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(edit_report['id']),))
+                            if not refreshed.empty:
+                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(edit_report['id']),))
+                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
+                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(edit_report['id'])))
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -4962,18 +5178,30 @@ def page_projects():
                                 """INSERT INTO biweekly_reports
                                    (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'PENDING', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
+                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
                             )
                             _save_biweekly_attachments(int(rid), photo_files, None, caption_register, pid=pid)
+                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(rid),))
+                            if not refreshed.empty:
+                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(rid),))
+                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
+                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(rid)))
                             st.success(f"Report saved. Status: {'Late' if timing_status=='LATE' else 'On time'} — pending admin approval.")
                             st.rerun()
 
-            rdf=fetch_df("""SELECT id,report_date,uploaded_at,submitted_on,file_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
+            rdf=fetch_df("""SELECT id,project_id,report_date,uploaded_at,submitted_on,file_path, report_pdf_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
                                    window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
-                                   hse_observations, rfi_notes, general_remarks
+                                   hse_observations, rfi_notes, general_remarks, reviewed_at, reviewed_by_staff_id, review_note
                             FROM biweekly_reports
-                            WHERE project_id=? AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=? OR ?=1)
-                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, current_staff_id(), 1 if is_admin() else 0))
+                            WHERE project_id=?
+                              AND (
+                                    ?=1
+                                    OR (
+                                        COALESCE(status,'APPROVED') <> 'REJECTED'
+                                        AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?)
+                                    )
+                                  )
+                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, 1 if is_admin() else 0, current_staff_id()))
             if rdf.empty:
                 st.info("No reports yet.")
             else:
@@ -4987,7 +5215,9 @@ def page_projects():
                         st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
                         st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
                         st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
-                    btns = st.columns([1,1,1,1])
+                    if str(r.get('review_note') or '').strip():
+                        st.caption(f"Review note: {r.get('review_note')}")
+                    btns = st.columns([1,1,1])
                     if str(r.get('file_path') or '').strip():
                         with btns[0]:
                             file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
@@ -4997,17 +5227,24 @@ def page_projects():
                             if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
                                 st.session_state[f"bw_edit_{pid}"] = int(r['id'])
                                 st.rerun()
+                    pdf_path = _ensure_biweekly_pdf(r.to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(r['id']),)))
+                    with btns[2]:
+                        render_pdf_preview_and_download(f"bw_{int(r['id'])}", pdf_path)
                     if is_admin():
-                        with btns[2]:
-                            if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
-                                approve_biweekly_report(int(r['id']), current_staff_id())
-                                execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
-                                st.rerun()
-                        with btns[3]:
-                            if r['status']!='REJECTED' and st.button('✖ Reject', key=f"brej{r['id']}"):
-                                execute("UPDATE biweekly_reports SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
-                                st.rerun()
+                        with st.expander('🧾 Review / Approval', expanded=False):
+                            review_note_val = st.text_area('Review note / revision instruction', value=str(r.get('review_note') or ''), key=f"bw_note_{r['id']}", help='Use this when sending a report back for correction or for internal review comments.')
+                            ra, rr = st.columns(2)
+                            with ra:
+                                if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET review_note=?, reviewed_by_staff_id=?, reviewed_at=? WHERE id=?", (review_note_val or None, current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                    approve_biweekly_report(int(r['id']), current_staff_id())
+                                    execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
+                                    st.rerun()
+                            with rr:
+                                if r['status']!='NEEDS_REVISION' and st.button('🔁 Request Revision', key=f"brev{r['id']}"):
+                                    execute("UPDATE biweekly_reports SET status='NEEDS_REVISION', review_note=?, reviewed_by_staff_id=?, reviewed_at=?, approved_at=NULL, approved_by_staff_id=NULL WHERE id=?",
+                                            ((review_note_val or 'Please review and update this report before resubmitting.'), current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
+                                    st.rerun()
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
 # ---------- Staff ----------
