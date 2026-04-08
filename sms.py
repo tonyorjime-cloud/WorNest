@@ -1,19 +1,56 @@
+import os
 import requests
 
-url = "https://api.sendchamp.com/api/v1/sms/send"
+def send_sms(to, message):
+    url = "https://api.sendchamp.com/api/v1/sms/send"
 
-payload = {
-    "to": ["+2349066454125"],
-    "message": "hello",
-    "route": "non_dnd",
-    "sender_name": "Sendchamp"
-}
-headers = {
-    "accept": "application/json",
-    "content-type": "application/json",
-    "Authorization": "Bearer sendchamp_live_$2a$10$8uOTPekP2b0aGS/Gr0nNpuZqIZA2XF7pzkqmESZOloYPOmZfF5B16"
-}
+    api_key = os.getenv("SENDCHAMP_API_KEY")
+    if not api_key:
+        return {
+            "ok": False,
+            "error": "SENDCHAMP_API_KEY is not set"
+        }
 
-response = requests.post(url, json=payload, headers=headers)
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Authorization": f"Bearer {api_key}",
+    }
 
-print(response.text)
+    data = {
+        "message": message,
+        "sender_name": "WorkNest",
+        "type": "text",
+        "phone_number": to,
+        "route_id": "non_dnd",
+        "route": "non_dnd",
+        "to": to,
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=data, timeout=30)
+        response.raise_for_status()
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+
+        return {
+            "ok": True,
+            "status_code": response.status_code,
+            "response": body
+        }
+
+    except requests.RequestException as e:
+        body = None
+        if getattr(e, "response", None) is not None:
+            try:
+                body = e.response.json()
+            except ValueError:
+                body = e.response.text
+
+        return {
+            "ok": False,
+            "error": str(e),
+            "response": body
+        }
