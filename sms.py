@@ -4,33 +4,30 @@ import requests
 def send_sms(to, message):
     url = "https://api.sendchamp.com/api/v1/sms/send"
 
-    api_key = os.getenv("SENDCHAMP_API_KEY")
-
     headers = {
-        "Accept": "application/json,text/plain,*/*",
-        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {os.getenv('SENDCHAMP_API_KEY')}",
+        "Content-Type": "application/json",
     }
 
-    data = {
-        "message": message,
+    payload = {
+        "to": [str(to)],
+        "message": str(message),
         "sender_name": "WorkNest",
-        "type": "text",
-        "phone_number": to,
-        "route_id": "non_dnd",
         "route": "non_dnd",
-        "to": to,
     }
 
-    response = requests.post(url, headers=headers, data=data, timeout=30)
+    response = requests.post(url, json=payload, headers=headers, timeout=30)
+
+    try:
+        body = response.json()
+    except Exception:
+        body = response.text
+
+    print("SENDCHAMP SMS RESPONSE:", response.status_code, body)
 
     return {
+        "ok": response.ok,
         "status_code": response.status_code,
-        "text": response.text,
+        "body": body,
     }
-
-
-result = send_sms("2349066454125", "Test from WorkNest")
-print("SMS RESULT:", result)
-
-
-st.write(result)
