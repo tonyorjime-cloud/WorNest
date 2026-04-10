@@ -2769,7 +2769,9 @@ def _editable_status(status: str | None) -> bool:
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 def _safe_pdf_text(v):
     s = "" if v is None else str(v)
@@ -2781,15 +2783,100 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     width, height = A4
     x = 18 * mm
     y = height - 18 * mm
+    usable_width = width - (2 * x)
+
+    def ensure_space(required_height_mm=0):
+        nonlocal y
+        if y < (18 + required_height_mm) * mm:
+            c.showPage()
+            y = height - 18 * mm
 
     def line(text="", size=10, gap=6):
         nonlocal y
+        ensure_space(gap + 2)
         c.setFont("Times-Roman", size)
         c.drawString(x, y, _safe_pdf_text(text)[:170])
         y -= gap * mm
-        if y < 20 * mm:
-            c.showPage()
-            y = height - 18 * mm
+
+    def draw_wrapped_text(title, body):
+        nonlocal y
+        ensure_space(12)
+        c.setFont("Times-Bold", 11)
+        c.drawString(x, y, _safe_pdf_text(title))
+        y -= 5 * mm
+        text_obj = c.beginText(x, y)
+        text_obj.setFont("Times-Roman", 10)
+        for raw_line in _safe_pdf_text(body).splitlines() or [""]:
+            line_text = raw_line
+            while len(line_text) > 105:
+                text_obj.textLine(line_text[:105])
+                line_text = line_text[105:]
+                y -= 4.5 * mm
+                if y < 25 * mm:
+                    c.drawText(text_obj)
+                    c.showPage()
+                    y = height - 18 * mm
+                    text_obj = c.beginText(x, y)
+                    text_obj.setFont("Times-Roman", 10)
+            text_obj.textLine(line_text)
+            y -= 4.5 * mm
+            if y < 25 * mm:
+                c.drawText(text_obj)
+                c.showPage()
+                y = height - 18 * mm
+                text_obj = c.beginText(x, y)
+                text_obj.setFont("Times-Roman", 10)
+        c.drawText(text_obj)
+        y -= 3 * mm
+
+    def _iter_attachment_records(df):
+        if df is None or getattr(df, "empty", True):
+            return []
+        try:
+            return list(df.to_dict("records"))
+        except Exception:
+            return []
+
+    def draw_attachment_images(df):
+        nonlocal y
+        rows = _iter_attachment_records(df)
+        if not rows:
+            return
+        c.showPage()
+        y = height - 18 * mm
+        c.setFont("Times-Bold", 12)
+        c.drawString(x, y, "Attachments / Photos")
+        y -= 8 * mm
+        for row in rows:
+            path = str(row.get("file_path") or "").strip()
+            cap = str(row.get("caption") or "").strip()
+            if not path:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if cap:
+                line(f"Caption: {cap}", 10, 5)
+            if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} or not os.path.exists(path):
+                line(f"File: {os.path.basename(path)}", 10, 5)
+                continue
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    img_w, img_h = img.size
+                    if not img_w or not img_h:
+                        raise ValueError("Invalid image size")
+                    scale = min(float(usable_width) / float(img_w), float(120 * mm) / float(img_h))
+                    draw_w = img_w * scale
+                    draw_h = img_h * scale
+                    ensure_space((draw_h / mm) + 10)
+                    img_reader = ImageReader(img)
+                    c.drawImage(img_reader, x, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+                    y -= draw_h + (4 * mm)
+            except (UnidentifiedImageError, OSError, ValueError):
+                line(f"File: {os.path.basename(path)}", 10, 5)
+            except Exception:
+                line(f"File: {os.path.basename(path)}", 10, 5)
 
     c.setFont("Times-Bold", 14)
     c.drawString(x, y, "Biweekly Report")
@@ -2819,51 +2906,12 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     ]
 
     for title, body in sections:
-        c.setFont("Times-Bold", 11)
-        c.drawString(x, y, _safe_pdf_text(title))
-        y -= 5 * mm
-        text_obj = c.beginText(x, y)
-        text_obj.setFont("Times-Roman", 10)
-        for raw_line in _safe_pdf_text(body).splitlines() or [""]:
-            line_text = raw_line
-            while len(line_text) > 105:
-                text_obj.textLine(line_text[:105])
-                line_text = line_text[105:]
-                y -= 4.5 * mm
-                if y < 25 * mm:
-                    c.drawText(text_obj)
-                    c.showPage()
-                    y = height - 18 * mm
-                    text_obj = c.beginText(x, y)
-                    text_obj.setFont("Times-Roman", 10)
-            text_obj.textLine(line_text)
-            y -= 4.5 * mm
-            if y < 25 * mm:
-                c.drawText(text_obj)
-                c.showPage()
-                y = height - 18 * mm
-                text_obj = c.beginText(x, y)
-                text_obj.setFont("Times-Roman", 10)
-        c.drawText(text_obj)
-        y -= 3 * mm
+        draw_wrapped_text(title, body)
         if y < 25 * mm:
             c.showPage()
             y = height - 18 * mm
 
-    if attachments_df is not None and not getattr(attachments_df, "empty", True):
-        c.showPage()
-        y = height - 18 * mm
-        c.setFont("Times-Bold", 12)
-        c.drawString(x, y, "Attachments")
-        y -= 8 * mm
-        c.setFont("Times-Roman", 10)
-        for _, row in attachments_df.iterrows():
-            path = row.get("file_path", "")
-            cap = row.get("caption", "")
-            line(f"File: {os.path.basename(str(path))}", 10, 5)
-            if cap:
-                line(f"Caption: {cap}", 10, 5)
-            y -= 1 * mm
+    draw_attachment_images(attachments_df)
 
     c.save()
     pdf_bytes = buf.getvalue()
@@ -2888,7 +2936,8 @@ def _build_biweekly_pdf_file(report_row, project_name="", attachments_df=None):
 
 def _ensure_biweekly_pdf(report_row, project_name="", attachments_df=None):
     existing = str(report_row.get("report_pdf_path") or "").strip()
-    if existing and os.path.exists(existing):
+    force_rebuild = attachments_df is not None
+    if existing and os.path.exists(existing) and not force_rebuild:
         return existing
     try:
         out_path = _build_biweekly_pdf_file(report_row, project_name=project_name, attachments_df=attachments_df)
@@ -3515,7 +3564,8 @@ def page_dashboard():
                     proj_label = f"{mr.get('code') or ''} — {mr.get('project_name') or ''}".strip(' —')
                     cyc_txt = f"Report No. {int(mr['cycle_no'])}" if pd.notna(mr.get('cycle_no')) else 'Report'
                     st.markdown(f"**{cyc_txt}** | {proj_label}  \n**Window:** {mr.get('window_start') or '—'} → {mr.get('window_end') or '—'}  \n**Submitted:** {submitted_txt} | **Status:** {mr.get('status') or '—'} | **Timing:** {mr.get('timing_status') or '—'}")
-                    pdf_path = str(mr.get('report_pdf_path') or '').strip()
+                    dash_atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(mr['id']),))
+                    pdf_path = _ensure_biweekly_pdf(mr.to_dict(), project_name=proj_label, attachments_df=dash_atts)
                     if pdf_path:
                         render_pdf_preview_and_download(f"dash_my_bw_{int(mr['id'])}", pdf_path)
                     st.markdown('---')
