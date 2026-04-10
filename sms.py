@@ -1,33 +1,16 @@
-import os
 import requests
 
-def send_sms(to, message):
-    url = "https://api.sendchamp.com/api/v1/sms/send"
+url = "https://api.sendchamp.com/api/v1/sms/send"
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {os.getenv('SENDCHAMP_API_KEY')}",
-        "Content-Type": "application/json",
-    }
+payload = "message=check&sender_name=WorkNest%20&type=text&phone_number=2349066454125&route_id=non_dnd&route=non_dnd&to=2349066454125"
+headers = {
+    "Accept": "application/json,text/plain,*/*",
+    "Content-Type": "application/json",
+    "Authorization": "Bearer sendchamp_live_$2a$10$8uOTPekP2b0aGS/Gr0nNpuZqIZA2XF7pzkqmESZOloYPOmZfF5B16"
+}
 
-    payload = {
-        "to": [str(to)],
-        "message": str(message),
-        "sender_name": "WorkNest",
-        "route": "non_dnd",
-    }
+response = requests.request("POST", url, data=payload, headers=headers)
 
-    response = requests.post(url, json=payload, headers=headers, timeout=30)
+print(response.text)
 
-    try:
-        body = response.json()
-    except Exception:
-        body = response.text
-
-    print("SENDCHAMP SMS RESPONSE:", response.status_code, body)
-
-    return {
-        "ok": response.ok,
-        "status_code": response.status_code,
-        "body": body,
-    }
+RESPONSE
