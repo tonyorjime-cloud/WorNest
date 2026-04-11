@@ -3483,7 +3483,10 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     if selected_modules:
         sections.append(("Observed Activities", ", ".join(_BIWEEKLY_MODULES[m]["label"] for m in selected_modules)))
         for module_key in selected_modules:
-            PLACEHOLDER
+            module_meta = _BIWEEKLY_MODULES.get(module_key, {})
+            module_state = (structured_payload.get("modules") or {}).get(module_key) or {}
+            module_lines = _module_summary_lines(module_key, module_state)
+            sections.append((module_meta.get("label", module_key), "\n".join(module_lines) if module_lines else "—"))
     else:
         sections.extend([
             ("Site Activities", report_row.get("site_activities", "")),
