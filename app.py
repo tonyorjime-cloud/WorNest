@@ -15,99 +15,94 @@ def _fix_attachment_id_sequences():
 # ===== SMS =====
 import os, requests, base64
 
-SMS_ENABLED = os.getenv("SMS_ENABLED", "false").lower() == "true"
-SENDCHAMP_API_KEY = os.getenv("SENDCHAMP_API_KEY", "")
-SENDCHAMP_SENDER_ID = os.getenv("SENDCHAMP_SENDER_ID", "WorkNest")
-TERMII_API_KEY = os.getenv("TERMII_API_KEY", "")
-TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "WorkNest")
-TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic")
+SMS_ENABLED = os.getenv("SMS_ENABLED", "false").strip().lower() == "true"
+TERMII_API_KEY = os.getenv("TERMII_API_KEY", "").strip()
+TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "Worknest").strip()
+TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic").strip()
+
 
 def _normalize_ng(phone):
     if not phone:
         return None
-    p = str(phone).strip().replace(" ", "")
+    p = str(phone).strip().replace(" ", "").replace("-", "")
     if p.startswith("+"):
         p = p[1:]
-    if p.startswith("234"):
+    if p.startswith("234") and p.isdigit():
         return p
-    if len(p) == 10 and p.isdigit():
-        p = "0" + p
-    if p.startswith("0") and len(p) >= 11:
+    if p.startswith("0") and len(p) == 11 and p.isdigit():
         return "234" + p[1:]
-    return p
+    if len(p) == 10 and p.isdigit():
+        return "234" + p
+    return p if p.isdigit() else None
 
-def send_sms_sendchamp(to_numbers, message):
-    if not SMS_ENABLED or not SENDCHAMP_API_KEY or not to_numbers:
-        return {"ok": False, "reason": "sendchamp_not_configured"}
-    nums = []
-    for n in to_numbers:
-        nn = _normalize_ng(n)
-        if nn:
-            nums.append(nn)
-    if not nums:
-        return {"ok": False, "reason": "no_valid_numbers"}
-    url = "https://api.sendchamp.com/api/v1/sms/send"
-    payload = {
-        "to": nums if len(nums) > 1 else nums[0],
-        "sender_name": SENDCHAMP_SENDER_ID,
-        "message": message,
-        "route": "dnd"
-    }
-    headers = {
-        "Authorization": f"Bearer {SENDCHAMP_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        body = {}
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text[:500]}
-        print("SENDCHAMP SMS RESPONSE:", resp.status_code, str(body)[:500])
-        return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
-    except Exception as e:
-        print("SENDCHAMP SMS ERROR:", str(e))
-        return {"ok": False, "reason": str(e)}
 
-def send_sms_termii(to_numbers, message):
-    if not SMS_ENABLED or not TERMII_API_KEY or not to_numbers:
-        return {"ok": False, "reason": "termii_not_configured"}
-    nums = []
-    for n in to_numbers:
-        nn = _normalize_ng(n)
-        if nn:
-            nums.append(nn)
-    if not nums:
-        return {"ok": False, "reason": "no_valid_numbers"}
+def _termii_send_one(phone, message):
     url = "https://api.ng.termii.com/api/sms/send"
     payload = {
-        "to": nums,
+        "to": phone,
         "from": TERMII_SENDER_ID,
         "sms": message,
         "type": "plain",
         "channel": TERMII_CHANNEL,
-        "api_key": TERMII_API_KEY
+        "api_key": TERMII_API_KEY,
     }
+    headers = {"Content-Type": "application/json"}
+
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        body = {}
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
         try:
             body = resp.json()
         except Exception:
             body = {"raw": resp.text[:500]}
-        print("TERMII SMS RESPONSE:", resp.status_code, str(body)[:500])
-        return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+        print("TERMII SMS RESPONSE:", resp.status_code, body)
+
+        ok = False
+        if resp.status_code == 200:
+            code = str(body.get("code", "")).strip().lower()
+            message_id = body.get("message_id")
+            if code in {"ok", "success"} or bool(message_id):
+                ok = True
+
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "body": body,
+            "phone": phone,
+        }
     except Exception as e:
         print("TERMII SMS ERROR:", str(e))
-        return {"ok": False, "reason": str(e)}
+        return {"ok": False, "reason": str(e), "phone": phone}
+
 
 def send_sms(to_numbers, message):
-    if SENDCHAMP_API_KEY:
-        return send_sms_sendchamp(to_numbers, message)
-    if TERMII_API_KEY:
-        return send_sms_termii(to_numbers, message)
-    return {"ok": False, "reason": "no_sms_provider_configured"}
+    if not SMS_ENABLED:
+        return {"ok": False, "reason": "sms_disabled"}
+    if not TERMII_API_KEY:
+        return {"ok": False, "reason": "termii_not_configured"}
+    if not to_numbers:
+        return {"ok": False, "reason": "no_numbers"}
+
+    nums = []
+    for n in to_numbers:
+        nn = _normalize_ng(n)
+        if nn:
+            nums.append(nn)
+    nums = list(dict.fromkeys(nums))
+
+    if not nums:
+        return {"ok": False, "reason": "no_valid_numbers"}
+
+    results = [_termii_send_one(num, message) for num in nums]
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": ok_count > 0,
+        "provider": "termii",
+        "requested": len(to_numbers),
+        "valid": len(nums),
+        "sent": ok_count,
+        "failed": len(nums) - ok_count,
+        "results": results,
+    }
 
 def _all_staff_phones():
     try:
@@ -1525,6 +1520,52 @@ def _staff_emails_for_project(project_id: int):
         return [str(x) for x in df["email"].tolist()] if not df.empty else []
     except Exception:
         return []
+
+
+def _staff_phone(staff_id: int | None):
+    try:
+        if not staff_id:
+            return None
+        df = fetch_df("SELECT phone FROM staff WHERE id=? LIMIT 1", (int(staff_id),))
+        if df.empty:
+            return None
+        phone = str(df.iloc[0].get("phone") or "").strip()
+        return phone or None
+    except Exception:
+        return None
+
+
+def _admin_phones():
+    try:
+        df = fetch_df(
+            """
+            SELECT DISTINCT s.phone
+            FROM users u
+            JOIN staff s ON s.id=u.staff_id
+            WHERE COALESCE(s.phone,'')<>''
+              AND (
+                    COALESCE(u.is_active,1)=1
+                    AND (
+                        COALESCE(u.is_admin,0)=1
+                        OR LOWER(COALESCE(u.role,'')) IN ('admin','sub_admin')
+                    )
+                  )
+            """
+        )
+        vals = [str(x).strip() for x in df["phone"].tolist()] if not df.empty else []
+        return [x for x in vals if x]
+    except Exception:
+        return []
+
+
+def _send_sms_notice(to_numbers, message: str):
+    try:
+        result = send_sms(to_numbers, message)
+        print("WORKNEST SMS NOTICE:", result)
+        return result
+    except Exception as e:
+        print("WORKNEST SMS NOTICE ERROR:", str(e))
+        return {"ok": False, "reason": str(e)}
 
 def get_setting(key:str, default:str|None=None)->str|None:
     """Read a setting from DB (app_settings)."""
@@ -4625,6 +4666,12 @@ def page_projects():
                         rid = int(edit_test['id'])
                         if up is not None:
                             _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
+                        admin_numbers = _admin_phones()
+                        if admin_numbers:
+                            _send_sms_notice(
+                                admin_numbers,
+                                f"WorkNest: Test result resubmitted for {selected['code']} ({str(test_date)}). Please review."
+                            )
                         st.success("Test result updated and resubmitted for admin review.")
                         st.session_state.pop(f"test_edit_{pid}", None)
                         st.rerun()
@@ -4635,6 +4682,12 @@ def page_projects():
                                       (pid, bid, stage, ttype, batch_id, path or '', now_iso, current_staff_id(), str(test_date), result_summary, result_summary, 'PENDING', now_iso))
                         if up is not None:
                             _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
+                        admin_numbers = _admin_phones()
+                        if admin_numbers:
+                            _send_sms_notice(
+                                admin_numbers,
+                                f"WorkNest: New test result submitted for {selected['code']} ({str(test_date)}). Please review."
+                            )
                         st.success("Test result saved — pending admin approval.")
                         st.rerun()
 
@@ -4815,6 +4868,12 @@ def page_projects():
                                 atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(edit_report['id']),))
                                 pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
                                 execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(edit_report['id'])))
+                            admin_numbers = _admin_phones()
+                            if admin_numbers:
+                                _send_sms_notice(
+                                    admin_numbers,
+                                    f"WorkNest: Biweekly report resubmitted for {selected['code']} - Report {int(target_cycle) if target_cycle is not None else 'N/A'}. Please review."
+                                )
                             st.success("Report updated and resubmitted for admin review.")
                             st.session_state.pop(f"bw_edit_{pid}", None)
                             st.rerun()
@@ -4832,6 +4891,12 @@ def page_projects():
                                 atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(rid),))
                                 pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
                                 execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(rid)))
+                            admin_numbers = _admin_phones()
+                            if admin_numbers:
+                                _send_sms_notice(
+                                    admin_numbers,
+                                    f"WorkNest: New biweekly report submitted for {selected['code']} - Report {int(target_cycle) if target_cycle is not None else 'N/A'}. Please review."
+                                )
                             st.success(f"Report saved. Status: {_timing_status_label(timing_status)} — pending admin approval.")
                             st.rerun()
 
@@ -5584,6 +5649,12 @@ def page_admin_inbox():
                             send_push(notify, "WorkNest: Approved", f"{kind.title()} approved for {code} ({period_str}).")
                         except Exception:
                             pass
+                        try:
+                            uploader_phone = _staff_phone(r.get("uploader_staff_id"))
+                            if uploader_phone:
+                                _send_sms_notice([uploader_phone], f"WorkNest: Your {kind} for {code} ({period_str}) has been approved.")
+                        except Exception:
+                            pass
 
                         # Keep performance table aligned (best-effort)
                         try:
@@ -5614,6 +5685,12 @@ def page_admin_inbox():
                             if pid:
                                 notify += _staff_emails_for_project(pid)
                             send_push(notify, "WorkNest: Rejected", f"{kind.title()} rejected for {code} ({period_str}).")
+                        except Exception:
+                            pass
+                        try:
+                            uploader_phone = _staff_phone(r.get("uploader_staff_id"))
+                            if uploader_phone:
+                                _send_sms_notice([uploader_phone], f"WorkNest: Your {kind} for {code} ({period_str}) was rejected. Please check WorkNest.")
                         except Exception:
                             pass
                         st.warning("Rejected.")
