@@ -122,7 +122,7 @@ try:
     from streamlit_javascript import st_javascript
 except Exception:
     st_javascript = None
-import os, hashlib, secrets, html
+import os, hashlib, secrets, html, json
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -1201,6 +1201,8 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
             "ALTER TABLE biweekly_reports ADD COLUMN rfi_notes TEXT",
             "ALTER TABLE biweekly_reports ADD COLUMN general_remarks TEXT",
             "ALTER TABLE biweekly_reports ADD COLUMN updated_at TEXT",
+            "ALTER TABLE biweekly_reports ADD COLUMN selected_modules TEXT",
+            "ALTER TABLE biweekly_reports ADD COLUMN structured_report_json TEXT",
             "ALTER TABLE test_results ADD COLUMN result_summary TEXT",
             "ALTER TABLE test_results ADD COLUMN notes TEXT",
             "ALTER TABLE test_results ADD COLUMN updated_at TEXT",
@@ -2996,6 +2998,177 @@ def _editable_status(status: str | None) -> bool:
     return str(status or "PENDING").upper() in {"DRAFT", "PENDING", "SUBMITTED", "NEEDS_REVISION"}
 
 
+
+_BIWEEKLY_STATUS_OPTIONS = ["Compliant", "Non-compliant", "Not checked", "Not applicable"]
+
+_BIWEEKLY_MODULES = {
+    "concrete": {
+        "label": "Concrete Works",
+        "checks": [
+            ("slump_test", "Slump test carried out"),
+            ("cube_samples", "Cube samples taken"),
+            ("proper_vibration", "Proper vibration achieved"),
+            ("no_segregation", "No segregation observed"),
+            ("curing_started", "Proper curing initiated"),
+        ],
+        "extras": [("batching_method", "Method of batching"), ("mix_ratio", "Mix proportion used"), ("slump_result", "Slump result"), ("cube_count", "Number of cube samples")],
+        "selects": {"batching_method": ["Not stated", "Manual", "Machine"]},
+    },
+    "formwork": {
+        "label": "Formwork Inspection",
+        "checks": [
+            ("alignment", "Proper alignment"),
+            ("bracing", "Adequate bracing"),
+            ("tightness", "Formwork tightness / leakage prevention"),
+            ("waterproofing", "Waterproofing installed where required"),
+            ("release_agent", "Release agent applied"),
+        ],
+        "extras": [],
+        "selects": {},
+    },
+    "reinforcement": {
+        "label": "Reinforcement Works",
+        "checks": [
+            ("bar_sizes", "Bar sizes as per drawings"),
+            ("spacing", "Spacing compliance"),
+            ("cover", "Concrete cover achieved"),
+            ("spacers", "Concrete spacers installed"),
+            ("laps", "Laps and anchorage correct"),
+        ],
+        "extras": [],
+        "selects": {},
+    },
+    "excavation": {
+        "label": "Excavation / Earthworks",
+        "checks": [
+            ("depth", "Required excavation depth achieved"),
+            ("soil_condition", "Soil condition consistent with expectation"),
+            ("groundwater", "Groundwater observed / managed"),
+        ],
+        "extras": [],
+        "selects": {},
+    },
+    "backfilling": {
+        "label": "Backfilling & Compaction",
+        "checks": [
+            ("suitable_material", "Suitable backfill material used"),
+            ("layers", "Backfilling carried out in layers"),
+            ("compaction", "Compaction carried out to required standard"),
+        ],
+        "extras": [("compaction_method", "Method of compaction")],
+        "selects": {"compaction_method": ["Not stated", "Manual", "Mechanical"]},
+    },
+    "steel_trusses": {
+        "label": "Steel Trusses",
+        "checks": [
+            ("section_sizes", "Steel section sizes as specified"),
+            ("material_tests", "Evidence of material testing available"),
+            ("spacing", "Spacing of trusses as specified"),
+            ("connections", "Connection details as specified"),
+        ],
+        "extras": [],
+        "selects": {},
+    },
+    "external_works": {
+        "label": "External Works (Roads & Drainage)",
+        "checks": [
+            ("subgrade", "Subgrade preparation adequate"),
+            ("drainage_alignment", "Drainage alignment correct"),
+            ("compaction", "Compaction adequate"),
+        ],
+        "extras": [],
+        "selects": {},
+    },
+}
+
+def _biweekly_default_module_state(module_key: str) -> dict:
+    meta = _BIWEEKLY_MODULES.get(module_key, {})
+    data = {"checks": {}, "extras": {}, "remarks": ""}
+    for field_key, _ in meta.get("checks", []):
+        data["checks"][field_key] = "Not checked"
+    for field_key, _ in meta.get("extras", []):
+        options = meta.get("selects", {}).get(field_key)
+        data["extras"][field_key] = options[0] if options else ""
+    return data
+
+def _normalize_biweekly_structured_payload(raw_payload) -> dict:
+    payload = {}
+    if isinstance(raw_payload, dict):
+        payload = raw_payload
+    elif raw_payload not in (None, ""):
+        try:
+            payload = json.loads(raw_payload)
+        except Exception:
+            payload = {}
+    selected = payload.get("selected_modules") or []
+    if isinstance(selected, str):
+        selected = [selected]
+    selected = [m for m in selected if m in _BIWEEKLY_MODULES]
+    modules = payload.get("modules") if isinstance(payload.get("modules"), dict) else {}
+    normalized_modules = {}
+    for module_key in _BIWEEKLY_MODULES:
+        base = _biweekly_default_module_state(module_key)
+        incoming = modules.get(module_key) if isinstance(modules.get(module_key), dict) else {}
+        checks_in = incoming.get("checks") if isinstance(incoming.get("checks"), dict) else {}
+        extras_in = incoming.get("extras") if isinstance(incoming.get("extras"), dict) else {}
+        for field_key in base["checks"]:
+            val = checks_in.get(field_key, base["checks"][field_key])
+            base["checks"][field_key] = val if val in _BIWEEKLY_STATUS_OPTIONS else "Not checked"
+        for field_key in base["extras"]:
+            base["extras"][field_key] = str(extras_in.get(field_key, base["extras"][field_key]) or "")
+        base["remarks"] = str(incoming.get("remarks") or "")
+        normalized_modules[module_key] = base
+    return {"selected_modules": selected, "modules": normalized_modules}
+
+def _structured_payload_to_json(payload: dict) -> str:
+    return json.dumps(_normalize_biweekly_structured_payload(payload), ensure_ascii=False)
+
+def _module_summary_lines(module_key: str, module_state: dict) -> list[str]:
+    meta = _BIWEEKLY_MODULES.get(module_key, {})
+    lines = []
+    for field_key, label in meta.get("checks", []):
+        val = str((module_state.get("checks") or {}).get(field_key) or "Not checked")
+        lines.append(f"{label}: {val}")
+    for field_key, label in meta.get("extras", []):
+        val = str((module_state.get("extras") or {}).get(field_key) or "").strip()
+        if val:
+            lines.append(f"{label}: {val}")
+    remarks = str(module_state.get("remarks") or "").strip()
+    if remarks:
+        lines.append(f"Remarks: {remarks}")
+    return lines
+
+def _structured_module_markdown(module_key: str, module_state: dict) -> str:
+    lines = _module_summary_lines(module_key, module_state)
+    if not lines:
+        return "—"
+    return "\n".join([f"- {line}" for line in lines])
+
+def _render_biweekly_structured_details(report_row: dict):
+    payload = _normalize_biweekly_structured_payload(report_row.get("structured_report_json"))
+    selected = payload.get("selected_modules") or []
+    if not selected:
+        return False
+    st.markdown(f"**Observed Activities**\n\n{', '.join(_BIWEEKLY_MODULES[m]['label'] for m in selected)}")
+    for module_key in selected:
+        st.markdown(f"**{_BIWEEKLY_MODULES[module_key]['label']}**\n\n{_structured_module_markdown(module_key, payload['modules'][module_key])}")
+    return True
+
+def _legacy_sections_from_structured(payload: dict, hse_text: str = "", rfi_text: str = "", general_text: str = "") -> dict:
+    payload = _normalize_biweekly_structured_payload(payload)
+    selected = payload.get("selected_modules") or []
+    module_labels = [_BIWEEKLY_MODULES[m]["label"] for m in selected]
+    site_activities = ", ".join(module_labels) if module_labels else ""
+    module_blocks = {m: _structured_module_markdown(m, payload["modules"][m]) for m in selected}
+    return {
+        "site_activities": site_activities,
+        "reinforcement_observations": module_blocks.get("reinforcement") or module_blocks.get("formwork") or "",
+        "concrete_observations": module_blocks.get("concrete") or "",
+        "hse_observations": hse_text,
+        "rfi_notes": rfi_text,
+        "general_remarks": general_text,
+    }
+
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -3126,14 +3299,24 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
         line(f"{k}: {v}", 10, 5)
 
     y -= 2 * mm
-    sections = [
-        ("Site Activities", report_row.get("site_activities", "")),
-        ("Reinforcement Observations", report_row.get("reinforcement_observations", "")),
-        ("Concrete / Test Observations", report_row.get("concrete_observations", "")),
+    structured_payload = _normalize_biweekly_structured_payload(report_row.get("structured_report_json"))
+    selected_modules = structured_payload.get("selected_modules") or []
+    sections = []
+    if selected_modules:
+        sections.append(("Observed Activities", ", ".join(_BIWEEKLY_MODULES[m]["label"] for m in selected_modules)))
+        for module_key in selected_modules:
+            sections.append((_BIWEEKLY_MODULES[module_key]["label"], "\n".join(_module_summary_lines(module_key, structured_payload["modules"][module_key]))))
+    else:
+        sections.extend([
+            ("Site Activities", report_row.get("site_activities", "")),
+            ("Reinforcement Observations", report_row.get("reinforcement_observations", "")),
+            ("Concrete / Test Observations", report_row.get("concrete_observations", "")),
+        ])
+    sections.extend([
         ("HSE Observations", report_row.get("hse_observations", "")),
         ("RFI / EI Notes", report_row.get("rfi_notes", "")),
         ("General Remarks", report_row.get("general_remarks", "")),
-    ]
+    ])
 
     for title, body in sections:
         draw_wrapped_text(title, body)
@@ -4816,12 +4999,70 @@ def page_projects():
                     cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
                     report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
                     report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
-                    site_activities = st.text_area("Site Activities", value=(str(edit_report.get('site_activities') or '') if edit_report is not None else ''), height=120, key=f"bw_site_{pid}")
-                    reinforcement_observations = st.text_area("Reinforcement Observations", value=(str(edit_report.get('reinforcement_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_reinf_{pid}")
-                    concrete_observations = st.text_area("Concrete / Test Observations", value=(str(edit_report.get('concrete_observations') or '') if edit_report is not None else ''), height=100, key=f"bw_conc_{pid}")
+                    structured_existing = _normalize_biweekly_structured_payload(edit_report.get('structured_report_json') if edit_report is not None else None)
+                    default_selected_modules = structured_existing.get("selected_modules") or []
+                    module_options = list(_BIWEEKLY_MODULES.keys())
+                    selected_modules = st.multiselect(
+                        "Observed structural activities",
+                        options=module_options,
+                        default=default_selected_modules,
+                        format_func=lambda k: _BIWEEKLY_MODULES[k]["label"],
+                        key=f"bw_modules_{pid}",
+                        help="Select only the activities actually observed on site for this reporting visit.",
+                    )
+                    structured_payload = {"selected_modules": selected_modules, "modules": {}}
+                    if selected_modules:
+                        st.caption("Complete the compliance checkpoints for each observed activity.")
+                    else:
+                        st.info("Select at least one observed activity to open the structured inspection sections.")
+                    for module_key in selected_modules:
+                        meta = _BIWEEKLY_MODULES[module_key]
+                        module_state = structured_existing["modules"].get(module_key, _biweekly_default_module_state(module_key))
+                        with st.expander(meta["label"], expanded=True):
+                            checks_state = {}
+                            for idx, (field_key, label) in enumerate(meta.get("checks", [])):
+                                checks_state[field_key] = st.selectbox(
+                                    label,
+                                    _BIWEEKLY_STATUS_OPTIONS,
+                                    index=max(0, _BIWEEKLY_STATUS_OPTIONS.index(module_state["checks"].get(field_key, "Not checked")) if module_state["checks"].get(field_key, "Not checked") in _BIWEEKLY_STATUS_OPTIONS else 2),
+                                    key=f"bw_{module_key}_{field_key}_{pid}",
+                                )
+                            extras_state = {}
+                            for field_key, label in meta.get("extras", []):
+                                if field_key in meta.get("selects", {}):
+                                    opts = meta["selects"][field_key]
+                                    current_val = module_state["extras"].get(field_key, opts[0])
+                                    extras_state[field_key] = st.selectbox(
+                                        label,
+                                        opts,
+                                        index=max(0, opts.index(current_val) if current_val in opts else 0),
+                                        key=f"bw_{module_key}_{field_key}_{pid}",
+                                    )
+                                else:
+                                    extras_state[field_key] = st.text_input(
+                                        label,
+                                        value=str(module_state["extras"].get(field_key) or ""),
+                                        key=f"bw_{module_key}_{field_key}_{pid}",
+                                    )
+                            remarks_val = st.text_area(
+                                f"{meta['label']} remarks",
+                                value=str(module_state.get("remarks") or ""),
+                                height=80,
+                                key=f"bw_{module_key}_remarks_{pid}",
+                            )
+                            structured_payload["modules"][module_key] = {
+                                "checks": checks_state,
+                                "extras": extras_state,
+                                "remarks": remarks_val,
+                            }
                     hse_observations = st.text_area("HSE Observations", value=(str(edit_report.get('hse_observations') or '') if edit_report is not None else ''), height=80, key=f"bw_hse_{pid}")
                     rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
                     general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
+                    legacy_sections = _legacy_sections_from_structured(structured_payload, hse_observations, rfi_notes, general_remarks)
+                    site_activities = legacy_sections["site_activities"]
+                    reinforcement_observations = legacy_sections["reinforcement_observations"]
+                    concrete_observations = legacy_sections["concrete_observations"]
+                    structured_report_json = _structured_payload_to_json(structured_payload)
                     st.markdown("**Images only**")
                     st.caption("Maximum of 5 images. On phones, use the Upload button to choose from gallery or camera. On computers, upload from storage only.")
                     photo_files = st.file_uploader("Upload images (maximum 5)", type=["png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
@@ -4841,6 +5082,8 @@ def page_projects():
                 if do_save:
                     if not allowed:
                         st.error("You don't have permission to upload to this project.")
+                    elif not selected_modules:
+                        st.error("Select at least one observed activity before submitting the report.")
                     elif current_cycle is None and edit_report is None:
                         st.error(cycle_reason or "No open reporting cycle is available.")
                     else:
@@ -4858,10 +5101,10 @@ def page_projects():
                                 base_path = first_new
                             execute("""UPDATE biweekly_reports
                                        SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
-                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?, review_note=?, reviewed_at=?, reviewed_by_staff_id=?
+                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?, selected_modules=?, structured_report_json=?, review_note=?, reviewed_at=?, reviewed_by_staff_id=?
                                        WHERE id=?""",
                                     (str(report_date), base_path or '', now_iso, str(submitted_on), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
-                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, None, None, None, int(edit_report['id'])))
+                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, json.dumps(selected_modules), structured_report_json, None, None, None, int(edit_report['id'])))
                             _save_biweekly_attachments(int(edit_report['id']), photo_files, None, caption_register, pid=pid)
                             refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(edit_report['id']),))
                             if not refreshed.empty:
@@ -4881,9 +5124,9 @@ def page_projects():
                             base_path = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
                             rid = execute(
                                 """INSERT INTO biweekly_reports
-                                   (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso)
+                                   (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at,selected_modules,structured_report_json)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso, json.dumps(selected_modules), structured_report_json)
                             )
                             _save_biweekly_attachments(int(rid), photo_files, None, caption_register, pid=pid)
                             refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(rid),))
@@ -4902,7 +5145,7 @@ def page_projects():
 
             rdf=fetch_df("""SELECT id,project_id,report_date,uploaded_at,submitted_on,file_path, report_pdf_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
                                    window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
-                                   hse_observations, rfi_notes, general_remarks, reviewed_at, reviewed_by_staff_id, review_note
+                                   hse_observations, rfi_notes, general_remarks, selected_modules, structured_report_json, reviewed_at, reviewed_by_staff_id, review_note
                             FROM biweekly_reports
                             WHERE project_id=?
                               AND (
@@ -4920,9 +5163,11 @@ def page_projects():
                     sub = r['uploaded_at'] if pd.notna(r.get('uploaded_at')) and str(r.get('uploaded_at')).strip() else r['report_date']
                     st.markdown(f"**Report No.** {int(r['cycle_no']) if pd.notna(r.get('cycle_no')) else '—'}  \n**Period:** {r.get('window_start') or r['report_date']} → {r.get('window_end') or r['report_date']}  \n**Submitted:** {sub}  \n**Status:** {r['status']}  \n**Timing:** {_timing_status_label(r.get('timing_status')) if str(r.get('timing_status') or '').strip() else '—'}")
                     with st.expander('Report details', expanded=False):
-                        st.markdown(f"**Site Activities**\n\n{r.get('site_activities') or '—'}")
-                        st.markdown(f"**Reinforcement Observations**\n\n{r.get('reinforcement_observations') or '—'}")
-                        st.markdown(f"**Concrete / Test Observations**\n\n{r.get('concrete_observations') or '—'}")
+                        rendered_structured = _render_biweekly_structured_details(r.to_dict())
+                        if not rendered_structured:
+                            st.markdown(f"**Site Activities**\n\n{r.get('site_activities') or '—'}")
+                            st.markdown(f"**Reinforcement Observations**\n\n{r.get('reinforcement_observations') or '—'}")
+                            st.markdown(f"**Concrete / Test Observations**\n\n{r.get('concrete_observations') or '—'}")
                         st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
                         st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
                         st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
