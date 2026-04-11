@@ -4988,33 +4988,34 @@ def page_projects():
                 default_start = safe_parse_date(edit_report.get('window_start'), current_cycle['window_start'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_start'] if current_cycle is not None else date.today())
                 default_end = safe_parse_date(edit_report.get('window_end'), current_cycle['window_end'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_end'] if current_cycle is not None else date.today())
                 default_due = safe_parse_date(edit_report.get('due_date'), current_cycle['due_date'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['due_date'] if current_cycle is not None else date.today())
+                st.markdown("#### Complete report in WorkNest")
+                st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
+                if edit_report is not None and str(edit_report.get("status") or "").upper() == "NEEDS_REVISION":
+                    st.warning(f"Revision requested: {edit_report.get('review_note') or 'Please review and update this report before resubmitting.'}")
+                cmeta1, cmeta2, cmeta3 = st.columns(3)
+                cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
+                cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
+                cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
+                report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
+                structured_existing = _normalize_biweekly_structured_payload(edit_report.get('structured_report_json') if edit_report is not None else None)
+                default_selected_modules = structured_existing.get("selected_modules") or []
+                module_options = list(_BIWEEKLY_MODULES.keys())
+                selected_modules = st.multiselect(
+                    "Observed structural activities",
+                    options=module_options,
+                    default=default_selected_modules,
+                    format_func=lambda k: _BIWEEKLY_MODULES[k]["label"],
+                    key=f"bw_modules_{pid}",
+                    help="Select only the activities actually observed on site for this reporting visit.",
+                )
+                if selected_modules:
+                    st.caption("Complete the compliance checkpoints for each observed activity.")
+                else:
+                    st.info("Select at least one observed activity to open the structured inspection sections.")
+
                 with st.form(f"bw_form_{pid}"):
-                    st.markdown("#### Complete report in WorkNest")
-                    st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
-                    if edit_report is not None and str(edit_report.get("status") or "").upper() == "NEEDS_REVISION":
-                        st.warning(f"Revision requested: {edit_report.get('review_note') or 'Please review and update this report before resubmitting.'}")
-                    cmeta1, cmeta2, cmeta3 = st.columns(3)
-                    cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
-                    cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
-                    cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
-                    report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
                     report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
-                    structured_existing = _normalize_biweekly_structured_payload(edit_report.get('structured_report_json') if edit_report is not None else None)
-                    default_selected_modules = structured_existing.get("selected_modules") or []
-                    module_options = list(_BIWEEKLY_MODULES.keys())
-                    selected_modules = st.multiselect(
-                        "Observed structural activities",
-                        options=module_options,
-                        default=default_selected_modules,
-                        format_func=lambda k: _BIWEEKLY_MODULES[k]["label"],
-                        key=f"bw_modules_{pid}",
-                        help="Select only the activities actually observed on site for this reporting visit.",
-                    )
                     structured_payload = {"selected_modules": selected_modules, "modules": {}}
-                    if selected_modules:
-                        st.caption("Complete the compliance checkpoints for each observed activity.")
-                    else:
-                        st.info("Select at least one observed activity to open the structured inspection sections.")
                     for module_key in selected_modules:
                         meta = _BIWEEKLY_MODULES[module_key]
                         module_state = structured_existing["modules"].get(module_key, _biweekly_default_module_state(module_key))
