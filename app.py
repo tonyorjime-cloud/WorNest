@@ -14,6 +14,7 @@ def _fix_attachment_id_sequences():
 
 # ===== SMS =====
 import os, requests, base64
+import textwrap
 
 SMS_ENABLED = os.getenv("SMS_ENABLED", "false").strip().lower() == "true"
 TERMII_API_KEY = os.getenv("TERMII_API_KEY", "").strip()
@@ -3169,6 +3170,158 @@ def _legacy_sections_from_structured(payload: dict, hse_text: str = "", rfi_text
         "general_remarks": general_text,
     }
 
+
+def _biweekly_reports_period_summary(cycle_no: int):
+    active_projects = fetch_df("""
+        SELECT id, code, name
+        FROM projects
+        WHERE COALESCE(status,'ACTIVE')!='DORMANT'
+        ORDER BY code
+    """)
+    expected_rows = []
+    for _, pr in active_projects.iterrows():
+        try:
+            pid = int(pr.get("id") or 0)
+        except Exception:
+            continue
+        first_idx = _project_first_cycle_index(pid)
+        target = None
+        for idx in range(first_idx, first_idx + 500):
+            cyc = _biweekly_cycle_from_index(idx)
+            if int(cyc.get("cycle_no") or 0) == int(cycle_no):
+                target = cyc
+                break
+        if target is None:
+            continue
+        expected_rows.append({
+            "project_id": pid,
+            "project_code": str(pr.get("code") or ""),
+            "project_name": str(pr.get("name") or ""),
+            "due_date": target.get("due_date").isoformat() if target.get("due_date") else "",
+            "window_start": target.get("window_start").isoformat() if target.get("window_start") else "",
+            "window_end": target.get("window_end").isoformat() if target.get("window_end") else "",
+        })
+    expected_df = pd.DataFrame(expected_rows)
+    reports_df = fetch_df(
+        """
+        SELECT r.*, p.code AS project_code, p.name AS project_name,
+               s.name AS uploader_name, s.email AS uploader_email
+        FROM biweekly_reports r
+        LEFT JOIN projects p ON p.id=r.project_id
+        LEFT JOIN staff s ON s.id=r.uploader_staff_id
+        WHERE COALESCE(r.status,'PENDING') != 'REJECTED'
+          AND r.cycle_no=?
+        ORDER BY COALESCE(r.updated_at, r.uploaded_at, r.report_date) DESC, r.id DESC
+        """,
+        (int(cycle_no),)
+    )
+    latest_rows = []
+    if reports_df is not None and not reports_df.empty:
+        reports_df = reports_df.sort_values(by=["project_id", "id"], ascending=[True, False])
+        latest_rows = list(reports_df.drop_duplicates(subset=["project_id"], keep="first").to_dict("records"))
+    reports_by_project = {int(r.get("project_id") or 0): r for r in latest_rows}
+
+    covered_projects = []
+    missing_projects = []
+    activity_counts = {meta["label"]: 0 for meta in _BIWEEKLY_MODULES.values()}
+    non_compliance_rows = []
+    status_counter = {}
+    timing_counter = {}
+    total_non_compliance = 0
+    total_hse_flagged = 0
+    total_rfi_flagged = 0
+
+    for _, exp in expected_df.iterrows():
+        pid = int(exp.get("project_id") or 0)
+        row = reports_by_project.get(pid)
+        if not row:
+            missing_projects.append({
+                "Project Code": exp.get("project_code") or "",
+                "Project Name": exp.get("project_name") or "",
+                "Window": f"{exp.get('window_start') or ''} → {exp.get('window_end') or ''}",
+                "Due Date": exp.get("due_date") or "",
+            })
+            continue
+        payload = _normalize_biweekly_structured_payload(row.get("structured_report_json"))
+        selected = payload.get("selected_modules") or []
+        nc_count = 0
+        nc_items = []
+        for module_key in selected:
+            label = _BIWEEKLY_MODULES[module_key]["label"]
+            activity_counts[label] = activity_counts.get(label, 0) + 1
+            module_state = payload["modules"].get(module_key, {})
+            for field_key, check_label in _BIWEEKLY_MODULES[module_key].get("checks", []):
+                val = str((module_state.get("checks") or {}).get(field_key) or "")
+                if val == "Non-compliant":
+                    nc_count += 1
+                    total_non_compliance += 1
+                    nc_items.append(f"{label} - {check_label}")
+                    non_compliance_rows.append({
+                        "Project": f"{row.get('project_code') or ''} - {row.get('project_name') or ''}".strip(' -'),
+                        "Module": label,
+                        "Checkpoint": check_label,
+                        "Status": val,
+                        "Report Status": row.get("status") or "",
+                    })
+        hse_text = str(row.get("hse_observations") or "").strip()
+        rfi_text = str(row.get("rfi_notes") or "").strip()
+        if hse_text:
+            total_hse_flagged += 1
+        if rfi_text:
+            total_rfi_flagged += 1
+        report_status = str(row.get("status") or "PENDING")
+        timing_status = _timing_status_label(row.get("timing_status") or "")
+        status_counter[report_status] = status_counter.get(report_status, 0) + 1
+        timing_counter[timing_status] = timing_counter.get(timing_status, 0) + 1
+        covered_projects.append({
+            "Project Code": row.get("project_code") or "",
+            "Project Name": row.get("project_name") or "",
+            "Submitted By": row.get("uploader_name") or row.get("uploader_email") or "",
+            "Submitted": row.get("uploaded_at") or row.get("submitted_on") or row.get("report_date") or "",
+            "Status": report_status,
+            "Timing": timing_status,
+            "Activities": ", ".join(_BIWEEKLY_MODULES[m]["label"] for m in selected) if selected else str(row.get("site_activities") or ""),
+            "Non-compliance Count": nc_count,
+            "HSE Flag": "Yes" if hse_text else "No",
+            "RFI/EI Flag": "Yes" if rfi_text else "No",
+            "Non-compliance Items": "; ".join(nc_items),
+        })
+
+    activity_df = pd.DataFrame([
+        {"Activity": k, "Reports Covering Activity": v}
+        for k, v in activity_counts.items() if v > 0
+    ])
+    if not activity_df.empty:
+        activity_df = activity_df.sort_values(by=["Reports Covering Activity", "Activity"], ascending=[False, True])
+
+    summary = {
+        "cycle_no": int(cycle_no),
+        "projects_expected": int(len(expected_df)),
+        "reports_submitted": int(len(covered_projects)),
+        "missing_reports": int(len(missing_projects)),
+        "total_non_compliance": int(total_non_compliance),
+        "hse_flags": int(total_hse_flagged),
+        "rfi_flags": int(total_rfi_flagged),
+        "status_breakdown": status_counter,
+        "timing_breakdown": timing_counter,
+        "window": "",
+    }
+    if not expected_df.empty:
+        try:
+            ws = sorted(set(str(v) for v in expected_df["window_start"].dropna().tolist()))
+            we = sorted(set(str(v) for v in expected_df["window_end"].dropna().tolist()))
+            dd = sorted(set(str(v) for v in expected_df["due_date"].dropna().tolist()))
+            summary["window"] = f"{ws[0] if ws else ''} → {we[-1] if we else ''} | Due: {dd[-1] if dd else ''}"
+        except Exception:
+            pass
+    return {
+        "summary": summary,
+        "covered_df": pd.DataFrame(covered_projects),
+        "missing_df": pd.DataFrame(missing_projects),
+        "activity_df": activity_df,
+        "non_compliance_df": pd.DataFrame(non_compliance_rows),
+    }
+
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -3184,53 +3337,65 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
-    x = 18 * mm
-    y = height - 18 * mm
-    usable_width = width - (2 * x)
+    left = 15 * mm
+    right = 15 * mm
+    top = 15 * mm
+    bottom = 15 * mm
+    y = height - top
+    usable_width = width - left - right
+    page_no = 0
 
-    def ensure_space(required_height_mm=0):
-        nonlocal y
-        if y < (18 + required_height_mm) * mm:
+    def draw_page_frame(title: str = "Biweekly Report"):
+        c.setLineWidth(0.5)
+        c.setFont("Times-Bold", 14)
+        c.drawString(left, height - 12 * mm, _safe_pdf_text(title)[:120])
+        c.setFont("Times-Roman", 9)
+        c.drawRightString(width - right, height - 12 * mm, f"Page {page_no}")
+        c.line(left, height - 14 * mm, width - right, height - 14 * mm)
+        c.line(left, bottom - 2 * mm, width - right, bottom - 2 * mm)
+        footer = f"Project: {_safe_pdf_text(project_name)[:85]}"
+        c.drawString(left, bottom - 6 * mm, footer)
+
+    def new_page(title: str = "Biweekly Report"):
+        nonlocal y, page_no
+        if page_no > 0:
             c.showPage()
-            y = height - 18 * mm
+        page_no += 1
+        draw_page_frame(title)
+        y = height - 22 * mm
 
-    def line(text="", size=10, gap=6):
+    def ensure_space(required_height_mm=0, title: str = "Biweekly Report"):
         nonlocal y
-        ensure_space(gap + 2)
-        c.setFont("Times-Roman", size)
-        c.drawString(x, y, _safe_pdf_text(text)[:170])
+        if y < bottom + (required_height_mm * mm):
+            new_page(title)
+
+    def line(text="", size=10, gap=5, font="Times-Roman"):
+        nonlocal y
+        ensure_space(gap + 3)
+        c.setFont(font, size)
+        c.drawString(left, y, _safe_pdf_text(text)[:175])
         y -= gap * mm
 
     def draw_wrapped_text(title, body):
         nonlocal y
-        ensure_space(12)
+        body = _safe_pdf_text(body)
+        ensure_space(14)
         c.setFont("Times-Bold", 11)
-        c.drawString(x, y, _safe_pdf_text(title))
+        c.drawString(left, y, _safe_pdf_text(title)[:100])
         y -= 5 * mm
-        text_obj = c.beginText(x, y)
-        text_obj.setFont("Times-Roman", 10)
-        for raw_line in _safe_pdf_text(body).splitlines() or [""]:
-            line_text = raw_line
-            while len(line_text) > 105:
-                text_obj.textLine(line_text[:105])
-                line_text = line_text[105:]
-                y -= 4.5 * mm
-                if y < 25 * mm:
-                    c.drawText(text_obj)
-                    c.showPage()
-                    y = height - 18 * mm
-                    text_obj = c.beginText(x, y)
-                    text_obj.setFont("Times-Roman", 10)
-            text_obj.textLine(line_text)
-            y -= 4.5 * mm
-            if y < 25 * mm:
-                c.drawText(text_obj)
-                c.showPage()
-                y = height - 18 * mm
-                text_obj = c.beginText(x, y)
-                text_obj.setFont("Times-Roman", 10)
-        c.drawText(text_obj)
-        y -= 3 * mm
+        wrapped_lines = []
+        for raw_line in body.splitlines() or [""]:
+            raw_line = raw_line or ""
+            segments = textwrap.wrap(raw_line, width=112, break_long_words=True, break_on_hyphens=False) or [""]
+            wrapped_lines.extend(segments)
+        if not wrapped_lines:
+            wrapped_lines = [""]
+        for item in wrapped_lines:
+            ensure_space(6)
+            c.setFont("Times-Roman", 10)
+            c.drawString(left, y, item[:190])
+            y -= 4.6 * mm
+        y -= 1.5 * mm
 
     def _iter_attachment_records(df):
         if df is None or getattr(df, "empty", True):
@@ -3245,45 +3410,58 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
         rows = _iter_attachment_records(df)
         if not rows:
             return
-        c.showPage()
-        y = height - 18 * mm
+        slot_gap = 6 * mm
+        slot_caption = 8 * mm
+        slot_height = ((height - top - bottom - 18 * mm) / 2.0) - slot_gap
+        max_img_height = slot_height - slot_caption
+        max_img_width = usable_width
+        current_slot = 0
+        new_page("Biweekly Report - Attachments")
         c.setFont("Times-Bold", 12)
-        c.drawString(x, y, "Attachments / Photos")
+        c.drawString(left, y, "Attachments / Photos")
         y -= 8 * mm
-        for row in rows:
+        for idx, row in enumerate(rows, start=1):
             path = str(row.get("file_path") or "").strip()
             cap = str(row.get("caption") or "").strip()
-            if not path:
-                continue
+            if current_slot == 2:
+                current_slot = 0
+                new_page("Biweekly Report - Attachments")
+                c.setFont("Times-Bold", 12)
+                c.drawString(left, y, "Attachments / Photos")
+                y -= 8 * mm
+            slot_top = y
             ext = os.path.splitext(path)[1].lower()
-            if cap:
-                line(f"Caption: {cap}", 10, 5)
+            caption_text = f"Photo {idx}: {cap}" if cap else f"Photo {idx}"
+            c.setFont("Times-Roman", 9)
+            c.drawString(left, slot_top, _safe_pdf_text(caption_text)[:170])
+            img_bottom = slot_top - slot_caption - max_img_height
             if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} or not os.path.exists(path):
-                line(f"File: {os.path.basename(path)}", 10, 5)
-                continue
-            try:
-                with Image.open(path) as img:
-                    img = ImageOps.exif_transpose(img)
-                    if img.mode not in ("RGB", "L"):
-                        img = img.convert("RGB")
-                    img_w, img_h = img.size
-                    if not img_w or not img_h:
-                        raise ValueError("Invalid image size")
-                    scale = min(float(usable_width) / float(img_w), float(120 * mm) / float(img_h))
-                    draw_w = img_w * scale
-                    draw_h = img_h * scale
-                    ensure_space((draw_h / mm) + 10)
-                    img_reader = ImageReader(img)
-                    c.drawImage(img_reader, x, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
-                    y -= draw_h + (4 * mm)
-            except (UnidentifiedImageError, OSError, ValueError):
-                line(f"File: {os.path.basename(path)}", 10, 5)
-            except Exception:
-                line(f"File: {os.path.basename(path)}", 10, 5)
+                c.setFont("Times-Italic", 9)
+                c.drawString(left, slot_top - 14 * mm, f"File unavailable: {os.path.basename(path) if path else 'missing file'}")
+            else:
+                try:
+                    with Image.open(path) as img:
+                        img = ImageOps.exif_transpose(img)
+                        if img.mode not in ("RGB", "L"):
+                            img = img.convert("RGB")
+                        img_w, img_h = img.size
+                        if not img_w or not img_h:
+                            raise ValueError("Invalid image size")
+                        scale = min(float(max_img_width) / float(img_w), float(max_img_height) / float(img_h))
+                        draw_w = img_w * scale
+                        draw_h = img_h * scale
+                        img_x = left + ((max_img_width - draw_w) / 2.0)
+                        img_y = img_bottom + ((max_img_height - draw_h) / 2.0)
+                        img_reader = ImageReader(img)
+                        c.rect(left, img_bottom, max_img_width, max_img_height)
+                        c.drawImage(img_reader, img_x, img_y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+                except Exception:
+                    c.setFont("Times-Italic", 9)
+                    c.drawString(left, slot_top - 14 * mm, f"Image could not be rendered: {os.path.basename(path)}")
+            y -= slot_height + slot_gap
+            current_slot += 1
 
-    c.setFont("Times-Bold", 14)
-    c.drawString(x, y, "Biweekly Report")
-    y -= 8 * mm
+    new_page("Biweekly Report")
 
     fields = [
         ("Project", project_name),
@@ -3296,7 +3474,7 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
         ("Timing", _timing_status_label(report_row.get("timing_status", ""))),
     ]
     for k, v in fields:
-        line(f"{k}: {v}", 10, 5)
+        line(f"{k}: {v}", 10, 4.5)
 
     y -= 2 * mm
     structured_payload = _normalize_biweekly_structured_payload(report_row.get("structured_report_json"))
@@ -3305,7 +3483,7 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     if selected_modules:
         sections.append(("Observed Activities", ", ".join(_BIWEEKLY_MODULES[m]["label"] for m in selected_modules)))
         for module_key in selected_modules:
-            sections.append((_BIWEEKLY_MODULES[module_key]["label"], "\n".join(_module_summary_lines(module_key, structured_payload["modules"][module_key]))))
+            PLACEHOLDER
     else:
         sections.extend([
             ("Site Activities", report_row.get("site_activities", "")),
@@ -3320,9 +3498,6 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
 
     for title, body in sections:
         draw_wrapped_text(title, body)
-        if y < 25 * mm:
-            c.showPage()
-            y = height - 18 * mm
 
     draw_attachment_images(attachments_df)
 
@@ -5963,6 +6138,55 @@ def page_admin_inbox():
                             st.caption("Download unavailable.")
 
     with tab_reports:
+        cyc_df = fetch_df("SELECT DISTINCT cycle_no FROM biweekly_reports WHERE cycle_no IS NOT NULL ORDER BY cycle_no DESC")
+        cycle_options = [int(v) for v in cyc_df["cycle_no"].dropna().tolist()] if cyc_df is not None and not cyc_df.empty else []
+        try:
+            current_cutoff = _report_cutoff_cycle_no(dt.date.today())
+            for extra in range(max(1, current_cutoff - 4), current_cutoff + 1):
+                if extra not in cycle_options:
+                    cycle_options.append(extra)
+            cycle_options = sorted(set(cycle_options), reverse=True)
+        except Exception:
+            cycle_options = sorted(set(cycle_options), reverse=True)
+        if cycle_options:
+            with st.expander("Period summary", expanded=True):
+                chosen_cycle = st.selectbox("Select biweekly report number", options=cycle_options, key="admin_biweekly_period_summary_cycle")
+                period_pack = _biweekly_reports_period_summary(int(chosen_cycle))
+                summary = period_pack["summary"]
+                if summary.get("window"):
+                    st.caption(summary["window"])
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Projects Covered", summary.get("reports_submitted", 0))
+                s2.metric("Expected Projects", summary.get("projects_expected", 0))
+                s3.metric("Missing Reports", summary.get("missing_reports", 0))
+                s4.metric("Non-compliance Items", summary.get("total_non_compliance", 0))
+                s5, s6 = st.columns(2)
+                with s5:
+                    st.markdown("**Activity breakdown**")
+                    if period_pack["activity_df"] is not None and not period_pack["activity_df"].empty:
+                        st.dataframe(period_pack["activity_df"], use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No structured activity data yet for this period.")
+                with s6:
+                    status_bits = []
+                    for k, v in (summary.get("status_breakdown") or {}).items():
+                        status_bits.append(f"{k}: {v}")
+                    for k, v in (summary.get("timing_breakdown") or {}).items():
+                        status_bits.append(f"{k}: {v}")
+                    st.markdown("**Submission profile**")
+                    st.write(" | ".join(status_bits) if status_bits else "No submissions yet.")
+                    st.write(f"HSE flags: {summary.get('hse_flags', 0)}")
+                    st.write(f"RFI/EI flags: {summary.get('rfi_flags', 0)}")
+                if period_pack["covered_df"] is not None and not period_pack["covered_df"].empty:
+                    with st.expander("Submitted reports in this period", expanded=False):
+                        st.dataframe(period_pack["covered_df"], use_container_width=True, hide_index=True)
+                if period_pack["missing_df"] is not None and not period_pack["missing_df"].empty:
+                    with st.expander("Missing reports", expanded=False):
+                        st.dataframe(period_pack["missing_df"], use_container_width=True, hide_index=True)
+                if period_pack["non_compliance_df"] is not None and not period_pack["non_compliance_df"].empty:
+                    with st.expander("Non-compliance register", expanded=False):
+                        st.dataframe(period_pack["non_compliance_df"], use_container_width=True, hide_index=True)
+
         df = fetch_df(
             """
             SELECT r.id, r.project_id, p.code AS project_code, p.name AS project_name,
