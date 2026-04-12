@@ -3094,11 +3094,21 @@ def _biweekly_default_module_state(module_key: str) -> dict:
 
 def _normalize_biweekly_structured_payload(raw_payload) -> dict:
     payload = {}
+    try:
+        if raw_payload is None or (not isinstance(raw_payload, dict) and pd.isna(raw_payload)):
+            raw_payload = None
+    except Exception:
+        pass
     if isinstance(raw_payload, dict):
         payload = raw_payload
+    elif isinstance(raw_payload, (bytes, bytearray)):
+        try:
+            payload = json.loads(raw_payload.decode("utf-8", errors="ignore"))
+        except Exception:
+            payload = {}
     elif raw_payload not in (None, ""):
         try:
-            payload = json.loads(raw_payload)
+            payload = json.loads(str(raw_payload))
         except Exception:
             payload = {}
     selected = payload.get("selected_modules") or []
@@ -3139,6 +3149,21 @@ def _module_summary_lines(module_key: str, module_state: dict) -> list[str]:
         lines.append(f"Remarks: {remarks}")
     return lines
 
+
+
+def _module_has_meaningful_content(module_key: str, module_state: dict) -> bool:
+    meta = _BIWEEKLY_MODULES.get(module_key, {})
+    checks = module_state.get("checks") if isinstance(module_state.get("checks"), dict) else {}
+    extras = module_state.get("extras") if isinstance(module_state.get("extras"), dict) else {}
+    for field_key, _ in meta.get("checks", []):
+        val = str(checks.get(field_key) or "").strip()
+        if val and val != "Not checked":
+            return True
+    for field_key, _ in meta.get("extras", []):
+        if str(extras.get(field_key) or "").strip():
+            return True
+    return bool(str(module_state.get("remarks") or "").strip())
+
 def _structured_module_markdown(module_key: str, module_state: dict) -> str:
     lines = _module_summary_lines(module_key, module_state)
     if not lines:
@@ -3158,13 +3183,18 @@ def _render_biweekly_structured_details(report_row: dict):
 def _legacy_sections_from_structured(payload: dict, hse_text: str = "", rfi_text: str = "", general_text: str = "") -> dict:
     payload = _normalize_biweekly_structured_payload(payload)
     selected = payload.get("selected_modules") or []
-    module_labels = [_BIWEEKLY_MODULES[m]["label"] for m in selected]
+    module_labels = [_BIWEEKLY_MODULES[m]["label"] for m in selected if m in _BIWEEKLY_MODULES]
     site_activities = ", ".join(module_labels) if module_labels else ""
-    module_blocks = {m: _structured_module_markdown(m, payload["modules"][m]) for m in selected}
+    module_blocks = {m: _structured_module_markdown(m, payload["modules"].get(m, {})) for m in selected}
+    reinforcement_keys = ["reinforcement_works", "formwork_inspection", "excavation_earthworks", "backfilling_compaction", "steel_trusses", "external_works"]
+    reinforcement_text = "\n\n".join([module_blocks[k] for k in reinforcement_keys if module_blocks.get(k)])
+    concrete_text = module_blocks.get("concrete_works") or ""
+    if not reinforcement_text:
+        reinforcement_text = "\n\n".join([module_blocks[k] for k in selected if k != "concrete_works" and module_blocks.get(k)])
     return {
         "site_activities": site_activities,
-        "reinforcement_observations": module_blocks.get("reinforcement") or module_blocks.get("formwork") or "",
-        "concrete_observations": module_blocks.get("concrete") or "",
+        "reinforcement_observations": reinforcement_text,
+        "concrete_observations": concrete_text,
         "hse_observations": hse_text,
         "rfi_notes": rfi_text,
         "general_remarks": general_text,
@@ -5946,7 +5976,7 @@ def page_tasks():
             COALESCE(SUM(CASE WHEN p.source IN ('biweekly','report') THEN p.points END), 0) AS report_points,
             COALESCE(SUM(CASE WHEN p.source = 'test' THEN p.points END), 0) AS test_points,
             COALESCE(SUM(p.points), 0) AS total_score,
-            COALESCE(SUM(CASE WHEN date(COALESCE(p.awarded_at, CURRENT_DATE)) >= date(?) AND date(COALESCE(p.awarded_at, CURRENT_DATE)) <= date(?) THEN p.points END), 0) AS monthly_score
+            COALESCE(SUM(CASE WHEN COALESCE(NULLIF(p.awarded_at, '')::date, CURRENT_DATE) >= date(?) AND COALESCE(NULLIF(p.awarded_at, '')::date, CURRENT_DATE) <= date(?) THEN p.points END), 0) AS monthly_score
         FROM staff s
         LEFT JOIN points p ON p.staff_id = s.id
         GROUP BY s.id, s.name, s.rank, s.section
