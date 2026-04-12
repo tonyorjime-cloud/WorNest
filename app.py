@@ -1,4 +1,34 @@
 
+def has_non_compliance(data):
+    for activity, fields in data.items():
+        if isinstance(fields, dict):
+            for v in fields.values():
+                if v == "Non-compliant":
+                    return True
+    return False
+
+def validate_concrete(data):
+    if "Concrete Works" not in data:
+        return True, ""
+
+    cw = data["Concrete Works"]
+
+    if not cw.get("batching_method"):
+        return False, "Concrete Works: Batching method is required."
+
+    if not cw.get("mix_ratio"):
+        return False, "Concrete Works: Mix ratio is required."
+
+    if cw.get("slump_test") == "Yes" and not cw.get("slump_result"):
+        return False, "Concrete Works: Slump result required."
+
+    if cw.get("cube_samples") == "Yes" and not cw.get("cube_count"):
+        return False, "Concrete Works: Cube count required."
+
+    return True, ""
+
+
+
 # ===== FIX ATTACHMENT ID AUTO-INCREMENT (Postgres) =====
 def _fix_attachment_id_sequences():
     try:
