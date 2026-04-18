@@ -9,3 +9,4 @@ streamlit-cookies-manager
 requests
 streamlit-javascript
 reportlab
+Pillow

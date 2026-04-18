@@ -1,34 +1,4 @@
-
-def has_non_compliance(data):
-    for activity, fields in data.items():
-        if isinstance(fields, dict):
-            for v in fields.values():
-                if v == "Non-compliant":
-                    return True
-    return False
-
-def validate_concrete(data):
-    if "Concrete Works" not in data:
-        return True, ""
-
-    cw = data["Concrete Works"]
-
-    if not cw.get("batching_method"):
-        return False, "Concrete Works: Batching method is required."
-
-    if not cw.get("mix_ratio"):
-        return False, "Concrete Works: Mix ratio is required."
-
-    if cw.get("slump_test") == "Yes" and not cw.get("slump_result"):
-        return False, "Concrete Works: Slump result required."
-
-    if cw.get("cube_samples") == "Yes" and not cw.get("cube_count"):
-        return False, "Concrete Works: Cube count required."
-
-    return True, ""
-
-
-
+﻿
 # ===== FIX ATTACHMENT ID AUTO-INCREMENT (Postgres) =====
 def _fix_attachment_id_sequences():
     try:
@@ -44,27 +14,13 @@ def _fix_attachment_id_sequences():
 
 # ===== SMS =====
 import os, requests, base64
+import traceback
 import textwrap
 
 SMS_ENABLED = os.getenv("SMS_ENABLED", "false").strip().lower() == "true"
 TERMII_API_KEY = os.getenv("TERMII_API_KEY", "").strip()
 TERMII_SENDER_ID = os.getenv("TERMII_SENDER_ID", "Worknest").strip()
 TERMII_CHANNEL = os.getenv("TERMII_CHANNEL", "generic").strip()
-
-
-def _normalize_ng(phone):
-    if not phone:
-        return None
-    p = str(phone).strip().replace(" ", "").replace("-", "")
-    if p.startswith("+"):
-        p = p[1:]
-    if p.startswith("234") and p.isdigit():
-        return p
-    if p.startswith("0") and len(p) == 11 and p.isdigit():
-        return "234" + p[1:]
-    if len(p) == 10 and p.isdigit():
-        return "234" + p
-    return p if p.isdigit() else None
 
 
 def _termii_send_one(phone, message):
@@ -153,7 +109,7 @@ try:
     from streamlit_javascript import st_javascript
 except Exception:
     st_javascript = None
-import os, hashlib, secrets, html, json
+import os, hashlib, secrets, html, json, hmac
 import datetime as dt
 import smtplib, ssl
 from email.message import EmailMessage
@@ -164,6 +120,111 @@ import pandas as pd, numpy as np, streamlit as st
 from streamlit_cookies_manager import CookieManager
 import uuid
 import streamlit.components.v1 as components
+from core.auth import current_staff_id, current_user, is_admin, user_role
+from core.dashboard_service import (
+    _dashboard_my_reports_df,
+    _dashboard_personal_perf_snapshot,
+    _dashboard_points_leaderboard_df,
+    _dashboard_recent_reports_df,
+    _dashboard_recent_tasks_df,
+    _dashboard_staff_of_month_df,
+    compliance_snapshot,
+    current_cycle_compliance_snapshot,
+    dashboard_summary_snapshot,
+    historical_compliance_snapshot,
+    my_current_cycle_compliance_snapshot,
+    obligations_snapshot,
+    unified_biweekly_snapshot,
+)
+from core.dates import (
+    _is_last_day_of_month,
+    _month_end,
+    _month_start,
+    _monthly_points_window,
+    _next_tuesday_after,
+    _parse_date,
+    _parse_date_safe,
+    _parse_iso,
+    _to_date_or_none,
+    _today,
+    _utcnow_iso,
+    safe_parse_date,
+)
+from core.db import (
+    DB_IS_POSTGRES,
+    DB_PATH,
+    DB_URL,
+    DATA_DIR,
+    UPLOAD_DIR,
+    USE_PG,
+    _adapt_query,
+    _fetch_df_cached,
+    execute,
+    fetch_df,
+    get_conn,
+)
+from core.labels import (
+    _biweekly_timing_status,
+    _editable_status,
+    _report_cycle_status_label,
+    _timing_status_label,
+    _timing_status_points,
+)
+from core.permissions import (
+    can_approve_leave,
+    can_assign_tasks,
+    can_confirm_task_completion,
+    can_import_csv,
+    can_manage_projects,
+    is_reviewer,
+    is_section_head,
+    is_sub_admin,
+)
+from core.projects_service import (
+    _biweekly_backfill_cutoff_cycle,
+    _biweekly_cycle_from_index,
+    _biweekly_start_date,
+    _current_biweekly_cycle,
+    _current_biweekly_cycle_no,
+    _project_current_due_cycle,
+    _project_first_cycle_index,
+    _project_is_dormant,
+    _project_meta,
+    _project_missing_historical_cycles,
+    _project_nonrejected_cycle_map,
+    _project_open_biweekly_cycle,
+    _project_report_rows,
+    can_upload_core_to_project,
+    can_upload_project_outputs,
+    file_download_button,
+    get_setting,
+    is_assigned_to_project,
+    save_uploaded_file,
+    set_setting,
+)
+from core.tasks_service import (
+    _task_points,
+    can_download_task_files,
+    can_upload_task_files,
+    current_staff_section,
+    run_task_reminders,
+    send_email,
+    send_push,
+    smtp_configured,
+)
+from core.utils import (
+    RANK_ORDER,
+    RANK_TO_INDEX,
+    _is_supported_pdf_image,
+    _normalize_handle_name,
+    _normalize_ng,
+    _pdf_error_value,
+    _safe_pdf_text,
+    has_non_compliance,
+    normalize_rank,
+    rank_index_safe,
+    validate_concrete,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -195,22 +256,6 @@ except Exception:
     RandomForestRegressor = None
     joblib = None
 
-try:
-    import psycopg2
-    import psycopg2.extras
-except Exception:
-    psycopg2 = None  # type: ignore
-
-import sqlite3
-
-# Database backend selection
-DB_URL = os.getenv('DATABASE_URL') or os.getenv('WORKNEST_DB_URL') or ''
-DB_IS_POSTGRES = bool(DB_URL.strip().lower().startswith(('postgres://','postgresql://')))
-# Backwards-compat alias used by older helper functions / branches
-# (Some parts of the app still reference USE_PG; keep it in sync with DB_IS_POSTGRES.)
-USE_PG = DB_IS_POSTGRES
-
-
 st.set_page_config(page_title="WorkNest Mini v3.2.4", layout="wide")
 # --- Persistent login (Remember me) ---
 cookies = CookieManager(prefix="worknest")
@@ -218,15 +263,6 @@ TOKEN_SALT = os.environ.get("WORKNEST_TOKEN_SALT") or os.environ.get("SECRET_KEY
 
 def _hash_token(raw: str) -> str:
     return hashlib.sha256((raw + TOKEN_SALT).encode("utf-8")).hexdigest()
-
-def _utcnow_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
-
-def _parse_iso(s: str):
-    try:
-        return dtparser.parse(s) if s else None
-    except Exception:
-        return None
 
 def try_auto_login_from_cookie():
     """
@@ -310,7 +346,7 @@ def clear_remember_cookie_and_token():
 
 # --- Navigation constants (avoid accidental indentation bugs) ---
 BASE_PAGES = ["🏠 Dashboard","🔎 Search","🏗️ Projects","🗂️ Tasks & Performance","🧳 Leave","📄 Leave Table","💬 Chat","⚙️ Account","❓ Help"]
-ADMIN_PAGES = ["👥 Staff","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights","📥 Admin Inbox"]
+ADMIN_PAGES = ["👥 Staff","📘 Office Diary","⬆️ Import CSVs","🔐 Access Control","🤖 ML / Insights","📥 Admin Inbox"]
 
 
 
@@ -369,7 +405,7 @@ def inject_mobile_drawer():
     components.html(
         """
         <div class="worknest-drawer-backdrop" id="wn_backdrop"></div>
-        <div class="worknest-drawer-btn" id="wn_drawer_btn">☰</div>
+        <div class="worknest-drawer-btn" id="wn_drawer_btn"></div>
         <script>
         (function(){
           function setOpen(v){
@@ -432,57 +468,7 @@ def inject_mobile_drawer():
         width=0
     )
 
-
-
-def safe_parse_date(v):
-    """Parse a date string safely; returns datetime.date or None."""
-    if v is None: return None
-    s=str(v).strip()
-    if not s or s.lower()=="nan": return None
-    try:
-        return dtparser.parse(s).date()
-    except Exception:
-        return None
-
 APP_TITLE="WorkNest Mini v3.2.4"
-# --- Storage paths (Render-safe) ---
-def _first_writable_dir(candidates):
-    for d in candidates:
-        if not d:
-            continue
-        try:
-            os.makedirs(d, exist_ok=True)
-            test_path=os.path.join(d, ".worknest_write_test")
-            with open(test_path, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(test_path)
-            return d
-        except Exception:
-            continue
-    return ""
-
-ENV_DATA_DIR=os.getenv("WORKNEST_DATA_DIR","").strip()
-# Prefer Render persistent disk if present. If you mount a disk at /var/data,
-# files written under /var/data will survive redeploys/restarts.
-RENDER_DISK_DIR = "/var/data/worknest_data"
-DEFAULT_LOCAL_DATA = RENDER_DISK_DIR if os.path.isdir("/var/data") else os.path.join(os.getcwd(), "data")
-
-# If the env var points to /tmp (ephemeral on Render), ignore it and use the
-# persistent disk path instead.
-effective_env_dir = ENV_DATA_DIR
-if ENV_DATA_DIR.startswith("/tmp") and os.path.isdir("/var/data"):
-    effective_env_dir = ""
-
-DATA_DIR = _first_writable_dir([effective_env_dir, DEFAULT_LOCAL_DATA, os.getcwd()])
-
-DB_PATH=os.getenv('WORKNEST_DB_PATH', os.path.join(DATA_DIR,'worknest.db'))
-UPLOAD_DIR=os.getenv("WORKNEST_UPLOAD_DIR", os.path.join(DATA_DIR,"uploads"))
-
-
-# Ensure persistence paths exist
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 CORE_DOC_CATEGORIES=["architectural","structural","electrical","mechanical","soil_investigation","boq","program_of_work"]
 STAGES=["Substructure","Ground Floor","Typical Floor","Roof","External Works"]
 TEST_TYPES_DISPLAY=[
@@ -491,62 +477,6 @@ TEST_TYPES_DISPLAY=[
     ("steel","Steel Test (Batch)"),
     ("reinforcement","Reinforcement Test (Batch)"),
 ]
-RANK_ORDER=["Higher Technical Officer","Senior Technical Officer","Engineer II","Engineer I","Senior Engineer","Principal Engineer","Assistant Chief Engineer","Chief Engineer","Assistant Director"]
-RANK_TO_INDEX={r:i for i,r in enumerate(RANK_ORDER)}
-
-def normalize_rank(r):
-    if not r: return None
-    r=str(r).strip()
-    aliases={
-        "Asst. Director":"Assistant Director",
-        "Assistant Dir":"Assistant Director",
-        "Engr I":"Engineer I",
-        "Engr II":"Engineer II",
-        "Engineer 1":"Engineer I",
-        "Engineer 2":"Engineer II",
-    }
-    return aliases.get(r, r)
-
-def rank_index_safe(r):
-    rr=normalize_rank(r)
-    return RANK_TO_INDEX.get(rr, None)
-
-def get_conn():
-    if DB_IS_POSTGRES:
-        if not psycopg2:
-            raise RuntimeError("psycopg2 is not installed. Add psycopg2-binary to requirements.txt")
-        if not DB_URL:
-            raise RuntimeError("DATABASE_URL (or WORKNEST_DB_URL) is not set.")
-        return psycopg2.connect(DB_URL)
-    c=sqlite3.connect(DB_PATH, check_same_thread=False)
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
-
-
-def _adapt_query(q: str) -> str:
-    if DB_IS_POSTGRES:
-        return q.replace("?", "%s")
-    return q
-
-@st.cache_data(ttl=45, show_spinner=False)
-def _fetch_df_cached(q: str, params: tuple = ()):
-    q = _adapt_query(q)
-    c = get_conn()
-    try:
-        if DB_IS_POSTGRES:
-            with c.cursor() as cur:
-                cur.execute(q, params or ())
-                cols = [d[0] for d in (cur.description or [])]
-                rows = cur.fetchall() if cur.description else []
-            return pd.DataFrame(rows, columns=cols)
-        return pd.read_sql_query(q, c, params=params)
-    finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-
-
 @st.cache_resource(show_spinner=False)
 def ensure_runtime_initialized():
     init_db()
@@ -579,8 +509,47 @@ def _exec_script(cur, sql_script: str):
                 continue
             raise
 
-def hash_pwd(p):
+PBKDF2_ITERATIONS = 100_000
+PASSWORD_SALT_BYTES = 16
+
+
+def _legacy_hash_pwd(p):
     return hashlib.sha256(("worknest_salt_"+str(p)).encode("utf-8")).hexdigest()
+
+
+def _generate_password_salt() -> str:
+    return os.urandom(PASSWORD_SALT_BYTES).hex()
+
+
+def hash_pwd(p, salt: str | None = None):
+    salt_hex = str(salt or _generate_password_salt()).strip().lower()
+    salt_bytes = bytes.fromhex(salt_hex)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(p).encode("utf-8"),
+        salt_bytes,
+        PBKDF2_ITERATIONS,
+    ).hex()
+    return digest, salt_hex
+
+
+def verify_pwd(password, stored_hash, stored_salt=None) -> bool:
+    if stored_hash is None:
+        return False
+    stored_hash = str(stored_hash).strip()
+    stored_salt = "" if stored_salt is None else str(stored_salt).strip().lower()
+    if stored_salt:
+        try:
+            calc_hash, _ = hash_pwd(password, stored_salt)
+            return hmac.compare_digest(calc_hash, stored_hash)
+        except Exception:
+            return False
+    return hmac.compare_digest(_legacy_hash_pwd(password), stored_hash)
+
+
+def _generate_temporary_password(length: int = 16) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789@#_-"
+    return "".join(secrets.choice(alphabet) for _ in range(max(12, int(length))))
 
 def init_db():
     c = get_conn()
@@ -611,6 +580,7 @@ CREATE TABLE IF NOT EXISTS users (
   staff_id INTEGER REFERENCES staff(id) ON DELETE SET NULL,
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
+  password_salt TEXT,
   is_admin INTEGER DEFAULT 0,
   role TEXT DEFAULT 'staff',
   is_active INTEGER DEFAULT 1
@@ -907,6 +877,8 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
         # users: must_change_password
         if not _pg_has_column('users', 'must_change_password'):
             _pg_add_column("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+        if not _pg_has_column('users', 'password_salt'):
+            _pg_add_column("ALTER TABLE users ADD COLUMN password_salt TEXT")
 
         # password resets (for 'forgot password')
         cur.execute("""CREATE TABLE IF NOT EXISTS password_resets (
@@ -985,7 +957,7 @@ CREATE TABLE IF NOT EXISTS ml_predictions (
     else:
         sqlite_schema = """CREATE TABLE IF NOT EXISTS public_holidays (id INTEGER PRIMARY KEY, date TEXT NOT NULL, name TEXT);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT NOT NULL, rank TEXT NOT NULL, email TEXT UNIQUE, phone TEXT, section TEXT, role TEXT, grade TEXT, join_date TEXT, dob TEXT);
-CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, staff_id INTEGER, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, password_salt TEXT, is_admin INTEGER DEFAULT 0, role TEXT DEFAULT 'staff', is_active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, client TEXT, location TEXT, rebar_strength REAL, concrete_strength REAL, target_slump_min REAL, target_slump_max REAL, supervisor_staff_id INTEGER, start_date TEXT, end_date TEXT, next_due_date TEXT);
 CREATE TABLE IF NOT EXISTS project_staff (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, role TEXT, UNIQUE(project_id,staff_id));
 CREATE TABLE IF NOT EXISTS buildings (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, floors INTEGER DEFAULT 0);
@@ -1078,6 +1050,9 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
 
         try:
             cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
+            if "password_salt" not in cols:
+                cur.execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
+            cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
             if "must_change_password" not in cols:
                 cur.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
         except Exception:
@@ -1145,6 +1120,7 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
     # Ensure forward-compatible columns exist (older DBs may not have them yet)
     try:
         if DB_IS_POSTGRES:
+            execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_salt TEXT")
             execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password INTEGER DEFAULT 0")
             execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT")
             # Governance: approvals for uploads (reports/tests)
@@ -1171,6 +1147,8 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
 
         else:
             # SQLite: IF NOT EXISTS for columns is not supported; ignore errors
+            try: execute("ALTER TABLE users ADD COLUMN password_salt TEXT")
+            except Exception: pass
             try: execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
             except Exception: pass
             try: execute("ALTER TABLE users ADD COLUMN password_changed_at TEXT")
@@ -1243,6 +1221,18 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
                 execute(q)
             except Exception:
                 pass
+        execute(
+            """CREATE TABLE IF NOT EXISTS office_diary (
+                id INTEGER PRIMARY KEY,
+                entry_date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                note TEXT NOT NULL,
+                project_id INTEGER,
+                created_by_staff_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
     except Exception:
         pass
 
@@ -1251,90 +1241,25 @@ CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY, user_id INTE
         ucnt = fetch_df("SELECT COUNT(1) AS n FROM users")
         n = int(ucnt.iloc[0]["n"]) if not ucnt.empty else 0
         if n == 0:
+            bootstrap_password = (os.getenv("WORKNEST_BOOTSTRAP_PASSWORD") or "").strip() or _generate_temporary_password()
+            bootstrap_hash, bootstrap_salt = hash_pwd(bootstrap_password)
             sid = execute(
                 "INSERT INTO staff (name,rank,email,phone,section,role,grade,join_date) VALUES (?,?,?,?,?,?,?,?)",
                 ("Admin", "Assistant Director", "", "", "", "admin", "", ""),
             )
-            execute(
-                "INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active) VALUES (?,?,?,?,?,?)",
-                (sid, "admin", hash_pwd("fcda"), 1, "admin", 1),
-            )
+            try:
+                execute(
+                    "INSERT INTO users (staff_id,username,password_hash,password_salt,is_admin,role,is_active,must_change_password) VALUES (?,?,?,?,?,?,?,?)",
+                    (sid, "admin", bootstrap_hash, bootstrap_salt, 1, "admin", 1, 1),
+                )
+            except Exception:
+                execute(
+                    "INSERT INTO users (staff_id,username,password_hash,password_salt,is_admin,role,is_active) VALUES (?,?,?,?,?,?,?)",
+                    (sid, "admin", bootstrap_hash, bootstrap_salt, 1, "admin", 1),
+                )
+            print(f"WORKNEST BOOTSTRAP ADMIN PASSWORD: {bootstrap_password}")
     except Exception:
         pass
-def fetch_df(q, p=()):
-    params = tuple(p) if isinstance(p, (list, tuple)) else ((p,) if p not in (None, ()) else ())
-    return _fetch_df_cached(str(q), params)
-
-
-def safe_parse_date(val, default=None):
-    """Parse a date-like value defensively (handles None/'NaN'/bad strings)."""
-    from datetime import date as _date
-    if default is None:
-        default = _date.today()
-    if val is None:
-        return default
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return default
-    try:
-        return dtparser.parse(s).date()
-    except Exception:
-        return default
-
-def execute(q, p=()):
-    q=_adapt_query(q).strip()
-    c=get_conn()
-    try:
-        if DB_IS_POSTGRES:
-            with c:
-                with c.cursor() as cur:
-                    # Postgres compatibility: SQLite uses INSERT OR IGNORE
-                    if q.lower().startswith("insert or ignore"):
-                        q = "INSERT" + q[len("INSERT OR IGNORE"):]
-                        if " on conflict" not in q.lower():
-                            q = q.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-                    low=q.lower()
-
-                    # For INSERTs, we *optionally* try to fetch the new id (common for SERIAL PK tables).
-                    # We must use a SAVEPOINT because a failed RETURNING attempt aborts the transaction in Postgres.
-                    if low.startswith("insert") and "returning" not in low:
-                        cur.execute("SAVEPOINT sp_worknest_insert")
-                        q2=q.rstrip().rstrip(";")+" RETURNING id"
-                        try:
-                            cur.execute(q2, p)
-                            row=cur.fetchone()
-                            cur.execute("RELEASE SAVEPOINT sp_worknest_insert")
-                            return int(row[0]) if row else None
-                        except Exception as e:
-                            cur.execute("ROLLBACK TO SAVEPOINT sp_worknest_insert")
-                            cur.execute("RELEASE SAVEPOINT sp_worknest_insert")
-                            # Some tables (e.g., app_settings) don't have an 'id' column.
-                            msg=str(e)
-                            if ("does not exist" in msg.lower()) and ("id" in msg.lower()):
-                                cur.execute(q, p)
-                                return None
-                            # Fall back to plain execute for other RETURNING failures too.
-                            cur.execute(q, p)
-                            return None
-
-                    cur.execute(q, p)
-                    if "returning" in low:
-                        row=cur.fetchone()
-                        return int(row[0]) if row else None
-                    return None
-        else:
-            cur=c.cursor()
-            cur.execute(q, p)
-            c.commit()
-            return cur.lastrowid
-    finally:
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        try: c.close()
-        except Exception: pass
-
 def execute_sql(q, p=()):
     """Backward-compatible alias used by some pages."""
     return execute(q, p)
@@ -1502,43 +1427,6 @@ def onesignal_opt_out(app_id: str, external_user_id: str | None = None):
     )
 
 
-def send_push(external_user_ids, title: str, message: str):
-    """Send a push notification to OneSignal users identified by external_user_ids (emails).
-
-    Requires ONESIGNAL_APP_ID + ONESIGNAL_REST_API_KEY.
-    """
-    cfg = _onesignal_cfg()
-    app_id = cfg.get("app_id")
-    api_key = cfg.get("api_key")
-    if not app_id or not api_key:
-        return False
-    if not external_user_ids:
-        return False
-    # De-dup + sanitize
-    ids = [str(x).strip() for x in external_user_ids if str(x).strip()]
-    ids = list(dict.fromkeys(ids))
-    if not ids:
-        return False
-    try:
-        r = requests.post(
-            "https://onesignal.com/api/v1/notifications",
-            headers={
-                "Authorization": f"Basic {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "app_id": app_id,
-                "include_external_user_ids": ids,
-                "headings": {"en": title[:60]},
-                "contents": {"en": message[:240]},
-            },
-            timeout=10,
-        )
-        return bool(r.ok)
-    except Exception:
-        return False
-
-
 def _staff_emails_for_project(project_id: int):
     try:
         df = fetch_df(
@@ -1586,9 +1474,37 @@ def _admin_phones():
             """
         )
         vals = [str(x).strip() for x in df["phone"].tolist()] if not df.empty else []
-        return [x for x in vals if x]
-    except Exception:
+        phones = []
+        for x in vals:
+            nx = _normalize_ng(x)
+            if nx:
+                phones.append(nx)
+        phones = list(dict.fromkeys(phones))
+        if phones:
+            return phones
+        fallback = _normalize_ng("2348112812709")
+        if fallback:
+            print("BIWEEKLY ADMIN SMS FALLBACK:", {"recipients": [fallback]})
+            return [fallback]
         return []
+    except Exception:
+        fallback = _normalize_ng("2348112812709")
+        if fallback:
+            print("BIWEEKLY ADMIN SMS FALLBACK:", {"recipients": [fallback], "reason": "admin_phone_lookup_failed"})
+            return [fallback]
+        return []
+
+
+def _notify_admins_biweekly_submission(project_code: str, cycle_no, event_label: str):
+    admin_numbers = _admin_phones()
+    if not admin_numbers:
+        print("BIWEEKLY ADMIN SMS SKIP:", {"event": event_label, "reason": "no_admin_numbers"})
+        return {"ok": False, "reason": "no_admin_numbers", "event": event_label}
+    message = f"WorkNest: Biweekly report {event_label} for {project_code} - Report {int(cycle_no) if cycle_no is not None else 'N/A'}. Please review."
+    print("BIWEEKLY ADMIN SMS ATTEMPT:", {"event": event_label, "project_code": project_code, "cycle_no": cycle_no, "recipients": len(admin_numbers)})
+    result = _send_sms_notice(admin_numbers, message)
+    print("BIWEEKLY ADMIN SMS RESULT:", {"event": event_label, "project_code": project_code, "cycle_no": cycle_no, "result": result})
+    return result
 
 
 def _send_sms_notice(to_numbers, message: str):
@@ -1599,266 +1515,6 @@ def _send_sms_notice(to_numbers, message: str):
     except Exception as e:
         print("WORKNEST SMS NOTICE ERROR:", str(e))
         return {"ok": False, "reason": str(e)}
-
-def get_setting(key:str, default:str|None=None)->str|None:
-    """Read a setting from DB (app_settings)."""
-    try:
-        df = fetch_df("SELECT value FROM app_settings WHERE key=?", (key,))
-        if not df.empty:
-            v = df.iloc[0]["value"]
-            return None if v is None else str(v)
-    except Exception:
-        pass
-    return default
-
-def set_setting(key:str, value:str|None)->None:
-    """Upsert a setting."""
-    if value is None:
-        execute("DELETE FROM app_settings WHERE key=?", (key,))
-        return
-    if DB_IS_POSTGRES:
-        execute("""INSERT INTO app_settings(key,value) VALUES(?,?)
-                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
-    else:
-        execute("""INSERT OR REPLACE INTO app_settings(key,value) VALUES(?,?)""", (key, value))
-
-def _today()->dt.date:
-    return dt.date.today()
-
-def _parse_date_safe(s)->dt.date|None:
-    if s is None: 
-        return None
-    try:
-        s=str(s).strip()
-        if not s or s.lower() in ("nan","none","null"):
-            return None
-        return dtparser.parse(s).date()
-    except Exception:
-        return None
-
-
-def _parse_date(v):
-    """Backwards-compatible alias used by older perf code."""
-    return _parse_date_safe(v)
-
-def _biweekly_start_date()->dt.date:
-    """Global reporting anchor.
-
-    Prefer the explicit reset-aware BIWEEKLY_CYCLE_START_DATE setting. Fall back to
-    legacy BIWEEKLY_START_DATE for older deployments.
-    """
-    for key, fallback in (("BIWEEKLY_CYCLE_START_DATE", "2026-04-14"), ("BIWEEKLY_START_DATE", "2025-10-13")):
-        v = get_setting(key, fallback)
-        d = _parse_date_safe(v)
-        if d:
-            return d
-    return dt.date(2026, 4, 14)
-
-
-def _next_tuesday_after(d: dt.date) -> dt.date:
-    days_ahead = (1 - d.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    return d + dt.timedelta(days=days_ahead)
-
-
-def _biweekly_cycle_from_index(idx: int) -> dict:
-    """Return the live biweekly cycle keyed by due-date anchor.
-
-    BIWEEKLY_CYCLE_START_DATE is the first due date in the refreshed regime.
-    Each cycle covers the 14 days immediately preceding its due date, so if the
-    anchor is Tuesday 2026-04-14 then Report 1 covers 2026-03-31 → 2026-04-13
-    and is due on 2026-04-14.
-    """
-    due = _biweekly_start_date() + dt.timedelta(days=14 * idx)
-    end = due - dt.timedelta(days=1)
-    start = due - dt.timedelta(days=14)
-    return {
-        "cycle_no": idx + 1,
-        "window_start": start,
-        "window_end": end,
-        "due_date": due,
-    }
-
-
-def _biweekly_cycle_for_due(due_date: dt.date | None) -> dict | None:
-    if due_date is None:
-        return None
-    start = _biweekly_start_date()
-    idx = 0
-    while idx < 500:
-        cyc = _biweekly_cycle_from_index(idx)
-        if cyc["due_date"] == due_date:
-            return cyc
-        if cyc["due_date"] > due_date + dt.timedelta(days=21):
-            return None
-        idx += 1
-    return None
-
-
-def _biweekly_backfill_cutoff_cycle() -> int:
-    """First live cycle to enforce in the current regime.
-
-    After a reset anchored by BIWEEKLY_CYCLE_START_DATE, the live regime starts from
-    cycle 1 unless explicitly overridden.
-    """
-    try:
-        return int(get_setting("BIWEEKLY_LIVE_FROM_CYCLE", "1") or 1)
-    except Exception:
-        return 1
-
-
-@st.cache_data(ttl=45, show_spinner=False)
-def _project_meta(pid: int) -> dict:
-    df = fetch_df("SELECT id, start_date, COALESCE(status,'ACTIVE') AS status, dormant_since, dormant_reason FROM projects WHERE id=?", (int(pid),))
-    if df.empty:
-        return {"id": int(pid), "start_date": None, "status": "ACTIVE", "dormant_since": None, "dormant_reason": None}
-    return df.iloc[0].to_dict()
-
-
-def _project_is_dormant(pid: int) -> bool:
-    try:
-        return str(_project_meta(int(pid)).get("status") or "ACTIVE").upper() == "DORMANT"
-    except Exception:
-        return False
-
-
-def _project_first_cycle_index(pid: int) -> int:
-    meta = _project_meta(int(pid))
-    # After the global reset, projects with no usable start_date must still participate
-    # in Report 1. Using the due-date anchor as a fallback incorrectly skips them to
-    # Report 2, because cycle 1 ends the day before the due date. So default to the
-    # first live window start, not the due-date anchor.
-    first_live_cycle = _biweekly_cycle_from_index(max(0, _biweekly_backfill_cutoff_cycle() - 1))
-    fallback_start = first_live_cycle["window_start"]
-    sd = _parse_date_safe(meta.get("start_date")) or fallback_start
-    idx = 0
-    while idx < 500:
-        cyc = _biweekly_cycle_from_index(idx)
-        if cyc["window_end"] >= sd:
-            return idx
-        idx += 1
-    return 0
-
-
-def _project_nonrejected_cycle_map(pid: int) -> dict:
-    rdf = _project_report_rows(int(pid))
-    existing = {}
-    if not rdf.empty:
-        for _, rr in rdf.iterrows():
-            cyc_no = rr.get("cycle_no")
-            due = _parse_date_safe(rr.get("due_date") or rr.get("report_date"))
-            if cyc_no is None:
-                cyc = _biweekly_cycle_for_due(due)
-                cyc_no = cyc["cycle_no"] if cyc else None
-            try:
-                cyc_no = int(cyc_no)
-            except Exception:
-                continue
-            status = str(rr.get("status") or "PENDING").upper()
-            if status != "REJECTED":
-                existing[cyc_no] = status
-    return existing
-
-
-@st.cache_data(ttl=45, show_spinner=False)
-def _project_current_due_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
-    today = today or _today()
-    if _project_is_dormant(int(pid)):
-        return None, "Dormant project — reporting is ignored."
-    first_idx = _project_first_cycle_index(int(pid))
-    existing = _project_nonrejected_cycle_map(int(pid))
-    live_cutoff = _biweekly_backfill_cutoff_cycle()
-
-    upcoming_idx = None
-    for idx in range(first_idx, 500):
-        cyc = _biweekly_cycle_from_index(idx)
-        if cyc["cycle_no"] < live_cutoff:
-            continue
-        if today <= cyc["due_date"]:
-            upcoming_idx = idx
-            break
-    if upcoming_idx is None:
-        return None, "No reporting cycle available."
-
-    # If the immediately previous live cycle is unresolved, treat that as the overdue current obligation.
-    prev_idx = upcoming_idx - 1
-    if prev_idx >= first_idx:
-        prev = _biweekly_cycle_from_index(prev_idx)
-        if prev["cycle_no"] >= live_cutoff and prev["due_date"] < today and prev["cycle_no"] not in existing:
-            return prev, None
-
-    cyc = _biweekly_cycle_from_index(upcoming_idx)
-    if cyc["cycle_no"] in existing:
-        return None, "Current cycle already submitted."
-    return cyc, None
-
-
-def _project_missing_historical_cycles(pid: int, today: dt.date | None = None) -> list[dict]:
-    today = today or _today()
-    if _project_is_dormant(int(pid)):
-        return []
-    existing = _project_nonrejected_cycle_map(int(pid))
-    first_idx = _project_first_cycle_index(int(pid))
-    out = []
-    cutoff = _biweekly_backfill_cutoff_cycle()
-    for idx in range(first_idx, 500):
-        cyc = _biweekly_cycle_from_index(idx)
-        if cyc["cycle_no"] >= cutoff:
-            break
-        if cyc["due_date"] > today:
-            break
-        if cyc["cycle_no"] not in existing:
-            out.append(cyc)
-    return out
-
-
-@st.cache_data(ttl=45, show_spinner=False)
-def _project_report_rows(pid: int) -> pd.DataFrame:
-    return fetch_df(
-        """SELECT id, project_id, report_date, uploaded_at, submitted_on, COALESCE(status,'PENDING') AS status,
-                  cycle_no, window_start, window_end, due_date, timing_status
-           FROM biweekly_reports
-           WHERE project_id=?
-           ORDER BY date(COALESCE(due_date, report_date)) ASC, id ASC""",
-        (int(pid),),
-    )
-
-
-def _project_open_biweekly_cycle(pid: int, today: dt.date | None = None) -> tuple[dict | None, str | None]:
-    """Backward-compatible wrapper: return only the one live obligation the UI should care about."""
-    return _project_current_due_cycle(pid, today or _today())
-
-
-def _current_biweekly_cycle_no(today: dt.date | None = None) -> int:
-    """Return the cycle that is currently due next in the live regime.
-
-    The anchor date is the first due date, not the first window start. So before the
-    first due date arrives we are still in Report 1; the cycle only advances after
-    a due date has passed.
-    """
-    today = today or _today()
-    cutoff = _biweekly_backfill_cutoff_cycle()
-    for idx in range(max(0, cutoff - 1), 500):
-        cyc = _biweekly_cycle_from_index(idx)
-        if today <= cyc["due_date"]:
-            return int(cyc["cycle_no"])
-    return int(_biweekly_cycle_from_index(499)["cycle_no"])
-
-
-def _current_biweekly_cycle(today: dt.date | None = None) -> dict:
-    return _biweekly_cycle_from_index(max(0, _current_biweekly_cycle_no(today) - 1))
-
-
-def _monthly_points_window(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
-    today = today or _today()
-    start = today.replace(day=1)
-    if start.month == 12:
-        nxt = dt.date(start.year + 1, 1, 1)
-    else:
-        nxt = dt.date(start.year, start.month + 1, 1)
-    return start, (nxt - dt.timedelta(days=1))
-
 
 def _expected_report_rows(today: dt.date | None = None, month_start: dt.date | None = None, month_end: dt.date | None = None) -> pd.DataFrame:
     today = today or _today()
@@ -1969,52 +1625,40 @@ def _report_scoreboard(today: dt.date | None = None, month_start: dt.date | None
     return df.sort_values(['_score_sort','report_points','name'], ascending=[False,False,True]).drop(columns=['_score_sort'])
 
 
-def _biweekly_timing_status(due: dt.date | None, submitted: dt.date | None) -> str:
-    """Classify report timing using the live 3/2/1 regime."""
-    if due is None or submitted is None:
-        return "ON_TIME"
-    if submitted <= due:
-        return "ON_TIME"
-    if submitted <= (due + dt.timedelta(days=7)):
-        return "LATE"
-    return "VERY_LATE"
-
-
-def _timing_status_points(timing_status: str | None) -> int:
-    timing = str(timing_status or "").upper()
-    if timing == "VERY_LATE":
-        return 1
-    if timing == "LATE":
-        return 2
-    return 3
-
-
-def _timing_status_label(timing_status: str | None) -> str:
-    timing = str(timing_status or "").upper()
-    if timing == "VERY_LATE":
-        return "Very late"
-    if timing == "LATE":
-        return "Late"
-    if timing == "ON_TIME":
-        return "On time"
-    return "—"
-
-
-def _report_cycle_status_label(cycle: dict, submitted_on: dt.date | None = None) -> str:
-    if submitted_on is None:
-        return "Awaiting upload"
-    return _timing_status_label(_biweekly_timing_status(cycle.get("due_date"), submitted_on))
+def _canonical_approved_biweekly_report_id(project_id: int, cycle_no: int | None, preferred_report_id: int | None = None) -> int | None:
+    if cycle_no is None:
+        return int(preferred_report_id) if preferred_report_id is not None else None
+    approved_df = fetch_df(
+        """
+        SELECT id
+        FROM biweekly_reports
+        WHERE project_id=?
+          AND cycle_no=?
+          AND COALESCE(status,'PENDING')='APPROVED'
+        ORDER BY reviewed_at DESC, id DESC
+        """,
+        (int(project_id), int(cycle_no)),
+    )
+    if approved_df.empty:
+        return None
+    approved_ids = [int(x) for x in approved_df["id"].tolist() if pd.notna(x)]
+    return approved_ids[0] if approved_ids else None
 
 
 def _award_biweekly_points(report_id: int) -> None:
     df = fetch_df(
-        "SELECT project_id, due_date, report_date, uploaded_at, submitted_on, timing_status FROM biweekly_reports WHERE id=?",
+        "SELECT project_id, cycle_no, due_date, report_date, uploaded_at, submitted_on, timing_status FROM biweekly_reports WHERE id=?",
         (int(report_id),),
     )
     if df.empty:
         return
     r = df.iloc[0]
     pid = int(r["project_id"])
+    cycle_no = int(r["cycle_no"]) if pd.notna(r.get("cycle_no")) else None
+    if cycle_no is not None:
+        canonical_report_id = _canonical_approved_biweekly_report_id(pid, cycle_no, preferred_report_id=int(report_id))
+        if canonical_report_id != int(report_id):
+            return
     due = _parse_date_safe(r.get("due_date") or r.get("report_date"))
     submitted = _parse_date_safe(r.get("submitted_on")) or _parse_date_safe(r.get("uploaded_at")) or due or _today()
     timing = str(r.get("timing_status") or "").upper() or _biweekly_timing_status(due or submitted, submitted)
@@ -2036,29 +1680,49 @@ def _award_biweekly_points(report_id: int) -> None:
         )
 
 
+def _delete_biweekly_points(report_id: int) -> None:
+    execute("DELETE FROM points WHERE source='biweekly' AND source_id=?", (int(report_id),))
+
+
+def _sync_biweekly_points_for_report(report_id: int) -> None:
+    df = fetch_df("SELECT id, project_id, cycle_no FROM biweekly_reports WHERE id=?", (int(report_id),))
+    if df.empty:
+        return
+    r = df.iloc[0]
+    pid = int(r["project_id"])
+    cycle_no = int(r["cycle_no"]) if pd.notna(r.get("cycle_no")) else None
+    if cycle_no is None:
+        current_status = str(fetch_df("SELECT COALESCE(status,'PENDING') AS status FROM biweekly_reports WHERE id=?", (int(report_id),)).iloc[0]["status"] or "").upper()
+        _delete_biweekly_points(int(report_id))
+        if current_status == "APPROVED":
+            _award_biweekly_points(int(report_id))
+        return
+
+    execute(
+        """
+        DELETE FROM points
+        WHERE source='biweekly'
+          AND source_id IN (
+              SELECT id
+              FROM biweekly_reports
+              WHERE project_id=?
+                AND cycle_no=?
+          )
+        """,
+        (pid, cycle_no),
+    )
+    canonical_report_id = _canonical_approved_biweekly_report_id(pid, cycle_no, preferred_report_id=int(report_id))
+    if canonical_report_id is not None:
+        _award_biweekly_points(int(canonical_report_id))
+
+
 def approve_biweekly_report(report_id: int, approver_staff_id: int | None) -> None:
     ts = dt.datetime.utcnow().isoformat(sep=' ', timespec='seconds')
     execute(
         "UPDATE biweekly_reports SET status='APPROVED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
         (ts, approver_staff_id, int(report_id)),
     )
-    _award_biweekly_points(int(report_id))
-
-def _task_points(date_assigned, days_allotted:int, completed_date)->int:
-    da=_parse_date_safe(date_assigned)
-    cd=_parse_date_safe(completed_date)
-    if not da or not cd or not days_allotted:
-        return 0
-    days=(cd - da).days + 1
-    # Scoring rule (agreed):
-    # - completed within allotted duration: 3
-    # - completed within 1.5× duration: 2
-    # - completed after 1.5× duration (including >2×): 1
-    if days <= days_allotted:
-        return 3
-    if days <= int(np.ceil(1.5*days_allotted)):
-        return 2
-    return 1
+    _sync_biweekly_points_for_report(int(report_id))
 
 def _report_points(due:dt.date, submitted:dt.date)->int:
     return _timing_status_points(_biweekly_timing_status(due, submitted))
@@ -2129,20 +1793,6 @@ def compute_staff_activity_points(staff_id:int)->dict:
 
 # ---------- Performance Index (Monthly) ----------
 
-def _month_start(d:dt.date)->dt.date:
-    return dt.date(d.year, d.month, 1)
-
-def _month_end(d:dt.date)->dt.date:
-    ms=_month_start(d)
-    if ms.month==12:
-        nxt=dt.date(ms.year+1, 1, 1)
-    else:
-        nxt=dt.date(ms.year, ms.month+1, 1)
-    return nxt - dt.timedelta(days=1)
-
-def _is_last_day_of_month(d:dt.date)->bool:
-    return d == _month_end(d)
-
 def _perf_include_soft()->bool:
     return str(get_setting("PERF_INCLUDE_SOFT", "0") or "0").strip() in ("1","true","True","yes","YES")
 
@@ -2182,16 +1832,16 @@ def compute_monthly_base_points(month_start: dt.date) -> pd.DataFrame:
     """Compute per-staff points for the calendar month that contains month_start.
 
     Scoring rules:
-      • Tasks (completed in the selected month):
+       Tasks (completed in the selected month):
           - within allotted days  => 3 pts
-          - within 1.5× allotted  => 2 pts
-          - beyond 1.5×           => 1 pt
-      • Bi-weekly reports (APPROVED; due date (report_date) in the selected month):
+          - within 1.5 allotted  => 2 pts
+          - beyond 1.5           => 1 pt
+       Bi-weekly reports (APPROVED; due date (report_date) in the selected month):
           - uploaded_at <= report_date          => 3 pts
           - uploaded_at <= report_date + 7 days => 2 pts
           - otherwise                           => 1 pt
         Points are shared across all staff posted to that project.
-      • Test results (APPROVED; submitted_at in the selected month):
+       Test results (APPROVED; submitted_at in the selected month):
           - each approved submission => 3 pts (shared across all staff posted to the project)
     """
     ms = dt.date(month_start.year, month_start.month, 1)
@@ -2476,10 +2126,6 @@ def post_staff_of_month(month:dt.date, force:bool=False)->tuple[bool,str]:
 
     return (True, "Posted")
 
-def smtp_configured()->bool:
-    return bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
-
-
 import secrets
 
 def _hash_token(token:str)->str:
@@ -2510,128 +2156,6 @@ def consume_password_reset(token:str)->int|None:
     execute("UPDATE password_resets SET used=1 WHERE id=?", (int(row["id"]),))
     return int(row["user_id"])
 
-def send_email(to_email:str, subject:str, body:str)->tuple[bool,str]:
-    """Send plain-text email via SMTP. Requires env vars:
-    SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD, SMTP_FROM (optional), SMTP_TLS (default 1).
-    """
-    if not to_email:
-        return (False, "missing recipient")
-    host=os.getenv("SMTP_HOST","").strip()
-    port=int(os.getenv("SMTP_PORT","587").strip() or "587")
-    user=os.getenv("SMTP_USER","").strip()
-    pwd=os.getenv("SMTP_PASSWORD","").strip()
-    use_tls=(os.getenv("SMTP_TLS","1").strip() not in ["0","false","False"])
-    sender=os.getenv("SMTP_FROM", user).strip() or user
-    if not (host and user and pwd):
-        return (False, "SMTP not configured")
-
-    msg=EmailMessage()
-    msg["From"]=sender
-    msg["To"]=to_email
-    msg["Subject"]=subject
-    msg.set_content(body)
-
-    ctx=ssl.create_default_context()
-    try:
-        if use_tls:
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.login(user, pwd)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.login(user, pwd)
-                s.send_message(msg)
-        return (True, "sent")
-    except Exception as e:
-        return (False, f"{type(e).__name__}: {e}")
-
-def run_task_reminders(today:date|None=None, horizon_days:int=2)->dict:
-    """Checks due-soon and overdue tasks and sends email reminders once per day per assignment + type."""
-    if today is None: today=date.today()
-    today_s=str(today)
-
-    df=fetch_df("""
-        SELECT
-            ta.id AS assignment_id,
-            ta.status,
-            t.title,
-            t.due_date,
-            t.date_assigned,
-            s.name AS staff_name,
-            s.email AS staff_email,
-            p.code AS project_code,
-            p.name AS project_name
-        FROM task_assignments ta
-        JOIN tasks t ON t.id=ta.task_id
-        JOIN staff s ON s.id=ta.staff_id
-        LEFT JOIN projects p ON p.id=t.project_id
-        WHERE ta.status!='Completed'
-    """)
-    if df.empty:
-        return {"checked":0,"sent":0,"skipped":0,"errors":0}
-
-    sent=skipped=errors=0
-    for _,r in df.iterrows():
-        try:
-            due=dtparser.parse(r["due_date"]).date()
-        except Exception:
-            continue
-        days_to_due=(due - today).days
-        if days_to_due < 0:
-            rtype="overdue"
-        elif days_to_due <= horizon_days:
-            rtype="due_soon"
-        else:
-            continue
-
-        # dedupe per day
-        already=fetch_df("SELECT 1 FROM reminders_sent WHERE assignment_id=? AND reminder_type=? AND sent_on=?",
-                         (int(r["assignment_id"]), rtype, today_s))
-        if not already.empty:
-            continue
-
-        proj=""
-        if pd.notna(r.get("project_code")) and pd.notna(r.get("project_name")):
-            proj=f"{r['project_code']} — {r['project_name']}"
-        elif pd.notna(r.get("project_code")):
-            proj=str(r["project_code"])
-        subj=f"WorkNest: Task reminder ({'OVERDUE' if rtype=='overdue' else 'Due soon'}) — {r['title']}"
-        body_lines=[
-            f"Hello {r['staff_name']},",
-            "",
-            "This is an automated reminder from WorkNest.",
-            "",
-            f"Task: {r['title']}",
-            f"Due date: {due.isoformat()}",
-        ]
-        if proj:
-            body_lines.append(f"Project: {proj}")
-        if rtype=="overdue":
-            body_lines.append(f"Status: OVERDUE by {abs(days_to_due)} day(s)")
-        else:
-            body_lines.append(f"Status: Due in {days_to_due} day(s)")
-        body_lines += [
-            "",
-            "Please log into WorkNest to review the task details and attachments.",
-            "",
-            "— WorkNest"
-        ]
-        ok,msg=send_email(str(r.get("staff_email") or "").strip(), subj, "\n".join(body_lines))
-        if ok:
-            sent += 1
-            execute("INSERT OR IGNORE INTO reminders_sent (assignment_id, reminder_type, sent_on) VALUES (?,?,?)",
-                    (int(r["assignment_id"]), rtype, today_s))
-        else:
-            # We only log as 'sent' if actually sent; otherwise keep it eligible.
-            if msg=="missing recipient" or msg=="SMTP not configured":
-                skipped += 1
-            else:
-                errors += 1
-    return {"checked":int(len(df)),"sent":sent,"skipped":skipped,"errors":errors}
-
-
 def apply_styles():
     st.markdown("""<style>
     .worknest-header{background:linear-gradient(90deg,#00B09B,#96C93D);color:#fff;padding:12px 16px;border-radius:14px}
@@ -2642,64 +2166,6 @@ def apply_styles():
     .wn-mention{color:#1565c0;font-weight:700}
     .wn-chat-badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef6ff;color:#1565c0;font-size:.78rem;font-weight:700;margin-left:8px}
     </style>""", unsafe_allow_html=True)
-
-def current_user(): return st.session_state.get("user")
-def user_role():
-    u=current_user()
-    if not u: return None
-    r=(u.get('role') or '').strip()
-    if r: return r
-    # Backward compatibility
-    return 'admin' if int(u.get('is_admin',0) or 0)==1 else 'staff'
-
-def is_admin():
-    return user_role()=='admin' or int((current_user() or {}).get('is_admin',0) or 0)==1
-
-# Future-proof hook: if we later introduce a dedicated "reviewer" role, this is where it plugs in.
-def is_reviewer():
-    return is_admin()
-
-def is_sub_admin():
-    return user_role()=='sub_admin' or is_admin()
-
-def is_section_head():
-    return user_role()=='section_head' or is_admin()
-
-def can_import_csv():
-    return is_admin()
-
-def can_manage_projects():
-    # create/edit/delete projects
-    return is_admin()
-
-def can_upload_core_docs():
-    # Core project documents (drawings, approvals, etc.)
-    # Admin always. Sub-admin only when explicitly enabled.
-    if is_admin():
-        return True
-    return (user_role()=='sub_admin') and has_perm('can_upload_project_docs')
-
-def can_assign_tasks():
-    # Create/assign tasks
-    if is_admin():
-        return True
-    return (user_role()=='section_head') and has_perm('can_assign_tasks')
-
-def can_confirm_task_completion():
-    if is_admin():
-        return True
-    return (user_role()=='section_head') and has_perm('can_confirm_task_completion')
-
-def can_approve_leave():
-    return is_admin()
-
-def current_staff_id():
-    u=current_user()
-    if not u: return None
-    sid=u.get("staff_id")
-    try: return int(sid) if sid is not None else None
-    except: return None
-
 
 def current_user_id():
     """Backward-compatible alias for older code paths."""
@@ -2717,9 +2183,6 @@ def staff_lookup_options():
         except Exception:
             pass
     return out
-
-def _normalize_handle_name(name:str)->str:
-    return " ".join(str(name or "").strip().split()).lower()
 
 def chat_name_to_id_map():
     return {_normalize_handle_name(x["name"]): x["id"] for x in staff_lookup_options()}
@@ -2835,42 +2298,10 @@ def chat_mentions_map(message_ids:list[int]):
         })
     return out
 
-def _get_user_permissions(user_id:int)->dict:
-    if user_id is None:
-        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
-    df = fetch_df("SELECT can_assign_tasks, can_confirm_task_completion, can_upload_project_docs FROM user_permissions WHERE user_id=?", (int(user_id),))
-    if df.empty:
-        return {"can_assign_tasks":0,"can_confirm_task_completion":0,"can_upload_project_docs":0}
-    r = df.iloc[0].to_dict()
-    return {
-        "can_assign_tasks": int(r.get("can_assign_tasks") or 0),
-        "can_confirm_task_completion": int(r.get("can_confirm_task_completion") or 0),
-        "can_upload_project_docs": int(r.get("can_upload_project_docs") or 0),
-    }
-
-def has_perm(flag:str)->bool:
-    u = current_user()
-    if not u:
-        return False
-    if is_admin():
-        return True
-    perms = _get_user_permissions(int(u.get("id")))
-    return int(perms.get(flag) or 0)==1
-
-def current_staff_section()->str|None:
-    sid = current_staff_id()
-    if sid is None:
-        return None
-    df = fetch_df("SELECT section FROM staff WHERE id=?", (int(sid),))
-    if df.empty:
-        return None
-    sec = df["section"].iloc[0]
-    return str(sec).strip() if sec is not None else None
-
 # ---------- Auth ----------
 def login_ui():
     st.markdown(f"<h2 style='text-align:center'>{APP_TITLE}</h2>", unsafe_allow_html=True)
-    st.caption("Login with staff <b>email</b> (preferred) or <b>name</b>. Default password is <b>fcda</b>.", unsafe_allow_html=True)
+    st.caption("Login with staff <b>email</b> (preferred) or <b>name</b>.", unsafe_allow_html=True)
     username=st.text_input("Username (email or name)", key="login_user")
     password=st.text_input("Password", type="password", key="login_pwd")
     remember_me = st.checkbox("Remember me on this device", value=True, key="remember_me")
@@ -2889,7 +2320,7 @@ def login_ui():
                        WHERE LOWER(u.username)=LOWER(?) OR LOWER(COALESCE(s.email,''))=LOWER(?) OR LOWER(COALESCE(s.name,''))=LOWER(?)
                        LIMIT 1""", (u_in, u_in, u_in))
 
-        if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and u["password_hash"].iloc[0]==hash_pwd(password):
+        if (not u.empty) and int(u["is_active"].iloc[0] if "is_active" in u.columns else 1)==1 and verify_pwd(password, u["password_hash"].iloc[0], u["password_salt"].iloc[0] if "password_salt" in u.columns else None):
             st.session_state["user"]=dict(u.iloc[0])
             # Optional persistent login (Remember me)
             if remember_me:
@@ -2918,7 +2349,7 @@ def login_ui():
                 pass
             st.rerun()
         else:
-            st.error("Wrong password. Default is 'fcda' unless changed.")
+            st.error("Wrong username or password.")
 
 def logout_button():
     if st.sidebar.button("🚪 Logout", key="logout_btn"):
@@ -2960,73 +2391,6 @@ def is_assigned_to_task(task_id:int, staff_id:int|None=None)->bool:
     if sid is None: return False
     df=fetch_df("SELECT 1 FROM task_assignments WHERE task_id=? AND staff_id=?", (int(task_id), int(sid)))
     return (not df.empty)
-
-
-
-def is_assigned_to_project(project_id:int, staff_id:int|None=None)->bool:
-    sid = staff_id if staff_id is not None else current_staff_id()
-    if sid is None: return False
-    df=fetch_df("SELECT 1 FROM project_staff WHERE project_id=? AND staff_id=?", (int(project_id), int(sid)))
-    return (not df.empty)
-
-def can_upload_project_outputs(project_id:int)->bool:
-    # Reports + test results + other project outputs
-    # Admin anywhere.
-    if is_admin():
-        return True
-    # Sub-admin can upload project documents if explicitly permitted.
-    if user_role()=='sub_admin' and has_perm('can_upload_project_docs'):
-        return True
-    # Otherwise, only staff posted to the project.
-    return is_assigned_to_project(project_id)
-
-def can_upload_task_files(task_row:dict)->bool:
-    # task attachments: admin always; task creator or assignee can upload
-    if is_admin(): return True
-    sid=current_staff_id()
-    if sid is None: return False
-    try:
-        tid=int(task_row.get("id"))
-    except Exception:
-        return False
-    # Creator
-    try:
-        if int(task_row.get("created_by_staff_id") or -1)==sid:
-            return True
-    except Exception:
-        pass
-    # Any assignee
-    return is_assigned_to_task(tid, sid)
-
-def can_download_task_files(task_row:dict)->bool:
-    # same as upload for now
-    return can_upload_task_files(task_row) or is_section_head()
-
-def can_upload_core_to_project(project_id:int)->bool:
-    # core docs: admin + sub-admin only
-    return can_upload_core_docs()
-
-
-def save_uploaded_file(uploaded_file, subfolder=""):
-    if uploaded_file is None: return None
-    fname=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}"
-    folder=os.path.join(UPLOAD_DIR, subfolder) if subfolder else UPLOAD_DIR
-    os.makedirs(folder, exist_ok=True)
-    path=os.path.join(folder, fname)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return path
-
-def file_download_button(label, file_path, key):
-    try:
-        with open(file_path, "rb") as f:
-            data=f.read()
-        st.download_button(label, data=data, file_name=os.path.basename(file_path), key=key)
-    except Exception as e:
-        st.error(f"Missing file: {file_path}")
-
-def _editable_status(status: str | None) -> bool:
-    return str(status or "PENDING").upper() in {"DRAFT", "PENDING", "SUBMITTED", "NEEDS_REVISION"}
 
 
 
@@ -3112,11 +2476,23 @@ _BIWEEKLY_MODULES = {
     },
 }
 
+_BIWEEKLY_CHECK_EXTRA_RULES = {
+    ("concrete", "slump_test"): {"extra_key": "slump_result", "label": "Slump value", "required_status": "Compliant"},
+    ("concrete", "cube_samples"): {"extra_key": "cube_count", "label": "Number of cubes", "required_status": "Compliant"},
+}
+
+def _biweekly_check_extra_rule(module_key: str, field_key: str) -> dict | None:
+    return _BIWEEKLY_CHECK_EXTRA_RULES.get((module_key, field_key))
+
+def _biweekly_form_refresh():
+    return None
+
 def _biweekly_default_module_state(module_key: str) -> dict:
     meta = _BIWEEKLY_MODULES.get(module_key, {})
-    data = {"checks": {}, "extras": {}, "remarks": ""}
+    data = {"checks": {}, "check_details": {}, "extras": {}, "remarks": ""}
     for field_key, _ in meta.get("checks", []):
         data["checks"][field_key] = "Not checked"
+        data["check_details"][field_key] = ""
     for field_key, _ in meta.get("extras", []):
         options = meta.get("selects", {}).get(field_key)
         data["extras"][field_key] = options[0] if options else ""
@@ -3151,10 +2527,12 @@ def _normalize_biweekly_structured_payload(raw_payload) -> dict:
         base = _biweekly_default_module_state(module_key)
         incoming = modules.get(module_key) if isinstance(modules.get(module_key), dict) else {}
         checks_in = incoming.get("checks") if isinstance(incoming.get("checks"), dict) else {}
+        details_in = incoming.get("check_details") if isinstance(incoming.get("check_details"), dict) else {}
         extras_in = incoming.get("extras") if isinstance(incoming.get("extras"), dict) else {}
         for field_key in base["checks"]:
             val = checks_in.get(field_key, base["checks"][field_key])
             base["checks"][field_key] = val if val in _BIWEEKLY_STATUS_OPTIONS else "Not checked"
+            base["check_details"][field_key] = str(details_in.get(field_key) or "")
         for field_key in base["extras"]:
             base["extras"][field_key] = str(extras_in.get(field_key, base["extras"][field_key]) or "")
         base["remarks"] = str(incoming.get("remarks") or "")
@@ -3167,10 +2545,23 @@ def _structured_payload_to_json(payload: dict) -> str:
 def _module_summary_lines(module_key: str, module_state: dict) -> list[str]:
     meta = _BIWEEKLY_MODULES.get(module_key, {})
     lines = []
+    rendered_extras = set()
     for field_key, label in meta.get("checks", []):
         val = str((module_state.get("checks") or {}).get(field_key) or "Not checked")
         lines.append(f"{label}: {val}")
+        detail = str((module_state.get("check_details") or {}).get(field_key) or "").strip()
+        if detail:
+            lines.append(f"{label} reason/details: {detail}")
+        rule = _biweekly_check_extra_rule(module_key, field_key)
+        if rule:
+            extra_key = rule["extra_key"]
+            extra_val = str((module_state.get("extras") or {}).get(extra_key) or "").strip()
+            if extra_val:
+                lines.append(f"{rule['label']}: {extra_val}")
+            rendered_extras.add(extra_key)
     for field_key, label in meta.get("extras", []):
+        if field_key in rendered_extras:
+            continue
         val = str((module_state.get("extras") or {}).get(field_key) or "").strip()
         if val:
             lines.append(f"{label}: {val}")
@@ -3189,6 +2580,8 @@ def _module_has_meaningful_content(module_key: str, module_state: dict) -> bool:
         val = str(checks.get(field_key) or "").strip()
         if val and val != "Not checked":
             return True
+        if str((module_state.get("check_details") or {}).get(field_key) or "").strip():
+            return True
     for field_key, _ in meta.get("extras", []):
         if str(extras.get(field_key) or "").strip():
             return True
@@ -3197,7 +2590,7 @@ def _module_has_meaningful_content(module_key: str, module_state: dict) -> bool:
 def _structured_module_markdown(module_key: str, module_state: dict) -> str:
     lines = _module_summary_lines(module_key, module_state)
     if not lines:
-        return "—"
+        return ""
     return "\n".join([f"- {line}" for line in lines])
 
 def _render_biweekly_structured_details(report_row: dict):
@@ -3216,11 +2609,11 @@ def _legacy_sections_from_structured(payload: dict, hse_text: str = "", rfi_text
     module_labels = [_BIWEEKLY_MODULES[m]["label"] for m in selected if m in _BIWEEKLY_MODULES]
     site_activities = ", ".join(module_labels) if module_labels else ""
     module_blocks = {m: _structured_module_markdown(m, payload["modules"].get(m, {})) for m in selected}
-    reinforcement_keys = ["reinforcement_works", "formwork_inspection", "excavation_earthworks", "backfilling_compaction", "steel_trusses", "external_works"]
+    reinforcement_keys = ["reinforcement", "formwork", "excavation", "backfilling", "steel_trusses", "external_works"]
     reinforcement_text = "\n\n".join([module_blocks[k] for k in reinforcement_keys if module_blocks.get(k)])
-    concrete_text = module_blocks.get("concrete_works") or ""
+    concrete_text = module_blocks.get("concrete") or ""
     if not reinforcement_text:
-        reinforcement_text = "\n\n".join([module_blocks[k] for k in selected if k != "concrete_works" and module_blocks.get(k)])
+        reinforcement_text = "\n\n".join([module_blocks[k] for k in selected if k != "concrete" and module_blocks.get(k)])
     return {
         "site_activities": site_activities,
         "reinforcement_observations": reinforcement_text,
@@ -3298,7 +2691,7 @@ def _biweekly_reports_period_summary(cycle_no: int):
             missing_projects.append({
                 "Project Code": exp.get("project_code") or "",
                 "Project Name": exp.get("project_name") or "",
-                "Window": f"{exp.get('window_start') or ''} → {exp.get('window_end') or ''}",
+                "Window": f"{exp.get('window_start') or ''}  {exp.get('window_end') or ''}",
                 "Due Date": exp.get("due_date") or "",
             })
             continue
@@ -3371,7 +2764,7 @@ def _biweekly_reports_period_summary(cycle_no: int):
             ws = sorted(set(str(v) for v in expected_df["window_start"].dropna().tolist()))
             we = sorted(set(str(v) for v in expected_df["window_end"].dropna().tolist()))
             dd = sorted(set(str(v) for v in expected_df["due_date"].dropna().tolist()))
-            summary["window"] = f"{ws[0] if ws else ''} → {we[-1] if we else ''} | Due: {dd[-1] if dd else ''}"
+            summary["window"] = f"{ws[0] if ws else ''}  {we[-1] if we else ''} | Due: {dd[-1] if dd else ''}"
         except Exception:
             pass
     return {
@@ -3389,9 +2782,30 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-def _safe_pdf_text(v):
-    s = "" if v is None else str(v)
-    return s.replace("—", "-").replace("–", "-").replace("’", "'").replace("“", '"').replace("”", '"')
+def _merge_biweekly_pdf_images(report_row, attachments_df=None):
+    rows = []
+    seen = set()
+
+    def add_row(path: str, caption: str = ""):
+        p = str(path or "").strip()
+        if not p or not _is_supported_pdf_image(p):
+            return
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({"file_path": p, "caption": caption or ""})
+
+    add_row(report_row.get("file_path"), "Main report image")
+
+    if attachments_df is not None and not getattr(attachments_df, "empty", True):
+        try:
+            for row in attachments_df.to_dict("records"):
+                add_row(row.get("file_path"), str(row.get("caption") or "").strip())
+        except Exception:
+            pass
+
+    return rows
 
 def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name=""):
     buf = BytesIO()
@@ -3457,17 +2871,8 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
             y -= 4.6 * mm
         y -= 1.5 * mm
 
-    def _iter_attachment_records(df):
-        if df is None or getattr(df, "empty", True):
-            return []
-        try:
-            return list(df.to_dict("records"))
-        except Exception:
-            return []
-
-    def draw_attachment_images(df):
+    def draw_attachment_images(rows):
         nonlocal y
-        rows = _iter_attachment_records(df)
         if not rows:
             return
         slot_gap = 6 * mm
@@ -3490,12 +2895,11 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
                 c.drawString(left, y, "Attachments / Photos")
                 y -= 8 * mm
             slot_top = y
-            ext = os.path.splitext(path)[1].lower()
             caption_text = f"Photo {idx}: {cap}" if cap else f"Photo {idx}"
             c.setFont("Times-Roman", 9)
             c.drawString(left, slot_top, _safe_pdf_text(caption_text)[:170])
             img_bottom = slot_top - slot_caption - max_img_height
-            if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} or not os.path.exists(path):
+            if not os.path.exists(path):
                 c.setFont("Times-Italic", 9)
                 c.drawString(left, slot_top - 14 * mm, f"File unavailable: {os.path.basename(path) if path else 'missing file'}")
             else:
@@ -3546,7 +2950,7 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
             module_meta = _BIWEEKLY_MODULES.get(module_key, {})
             module_state = (structured_payload.get("modules") or {}).get(module_key) or {}
             module_lines = _module_summary_lines(module_key, module_state)
-            sections.append((module_meta.get("label", module_key), "\n".join(module_lines) if module_lines else "—"))
+            sections.append((module_meta.get("label", module_key), "\n".join(module_lines) if module_lines else ""))
     else:
         sections.extend([
             ("Site Activities", report_row.get("site_activities", "")),
@@ -3562,7 +2966,7 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
     for title, body in sections:
         draw_wrapped_text(title, body)
 
-    draw_attachment_images(attachments_df)
+    draw_attachment_images(_merge_biweekly_pdf_images(report_row, attachments_df))
 
     c.save()
     pdf_bytes = buf.getvalue()
@@ -3571,22 +2975,30 @@ def generate_biweekly_report_pdf(report_row, attachments_df=None, project_name="
 
 def _build_biweekly_pdf_file(report_row, project_name="", attachments_df=None):
     try:
-        project_id = int(report_row.get("project_id") or 0)
-        report_id = int(report_row.get("id") or 0)
-    except Exception:
-        project_id = 0
-        report_id = 0
-    folder = os.path.join(UPLOAD_DIR, f"project_{project_id}/reports") if project_id else os.path.join(UPLOAD_DIR, "reports")
-    os.makedirs(folder, exist_ok=True)
-    fname = f"biweekly_report_{report_id or datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    out_path = os.path.join(folder, fname)
-    pdf_bytes = generate_biweekly_report_pdf(report_row, attachments_df=attachments_df, project_name=project_name)
-    with open(out_path, "wb") as f:
-        f.write(pdf_bytes)
-    return out_path
+        try:
+            project_id = int(report_row.get("project_id") or 0)
+            report_id = int(report_row.get("id") or 0)
+        except Exception:
+            project_id = 0
+            report_id = 0
+        folder = os.path.join(UPLOAD_DIR, f"project_{project_id}/reports") if project_id else os.path.join(UPLOAD_DIR, "reports")
+        os.makedirs(folder, exist_ok=True)
+        fname = f"biweekly_report_{report_id or datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        out_path = os.path.join(folder, fname)
+        pdf_bytes = generate_biweekly_report_pdf(report_row, attachments_df=attachments_df, project_name=project_name)
+        with open(out_path, "wb") as f:
+            f.write(pdf_bytes)
+        return out_path
+    except Exception as e:
+        err_value = _pdf_error_value(e)
+        print("BIWEEKLY PDF BUILD ERROR:", err_value)
+        print(traceback.format_exc())
+        return err_value
 
 def _ensure_biweekly_pdf(report_row, project_name="", attachments_df=None):
     existing = str(report_row.get("report_pdf_path") or "").strip()
+    if existing.startswith(_PDF_ERROR_PREFIX):
+        existing = ""
     force_rebuild = attachments_df is not None
     if existing and os.path.exists(existing) and not force_rebuild:
         return existing
@@ -3595,13 +3007,24 @@ def _ensure_biweekly_pdf(report_row, project_name="", attachments_df=None):
         if report_row.get("id") is not None:
             execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (out_path, int(report_row.get("id"))))
         return out_path
-    except Exception:
-        return existing
+    except Exception as e:
+        err_value = _pdf_error_value(e)
+        print("BIWEEKLY PDF BUILD ERROR:", err_value)
+        print(traceback.format_exc())
+        if report_row.get("id") is not None:
+            try:
+                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (err_value, int(report_row.get("id"))))
+            except Exception:
+                pass
+        return err_value
 
 def render_pdf_preview_and_download(label_prefix: str, pdf_path: str):
     p = str(pdf_path or "").strip()
     if not p:
         st.caption("PDF not available yet.")
+        return
+    if p.startswith(_PDF_ERROR_PREFIX):
+        st.error(f"PDF generation failed. {p[len(_PDF_ERROR_PREFIX):]}")
         return
     if not os.path.exists(p):
         st.caption("PDF file could not be found.")
@@ -3616,9 +3039,10 @@ def render_pdf_preview_and_download(label_prefix: str, pdf_path: str):
     with st.expander("👁️ View PDF", expanded=False):
         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
         st.markdown(
-            f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="700" type="application/pdf"></iframe>',
+            f'<a href="data:application/pdf;base64,{b64}" target="_blank" rel="noopener noreferrer">Open PDF</a>',
             unsafe_allow_html=True,
         )
+        st.caption("Use Open PDF on mobile devices. The direct open link is more reliable than inline preview.")
 
 def _save_uploaded_bytes(uploaded_file, subfolder="", forced_name=None):
     if uploaded_file is None:
@@ -3663,6 +3087,7 @@ def _save_test_result_attachment(test_result_id: int, upload=None, caption: str 
                 (int(test_result_id), path, caption or '', datetime.now().isoformat(timespec='seconds'), current_staff_id()))
     return path
 
+@st.cache_data(ttl=45, show_spinner=False)
 def _attachment_rows(kind: str, parent_id: int):
     table = 'biweekly_report_attachments' if kind == 'biweekly' else 'test_result_attachments'
     idcol = 'report_id' if kind == 'biweekly' else 'test_result_id'
@@ -3670,6 +3095,22 @@ def _attachment_rows(kind: str, parent_id: int):
         return fetch_df(f"SELECT id,file_path,caption,uploaded_at FROM {table} WHERE {idcol}=? ORDER BY id", (int(parent_id),))
     except Exception:
         return pd.DataFrame(columns=['id','file_path','caption','uploaded_at'])
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _attachment_rows_bulk(kind: str, parent_ids: tuple[int, ...]):
+    if not parent_ids:
+        return pd.DataFrame(columns=['id', 'parent_id', 'file_path', 'caption', 'uploaded_at'])
+    table = 'biweekly_report_attachments' if kind == 'biweekly' else 'test_result_attachments'
+    idcol = 'report_id' if kind == 'biweekly' else 'test_result_id'
+    qmarks = ",".join(["?"] * len(parent_ids))
+    try:
+        return fetch_df(
+            f"SELECT id, {idcol} AS parent_id, file_path, caption, uploaded_at FROM {table} WHERE {idcol} IN ({qmarks}) ORDER BY {idcol}, id",
+            tuple(int(x) for x in parent_ids),
+        )
+    except Exception:
+        return pd.DataFrame(columns=['id', 'parent_id', 'file_path', 'caption', 'uploaded_at'])
 
 def _render_attachment_list(kind: str, parent_id: int, key_prefix: str):
     adf = _attachment_rows(kind, parent_id)
@@ -3685,17 +3126,6 @@ def _render_attachment_list(kind: str, parent_id: int, key_prefix: str):
                 st.markdown(f"**{nm}**" + (f"  \n{cap}" if cap else '') + (f"  \n*{stamp}*" if stamp else ''))
             with c2:
                 file_download_button('⬇️ File', str(ar.get('file_path') or ''), key=f"{key_prefix}_{int(ar['id'])}")
-
-def _to_date_or_none(val):
-    if val is None:
-        return None
-    if isinstance(val, dt.date):
-        return val
-    try:
-        return dtparser.parse(str(val)).date()
-    except Exception:
-        return None
-
 
 def log_login_event(user: dict | None, method: str = "password") -> None:
     """Best-effort login audit trail."""
@@ -3742,139 +3172,6 @@ def latest_login_activity() -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
 
-@st.cache_data(ttl=45, show_spinner=False)
-def obligations_snapshot(staff_id, today=None):
-    """Return lightweight dashboard obligations for a staff member."""
-    today = today or date.today()
-    today = _to_date_or_none(today) or date.today()
-    snap = {"tasks": [], "reports": [], "leave": [], "last_report": None}
-    if staff_id is None:
-        return snap
-    try:
-        sid = int(staff_id)
-    except Exception:
-        return snap
-
-    # Pending tasks
-    try:
-        tdf = fetch_df(
-            """
-            SELECT ta.id AS assignment_id, t.id AS task_id, t.title, t.due_date,
-                   p.code AS project_code, p.name AS project_name
-            FROM task_assignments ta
-            JOIN tasks t ON t.id=ta.task_id
-            LEFT JOIN projects p ON p.id=t.project_id
-            WHERE ta.staff_id=? AND COALESCE(ta.status,'In progress')!='Completed'
-            ORDER BY CASE WHEN t.due_date IS NULL OR t.due_date='' THEN 1 ELSE 0 END,
-                     date(t.due_date) ASC, ta.id DESC
-            LIMIT 10
-            """,
-            (sid,),
-        )
-        for _, row in tdf.iterrows():
-            due = _to_date_or_none(row.get("due_date"))
-            proj_bits = [str(row.get("project_code") or "").strip(), str(row.get("project_name") or "").strip()]
-            proj = " — ".join([x for x in proj_bits if x])
-            label = str(row.get("title") or "Task")
-            if proj:
-                label = f"{proj} — {label}"
-            snap["tasks"].append({
-                "assignment_id": row.get("assignment_id"),
-                "task_id": row.get("task_id"),
-                "label": label,
-                "due_date": due,
-                "days_left": ((due - today).days if due else None),
-            })
-    except Exception:
-        pass
-
-    # Outstanding report obligations (projects where the officer is posted)
-    try:
-        projects_df = fetch_df(
-            """
-            SELECT DISTINCT p.id, p.code, p.name
-            FROM project_staff ps
-            JOIN projects p ON p.id=ps.project_id
-            WHERE ps.staff_id=?
-            ORDER BY p.code, p.name
-            """,
-            (sid,),
-        )
-        for _, row in projects_df.iterrows():
-            pid = row.get("id")
-            if pd.isna(pid):
-                continue
-            cyc, reason = _project_open_biweekly_cycle(int(pid), today)
-            if not cyc:
-                continue
-            snap["reports"].append({
-                "project_id": int(pid),
-                "project": " — ".join([x for x in [str(row.get("code") or "").strip(), str(row.get("name") or "").strip()] if x]),
-                "project_code": str(row.get("code") or "").strip(),
-                "project_name": str(row.get("name") or "").strip(),
-                "cycle_no": int(cyc.get("cycle_no")),
-                "window_start": cyc.get("window_start"),
-                "window_end": cyc.get("window_end"),
-                "due_date": cyc.get("due_date"),
-                "days_left": ((cyc.get("due_date") - today).days if cyc.get("due_date") else None),
-                "reason": reason,
-            })
-    except Exception:
-        pass
-
-    # Upcoming relief duty where this staff is the relieving officer
-    try:
-        ldf = fetch_df(
-            """
-            SELECT l.start_date, l.end_date, s.name AS covering_name
-            FROM leaves l
-            LEFT JOIN staff s ON s.id=l.staff_id
-            WHERE l.relieving_staff_id=?
-              AND date(l.end_date) >= date(?)
-              AND COALESCE(l.status,'Pending') IN ('Pending','Approved')
-            ORDER BY date(l.start_date) ASC
-            LIMIT 5
-            """,
-            (sid, today.isoformat()),
-        )
-        for _, row in ldf.iterrows():
-            snap["leave"].append({
-                "start_date": _to_date_or_none(row.get("start_date")),
-                "end_date": _to_date_or_none(row.get("end_date")),
-                "covering_name": row.get("covering_name"),
-            })
-    except Exception:
-        pass
-
-    # Last submitted report by this officer
-    try:
-        rdf = fetch_df(
-            """
-            SELECT r.cycle_no, COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS submitted_on,
-                   p.code AS project_code, p.name AS project_name
-            FROM biweekly_reports r
-            LEFT JOIN projects p ON p.id=r.project_id
-            WHERE r.uploader_staff_id=?
-              AND COALESCE(r.status,'PENDING') IN ('PENDING','SUBMITTED','NEEDS_REVISION','APPROVED')
-            ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
-            LIMIT 1
-            """,
-            (sid,),
-        )
-        if not rdf.empty:
-            rr = rdf.iloc[0].to_dict()
-            rr["submitted_on"] = _to_date_or_none(rr.get("submitted_on"))
-            snap["last_report"] = rr
-    except Exception:
-        pass
-
-    return snap
-
-
-@st.cache_data(ttl=45, show_spinner=False)
-
-
-
 def _refresh_biweekly_reporting_views():
     """Create lightweight views used to normalize submitted biweekly uploads for branch compliance."""
     try:
@@ -3896,221 +3193,21 @@ def _refresh_biweekly_reporting_views():
     except Exception:
         pass
 
-def _submitted_biweekly_reports_df():
-    try:
-        return fetch_df("""
-            SELECT project_id, cycle_no,
-                   COALESCE(status,'PENDING') AS status,
-                   COALESCE(timing_status,'ON_TIME') AS timing_status,
-                   report_date, submitted_on, uploaded_at, uploader_staff_id
-            FROM vw_submitted_biweekly_reports
-        """)
-    except Exception:
-        return fetch_df("""
-            SELECT project_id, cycle_no,
-                   COALESCE(status,'PENDING') AS status,
-                   COALESCE(timing_status,'ON_TIME') AS timing_status,
-                   report_date, submitted_on, uploaded_at, uploader_staff_id
-            FROM biweekly_reports
-            WHERE COALESCE(status,'PENDING') IN ('APPROVED','PENDING','SUBMITTED','NEEDS_REVISION')
-              AND cycle_no IS NOT NULL
-        """)
-
-@st.cache_data(ttl=45, show_spinner=False)
-def unified_biweekly_snapshot(today_iso: str):
-    today = date.fromisoformat(today_iso)
-    cutoff = _biweekly_backfill_cutoff_cycle()
-    active_projects = fetch_df("""
-        SELECT id, code, name
-        FROM projects
-        WHERE COALESCE(status,'ACTIVE')!='DORMANT'
-        ORDER BY code
-    """)
-    valid = _submitted_biweekly_reports_df()
-    valid_map = {}
-    if not valid.empty:
-        for _, rr in valid.iterrows():
-            try:
-                valid_map[(int(rr["project_id"]), int(rr["cycle_no"]))] = {
-                    "timing_status": str(rr.get("timing_status") or "ON_TIME").upper(),
-                    "status": str(rr.get("status") or "PENDING").upper(),
-                }
-            except Exception:
-                continue
-
-    expected_rows = []
-    branch_queue = []
-    for _, pr in active_projects.iterrows():
-        pid = int(pr["id"])
-        code = str(pr.get("code") or "").strip()
-        name = str(pr.get("name") or "").strip()
-        first_idx = _project_first_cycle_index(pid)
-        for idx in range(first_idx, 500):
-            cyc = _biweekly_cycle_from_index(idx)
-            if cyc["cycle_no"] < cutoff:
-                continue
-            if cyc["due_date"] > today:
-                break
-            expected_rows.append({
-                "project_id": pid,
-                "project_code": code,
-                "project_name": name,
-                "cycle_no": int(cyc["cycle_no"]),
-                "due_date": cyc["due_date"],
-            })
-        live_cyc, _reason = _project_current_due_cycle(pid, today)
-        if live_cyc is not None:
-            branch_queue.append({
-                "project": f"{code} — {name}".strip(" —"),
-                "report_no": int(live_cyc["cycle_no"]),
-                "window": f"{live_cyc['window_start'].isoformat()} → {live_cyc['window_end'].isoformat()}",
-                "due": live_cyc["due_date"].isoformat(),
-                "status": "Overdue" if today > live_cyc["due_date"] else ("Due soon" if (live_cyc["due_date"]-today).days <= 7 else "Open")
-            })
-
-    expected_df = pd.DataFrame(expected_rows)
-    if expected_df.empty:
-        empty_rows = pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"])
-        staff_users = fetch_df("""
-        SELECT u.id AS user_id, u.username, s.id AS staff_id, s.name
-        FROM users u
-        LEFT JOIN staff s ON s.id=u.staff_id
-        WHERE COALESCE(u.is_active,1)=1
-        ORDER BY s.name, u.username
-    """)
-        return {"ratio": None, "no_obligation": True, "compliant": 0, "outstanding": 0, "total_staff": len(staff_users), "rows": empty_rows, "branch_queue": pd.DataFrame(branch_queue), "staff_compliance": pd.DataFrame(columns=["Engineer","On-time","Late","Very late","Missed","Points"])}
-
-    expected_df["key"] = expected_df.apply(lambda r: (int(r["project_id"]), int(r["cycle_no"])), axis=1)
-    expected_df["has_valid"] = expected_df["key"].map(lambda k: k in valid_map)
-    expected_df["timing_status"] = expected_df["key"].map(lambda k: valid_map.get(k, {}).get("timing_status"))
-    submitted_reports = int(expected_df["has_valid"].sum())
-    outstanding_reports = int((~expected_df["has_valid"]).sum())
-
-    staff_users = fetch_df("""
-        SELECT u.id AS user_id, u.username, s.id AS staff_id, s.name
-        FROM users u
-        LEFT JOIN staff s ON s.id=u.staff_id
-        WHERE COALESCE(u.is_active,1)=1
-        ORDER BY s.name, u.username
-    """)
-    posted = fetch_df("""
-        SELECT ps.staff_id, ps.project_id, p.code AS project_code
-        FROM project_staff ps
-        JOIN projects p ON p.id=ps.project_id
-        WHERE COALESCE(p.status,'ACTIVE')!='DORMANT'
-    """)
-    proj_by_staff = {}
-    if not posted.empty:
-        for _, rr in posted.iterrows():
-            try:
-                proj_by_staff.setdefault(int(rr["staff_id"]), []).append((int(rr["project_id"]), str(rr.get("project_code") or "")))
-            except Exception:
-                pass
-
-    out_rows = []
-    compliant = 0
-    total_staff = len(staff_users)
-    perf_rows = []
-    for _, row in staff_users.iterrows():
-        sid = row.get("staff_id")
-        staff_name = row.get("name") or row.get("username") or "Unknown"
-        if pd.isna(sid):
-            compliant += 1
-            continue
-        sid = int(sid)
-        outstanding = []
-        ontime = late = very_late = missed = points = 0
-        for pid, pcode in proj_by_staff.get(sid, []):
-            sdf = expected_df[expected_df["project_id"] == pid]
-            for _, er in sdf.iterrows():
-                if not er["has_valid"]:
-                    missed += 1
-                    outstanding.append((int(er["cycle_no"]), pcode))
-                else:
-                    timing = str(er["timing_status"] or "").upper()
-                    if timing == "VERY_LATE":
-                        very_late += 1
-                        points += 1
-                    elif timing == "LATE":
-                        late += 1
-                        points += 2
-                    else:
-                        ontime += 1
-                        points += 3
-        if outstanding:
-            first = sorted(outstanding, key=lambda x: x[0])[0]
-            out_rows.append({"Staff": staff_name, "Login": row.get("username") or "", "Outstanding reports": len(outstanding), "Next due": f"Report {first[0]} ({first[1]})"})
-        else:
-            compliant += 1
-        perf_rows.append({"Engineer": staff_name, "On-time": ontime, "Late": late, "Very late": very_late, "Missed": missed, "Points": points})
-
-    ratio = (submitted_reports / len(expected_df)) if len(expected_df) else 1.0
-    return {
-        "ratio": ratio,
-        "no_obligation": False,
-        "compliant": compliant,
-        "outstanding": outstanding_reports,
-        "total_staff": total_staff,
-        "rows": pd.DataFrame(out_rows) if out_rows else pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"]),
-        "branch_queue": pd.DataFrame(branch_queue),
-        "staff_compliance": pd.DataFrame(perf_rows).sort_values(["Points","On-time","Engineer"], ascending=[False,False,True]) if perf_rows else pd.DataFrame(columns=["Engineer","On-time","Late","Very late","Missed","Points"]),
-    }
-
-def compliance_snapshot(today=None):
-    """Unified branch-wide report compliance view."""
-    today = _to_date_or_none(today) or date.today()
-    try:
-        snap = unified_biweekly_snapshot(today.isoformat())
-        return {
-            "ratio": snap.get("ratio"),
-            "no_obligation": bool(snap.get("no_obligation") or False),
-            "compliant": int(snap.get("compliant") or 0),
-            "outstanding": int(snap.get("outstanding") or 0),
-            "total_staff": int(snap.get("total_staff") or 0),
-            "rows": snap.get("rows") if isinstance(snap.get("rows"), pd.DataFrame) else pd.DataFrame(columns=["Staff","Login","Outstanding reports","Next due"]),
-        }
-    except Exception:
-        empty = pd.DataFrame(columns=["Staff", "Login", "Outstanding reports", "Next due"])
-        return {"ratio": None, "no_obligation": True, "compliant": 0, "outstanding": 0, "total_staff": 0, "rows": empty}
-
-
-# ---------- Dashboard ----------
 @st.cache_data(ttl=30, show_spinner=False)
-def dashboard_summary_snapshot(today_iso: str):
-    out = {"projects": 0, "active_projects": 0, "dormant_projects": 0, "open_tasks": 0, "tasks_completed_7d": 0}
-    try:
-        pdf = fetch_df("""
-            SELECT
-                COUNT(*) AS projects,
-                SUM(CASE WHEN UPPER(COALESCE(status,'ACTIVE'))='ACTIVE' THEN 1 ELSE 0 END) AS active_projects,
-                SUM(CASE WHEN UPPER(COALESCE(status,'ACTIVE'))='DORMANT' THEN 1 ELSE 0 END) AS dormant_projects
-            FROM projects
-        """)
-        if not pdf.empty:
-            row = pdf.iloc[0]
-            out["projects"] = int(row.get("projects") or 0)
-            out["active_projects"] = int(row.get("active_projects") or 0)
-            out["dormant_projects"] = int(row.get("dormant_projects") or 0)
-    except Exception:
-        pass
-    try:
-        tdf = fetch_df("SELECT COUNT(*) AS n FROM task_assignments WHERE COALESCE(status,'')!='Completed'")
-        if not tdf.empty:
-            out["open_tasks"] = int(tdf["n"].iloc[0] or 0)
-    except Exception:
-        pass
-    try:
-        recent = fetch_df(
-            "SELECT COUNT(*) AS n FROM task_assignments WHERE status='Completed' AND completed_date IS NOT NULL AND date(completed_date) >= date(?)",
-            ((date.fromisoformat(today_iso) - timedelta(days=7)).isoformat(),)
-        )
-        if not recent.empty:
-            out["tasks_completed_7d"] = int(recent["n"].iloc[0] or 0)
-    except Exception:
-        pass
-    return out
-
-
+def _project_visible_biweekly_reports_df(pid: int, admin_flag: int, viewer_staff_id: int):
+    return fetch_df("""SELECT id,project_id,report_date,uploaded_at,submitted_on,file_path, report_pdf_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
+                           window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
+                           hse_observations, rfi_notes, general_remarks, selected_modules, structured_report_json, reviewed_at, reviewed_by_staff_id, review_note, rejected_reason
+                    FROM biweekly_reports
+                    WHERE project_id=?
+                      AND (
+                            ?=1
+                            OR (
+                                COALESCE(status,'APPROVED') <> 'REJECTED'
+                                AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?)
+                            )
+                          )
+                    ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(int(pid), int(admin_flag), int(viewer_staff_id)))
 
 def navigate_to_search_result(page, project_id=None, tab=None, tab_index=None):
     st.session_state["_pending_nav"] = page
@@ -4129,445 +3226,10 @@ def navigate_to_search_result(page, project_id=None, tab=None, tab_index=None):
     st.rerun()
 
 
-def page_dashboard():
-    st.markdown(f"<div class='worknest-header'><h2>🏠 {APP_TITLE} — Dashboard</h2></div>", unsafe_allow_html=True)
-    sid = current_staff_id()
-    admin = is_admin()
-    today = date.today()
-    selected = None
-
-    summary = dashboard_summary_snapshot(today.isoformat())
-    snap = obligations_snapshot(sid, today) if sid is not None else {"tasks": [], "reports": [], "leave": [], "last_report": None}
-    comp = compliance_snapshot(today)
-    ubs = unified_biweekly_snapshot(today.isoformat())
-
-    ctop1, ctop2, ctop3, ctop4 = st.columns(4)
-    ctop1.metric("Projects", summary.get("projects", 0))
-    ctop2.metric("Active", summary.get("active_projects", 0))
-    ctop3.metric("Dormant", summary.get("dormant_projects", 0))
-    ctop4.metric("Open Tasks", summary.get("open_tasks", 0))
-
-    if sid is not None:
-        cc = chat_visibility_counts(sid)
-        unread = int(cc.get("unread", 0) or 0)
-        mentions = int(cc.get("mentions", 0) or 0)
-        if unread or mentions:
-            alert = f"📩 You have {unread} unread chat message(s)"
-            if mentions:
-                alert += f" and {mentions} mention(s)"
-            st.info(alert)
-
-    st.markdown("### 🎯 Today's Obligations")
-    ob1, ob2 = st.columns([2,1])
-    with ob1:
-        if sid is None:
-            st.info("Log in to view personal obligations.")
-        else:
-            reports = sorted(snap.get("reports") or [], key=lambda x: (x.get("days_left") is None, x.get("days_left", 9999)))
-            current_cycle = _current_biweekly_cycle(today)
-            if reports:
-                r0 = reports[0]
-                dl = r0.get("days_left")
-                due_text = "due today" if dl == 0 else (f"overdue by {abs(dl)} day(s)" if dl is not None and dl < 0 else f"due in {dl} day(s)")
-                st.warning(f"Biweekly Report No. {r0['cycle_no']} — {due_text}")
-                st.caption(f"{r0['project']} | {r0['window_start'].isoformat()} → {r0['window_end'].isoformat()} | deadline {r0['due_date'].isoformat()}")
-            else:
-                dl = (current_cycle["due_date"] - today).days if current_cycle.get("due_date") else None
-                if dl is not None and dl >= 0:
-                    due_text = "due today" if dl == 0 else f"due in {dl} day(s)"
-                    st.warning(f"Biweekly Report No. {int(current_cycle['cycle_no'])} — {due_text}")
-                    st.caption(f"Current reporting window: {current_cycle['window_start'].isoformat()} → {current_cycle['window_end'].isoformat()} | deadline {current_cycle['due_date'].isoformat()}")
-                else:
-                    st.success("No outstanding biweekly report obligation right now.")
-
-            tasks = sorted(snap.get("tasks") or [], key=lambda x: (x.get("days_left") is None, x.get("days_left", 9999)))
-            if tasks:
-                t0 = tasks[0]
-                dd = t0.get("days_left")
-                due_text = "no due date" if dd is None else ("due today" if dd == 0 else (f"overdue by {abs(dd)} day(s)" if dd < 0 else f"due in {dd} day(s)"))
-                st.info(f"Task pending: {t0['label']} — {due_text}")
-            else:
-                st.caption("No pending tasks assigned to you.")
-
-            leave_items = sorted(snap.get("leave") or [], key=lambda x: (x.get("start_date") or date.max))
-            if leave_items:
-                l0 = leave_items[0]
-                start_txt = l0['start_date'].isoformat() if l0.get('start_date') else 'n/a'
-                who = l0.get('covering_name') or 'another officer'
-                st.info(f"Relief duty ahead: covering {who} from {start_txt}.")
-            else:
-                st.caption("No upcoming relief assignment recorded.")
-
-            last_report = snap.get("last_report")
-            if last_report:
-                when = last_report.get("submitted_on")
-                when_txt = when.isoformat() if when else "date unavailable"
-                pfx = str(last_report.get("project_code") or "").strip()
-                proj = f"{pfx} — {last_report.get('project_name') or ''}".strip(" —")
-                cyc = last_report.get("cycle_no")
-                cyc_txt = f"Report No. {int(cyc)}" if pd.notna(cyc) else "Latest report"
-                st.success(f"{cyc_txt} submitted on {when_txt}" + (f" | {proj}" if proj else ""))
-            else:
-                st.caption("No biweekly report submission has been recorded under your login yet.")
-
-            report_order_expr = (
-                "COALESCE(br.submitted_on::timestamp, br.uploaded_at::timestamp, br.report_date::timestamp)"
-                if DB_IS_POSTGRES else
-                "datetime(COALESCE(br.submitted_on, br.uploaded_at, br.report_date))"
-            )
-            my_reports_df = fetch_df(f"""
-                SELECT p.code, p.name AS project_name, br.id, br.cycle_no, br.window_start, br.window_end, br.submitted_on, br.uploaded_at,
-                       COALESCE(br.status,'PENDING') AS status, br.timing_status, br.report_pdf_path
-                FROM biweekly_reports br
-                JOIN projects p ON p.id = br.project_id
-                WHERE br.uploader_staff_id=?
-                  AND COALESCE(br.status,'PENDING') IN ('PENDING','SUBMITTED','NEEDS_REVISION','APPROVED')
-                ORDER BY {report_order_expr} DESC, br.id DESC
-                LIMIT 12
-            """, (int(sid),))
-            st.markdown("#### My Recent Biweekly Submissions")
-            if my_reports_df.empty:
-                st.caption("You have not submitted any biweekly report yet.")
-            else:
-                for _, mr in my_reports_df.iterrows():
-                    submitted_txt = mr.get('submitted_on') or mr.get('uploaded_at') or '—'
-                    proj_label = f"{mr.get('code') or ''} — {mr.get('project_name') or ''}".strip(' —')
-                    cyc_txt = f"Report No. {int(mr['cycle_no'])}" if pd.notna(mr.get('cycle_no')) else 'Report'
-                    st.markdown(f"**{cyc_txt}** | {proj_label}  \n**Window:** {mr.get('window_start') or '—'} → {mr.get('window_end') or '—'}  \n**Submitted:** {submitted_txt} | **Status:** {mr.get('status') or '—'} | **Timing:** {_timing_status_label(mr.get('timing_status'))}")
-                    dash_atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(mr['id']),))
-                    pdf_path = _ensure_biweekly_pdf(mr.to_dict(), project_name=proj_label, attachments_df=dash_atts)
-                    if pdf_path:
-                        render_pdf_preview_and_download(f"dash_my_bw_{int(mr['id'])}", pdf_path)
-                    st.markdown('---')
-    current_cycle = _current_biweekly_cycle(today)
-    monthly_start, monthly_end = _monthly_points_window(today)
-    month_perf = _report_scoreboard(today=today, month_start=monthly_start, month_end=monthly_end)
-    global_perf = _report_scoreboard(today=today)
-    with ob2:
-        st.markdown("**Compliance radar**")
-        ratio = comp.get("ratio")
-        st.progress(float(ratio) if ratio is not None else 0.0)
-        st.metric("Staff up to date", f"{comp.get('compliant', 0)}/{comp.get('total_staff', 0)}")
-        if comp.get("no_obligation"):
-            st.caption(f"No due report yet | Current cycle: Report {int(current_cycle['cycle_no'])} | Next submission due {current_cycle['due_date'].isoformat()}")
-        else:
-            st.caption(f"Submitted compliance basis: pending and approved uploads count as submitted. Outstanding: {comp.get('outstanding', 0)} | Current cycle: Report {int(current_cycle['cycle_no'])}")
-
-    st.markdown("### 📊 Branch Situational Awareness")
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Submitted compliance", "—" if comp.get('no_obligation') else f"{int(round(((comp.get('ratio') or 0.0))*100))}%")
-    b2.metric("Outstanding reports", comp.get("outstanding", 0))
-    my_pending_tasks = len(snap.get("tasks") or []) if sid is not None else 0
-    b3.metric("My pending tasks", my_pending_tasks)
-    b4.metric("Current report no.", int(current_cycle['cycle_no']))
-
-    if admin:
-        with st.expander("📱 SMS test (Admin only)", expanded=False):
-            st.caption("Use this once to confirm that WorkNest can send SMS before wiring it into live reminders.")
-            sms_test_number = st.text_input("Test phone number", value="", placeholder="2348012345678", key="dashboard_sms_test_number")
-            sms_test_message = st.text_area("Test message", value="WorkNest: Test SMS successful.", key="dashboard_sms_test_message")
-            if st.button("Send Test SMS", key="dashboard_send_test_sms"):
-                result = send_sms([sms_test_number], sms_test_message)
-                if result.get("ok"):
-                    st.success("SMS request sent. Check the phone and the Render logs for delivery details.")
-                else:
-                    st.error(f"SMS test failed: {result}")
-                st.write(result)
-
-    st.markdown("### 🕒 Recent Activity")
-    a1, a2 = st.columns(2)
-    with a1:
-        recent_reports = fetch_df(
-            """
-            SELECT COALESCE(s.name, u.username, 'Unknown') AS officer, p.code AS project_code, p.name AS project_name,
-                   r.cycle_no, COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp
-            FROM biweekly_reports r
-            LEFT JOIN staff s ON s.id=r.uploader_staff_id
-            LEFT JOIN users u ON u.staff_id=r.uploader_staff_id
-            LEFT JOIN projects p ON p.id=r.project_id
-            WHERE COALESCE(r.status,'PENDING') IN ('APPROVED','PENDING')
-            ORDER BY COALESCE(r.submitted_on, r.uploaded_at, r.report_date) DESC, r.id DESC
-            LIMIT 6
-            """
-        )
-        if recent_reports.empty:
-            st.caption("No recent report submissions yet.")
-        else:
-            for _, rr in recent_reports.iterrows():
-                cyc = rr.get("cycle_no")
-                cyc_txt = f"Report No. {int(cyc)}" if pd.notna(cyc) else "Biweekly report"
-                proj = " — ".join([x for x in [str(rr.get("project_code") or "").strip(), str(rr.get("project_name") or "").strip()] if x])
-                st.write(f"• {rr['officer']} submitted {cyc_txt}" + (f" for {proj}" if proj else ""))
-                st.caption(str(rr.get("stamp") or ""))
-    with a2:
-        recent_tasks = fetch_df(
-            """
-            SELECT s.name AS staff_name, COALESCE(t.title, t.description, 'Task') AS title, ta.completed_date, p.code AS project_code
-            FROM task_assignments ta
-            JOIN tasks t ON t.id=ta.task_id
-            JOIN staff s ON s.id=ta.staff_id
-            LEFT JOIN projects p ON p.id=t.project_id
-            WHERE ta.status='Completed' AND ta.completed_date IS NOT NULL
-            ORDER BY ta.completed_date DESC, ta.id DESC
-            LIMIT 6
-            """
-        )
-        if recent_tasks.empty:
-            st.caption("No recently completed tasks yet.")
-        else:
-            for _, tr in recent_tasks.iterrows():
-                label = str(tr.get('title') or 'Task')
-                pcode = str(tr.get('project_code') or '').strip()
-                if pcode:
-                    label = f"{pcode} — {label}"
-                st.write(f"• {tr['staff_name']} completed {label}")
-                st.caption(str(tr.get('completed_date') or ''))
-
-    st.markdown("### 👤 My Performance")
-    if sid is not None:
-        pts = fetch_df(
-            "SELECT COALESCE(SUM(points),0) AS total_points, COUNT(*) AS entries FROM points WHERE staff_id=?",
-            (int(sid),),
-        )
-        rp = fetch_df("SELECT COUNT(*) AS n FROM biweekly_reports WHERE uploader_staff_id=? AND COALESCE(status,'PENDING') IN ('APPROVED','PENDING')", (int(sid),))
-        tp = fetch_df(
-            """
-            SELECT COUNT(*) AS n
-            FROM task_assignments ta
-            WHERE ta.staff_id=? AND ta.status='Completed'
-            """,
-            (int(sid),),
-        )
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Biweekly reports", int(rp["n"].iloc[0]) if not rp.empty else 0)
-        p2.metric("Tasks completed", int(tp["n"].iloc[0]) if not tp.empty else 0)
-        p3.metric("Total points", int(pts["total_points"].iloc[0]) if not pts.empty else 0)
-    else:
-        st.caption("No personal performance record available.")
-
-    if admin:
-        st.markdown("### 🎯 Precision Follow-up")
-        out_df = comp.get("rows")
-        if isinstance(out_df, pd.DataFrame) and not out_df.empty:
-            st.markdown("**Staff with Outstanding Reports**")
-            st.dataframe(out_df, hide_index=True, width='stretch')
-        else:
-            st.success("No staff currently sitting on an outstanding biweekly report obligation.")
-
-        st.markdown("**Login Activity**")
-        latest = latest_login_activity()
-        staff_users = fetch_df(
-            """
-            SELECT u.id AS user_id, s.id AS staff_id, s.name, COALESCE(u.username, s.email, s.name) AS username
-            FROM users u
-            LEFT JOIN staff s ON s.id=u.staff_id
-            WHERE COALESCE(u.is_active,1)=1
-            ORDER BY s.name, u.username
-            """
-        )
-        if staff_users.empty:
-            st.caption("No login accounts found.")
-        else:
-            merged = staff_users.merge(latest, on="user_id", how="left", suffixes=("", "_last"))
-            merged["last_login"] = merged["login_at"].fillna("Never")
-            st.dataframe(
-                merged[["name", "username", "last_login", "login_method"]].rename(columns={
-                    "name": "Staff",
-                    "username": "Login",
-                    "last_login": "Last login",
-                    "login_method": "Method",
-                }),
-                hide_index=True,
-                width='stretch'
-            )
-            never = merged[merged["login_at"].isna()]
-            if not never.empty:
-                st.warning("No login recorded yet: " + ", ".join([str(x) for x in never["name"].fillna(never["username"]).tolist()]))
-
-    def project_core_docs_status(pid):
-        df=fetch_df("SELECT DISTINCT category FROM documents WHERE project_id=?", (pid,))
-        present=set(df["category"]) if not df.empty else set()
-        missing=[c for c in CORE_DOC_CATEGORIES if c not in present]
-        return present, missing
-
-    def project_next_due(pid, start_date, next_due_date=None):
-        cyc, reason = _project_open_biweekly_cycle(int(pid), date.today())
-        if cyc is None:
-            return (False, None, None, reason)
-        overdue = date.today() > cyc["due_date"]
-        return (overdue, cyc["window_end"], cyc["due_date"], reason)
-
-    st.markdown("### ✅ Action Items (Due / Overdue)")
-    items=[]
-    horizon=today+timedelta(days=7)
-
-    if admin:
-        proj_due=fetch_df("SELECT id,code,name,start_date,next_due_date,COALESCE(status,'ACTIVE') AS status FROM projects WHERE COALESCE(status,'ACTIVE')!='DORMANT' ORDER BY code")
-    else:
-        proj_due=fetch_df("SELECT P.id,P.code,P.name,P.start_date,P.next_due_date,COALESCE(P.status,'ACTIVE') AS status FROM projects P JOIN project_staff PS ON PS.project_id=P.id WHERE PS.staff_id=? AND COALESCE(P.status,'ACTIVE')!='DORMANT' ORDER BY P.code", (sid,))
-
-    for _,p in proj_due.iterrows():
-        pid=int(p["id"])
-        overdue,last_d,exp,reason = project_next_due(pid, p.get("start_date"), p.get("next_due_date"))
-        if exp is None: continue
-        if overdue or (0 <= (exp - today).days <= 7):
-            status = "Overdue" if overdue else "Due soon"
-            items.append({
-                "type":"Project report",
-                "item":f"{p.get('code','')} — {p.get('name','')}",
-                "due":exp.isoformat(),
-                "status":status,
-                "details":reason
-            })
-
-    if sid is not None:
-        tdf=fetch_df("""
-            SELECT T.id, T.title, T.due_date, TA.status, P.code AS project_code, P.name AS project_name
-            FROM task_assignments TA
-            JOIN tasks T ON T.id = TA.task_id
-            LEFT JOIN projects P ON P.id = T.project_id
-            WHERE TA.staff_id=? AND COALESCE(TA.status,'')!='Completed'
-        """, (sid,))
-        for _,t in tdf.iterrows():
-            due=safe_parse_date(t.get("due_date"))
-            if due is None: continue
-            if due <= horizon:
-                status = "Overdue" if due < today else "Due soon"
-                pfx = (t.get("project_code") or "").strip()
-                items.append({
-                    "type":"Task",
-                    "item":f"{pfx} — {t.get('title','')}" if pfx else str(t.get('title') or ""),
-                    "due":due.isoformat(),
-                    "status":status,
-                    "details":f"Task ID {t.get('id')}"
-                })
-
-    if items:
-        df_items=pd.DataFrame(items)
-        df_items["__due_sort"]=pd.to_datetime(df_items["due"], errors="coerce")
-        df_items["__status_sort"]=df_items["status"].map(lambda s: 0 if s=="Overdue" else 1)
-        df_items=df_items.sort_values(["__status_sort","__due_sort","type","item"]).drop(columns=["__due_sort","__status_sort"])
-        st.dataframe(df_items, hide_index=True, width='stretch')
-    else:
-        st.success("No due/overdue items in the next 7 days.")
-
-
-def _queue_rows(for_staff_id=None):
-    base = ubs.get("branch_queue")
-    if not isinstance(base, pd.DataFrame):
-        return pd.DataFrame(columns=['project','report_no','window','due','status'])
-    if for_staff_id is None:
-        return base
-    try:
-        my_projects = fetch_df("""
-            SELECT p.code, p.name
-            FROM projects p
-            JOIN project_staff ps ON ps.project_id=p.id
-            WHERE ps.staff_id=? AND COALESCE(p.status,'ACTIVE')!='DORMANT'
-        """, (int(for_staff_id),))
-        allowed = set((f"{str(r.get('code') or '').strip()} — {str(r.get('name') or '').strip()}").strip(" —") for _, r in my_projects.iterrows())
-        return base[base["project"].isin(allowed)].reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame(columns=['project','report_no','window','due','status'])
-
-    st.markdown("### 🗂️ Report Queue")
-    if sid is not None:
-        myq = _queue_rows(sid)
-        st.markdown("**My Pending Reports**")
-        if myq.empty:
-            st.caption("No pending report obligation for you right now.")
-        else:
-            st.dataframe(myq, hide_index=True, width='stretch')
-    if admin:
-        st.markdown("**Branch Report Queue**")
-        bq = _queue_rows(None)
-        if bq.empty:
-            st.success("No open branch report obligations right now.")
-        else:
-            st.dataframe(bq, hide_index=True, width='stretch')
-
-    st.markdown("### 📊 Reporting Compliance")
-    cdf = ubs.get("staff_compliance")
-    if isinstance(cdf, pd.DataFrame) and not cdf.empty:
-        st.dataframe(cdf, hide_index=True, width='stretch')
-
-# --- Project Quick Edit (Admin only) ---
-
-    if can_manage_projects():
-        st.markdown("### Project Quick Edit")
-        pdf = fetch_df("SELECT id,code,name,client,location,start_date,end_date,supervisor_staff_id FROM projects ORDER BY code")
-        staff = fetch_df("SELECT id,name FROM staff ORDER BY name")
-        if not pdf.empty:
-            options = ["— Select project —"] + [f"{r['code']} — {r['name']}" for _, r in pdf.iterrows()]
-            pick = st.selectbox("Project", options, key="dash_proj_pick")
-            if pick != "— Select project —":
-                sel_code = pick.split(" — ")[0].strip()
-                row = pdf[pdf["code"] == sel_code]
-                if not row.empty:
-                    selected = row.iloc[0].to_dict()
-        else:
-            st.info("No projects found yet. Import projects via Import CSVs (admin).")
-
-        # Basic edit form (admin only)
-        sup_name_by_id = {int(r["id"]): r["name"] for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
-        sup_id_by_name = {r["name"]: int(r["id"]) for _, r in staff.iterrows() if str(r.get("id", "")).isdigit() and r.get("name")}
-        sup_options = [""] + sorted([n for n in staff["name"].dropna().tolist() if str(n).strip()]) if not staff.empty and "name" in staff.columns else [""]
-
-        default_sup = ""
-        if selected is not None and selected.get("supervisor_staff_id"):
-            try:
-                default_sup = sup_name_by_id.get(int(selected["supervisor_staff_id"]), "") or ""
-            except Exception:
-                default_sup = ""
-
-        with st.expander("Create / Edit Project", expanded=False):
-            code = st.text_input("Code", value=(selected["code"] if selected is not None else ""), key="proj_code")
-            name = st.text_input("Name", value=(selected["name"] if selected is not None else ""), key="proj_name")
-            client = st.text_input("Client", value=(selected.get("client") if selected is not None else "") or "", key="proj_client")
-            location = st.text_input("Location", value=(selected.get("location") if selected is not None else "") or "", key="proj_location")
-            start_date = st.text_input("Start date (YYYY-MM-DD)", value=(selected.get("start_date") if selected is not None else "") or "", key="proj_start")
-            end_date = st.text_input("End date (YYYY-MM-DD)", value=(selected.get("end_date") if selected is not None else "") or "", key="proj_end")
-
-            sup_idx = 0
-            if default_sup and default_sup in sup_options:
-                sup_idx = sup_options.index(default_sup)
-            supervisor_name = st.selectbox("Supervisor", sup_options, index=sup_idx, key="proj_supervisor")
-            supervisor_id = sup_id_by_name.get(supervisor_name) if supervisor_name else None
-
-            colA, colB = st.columns([1, 1])
-            with colA:
-                if st.button("Save project", use_container_width=True):
-                    if not code.strip() or not name.strip():
-                        st.error("Project Code and Name are required.")
-                    else:
-                        if selected is None:
-                            execute(
-                                "INSERT INTO projects(code,name,client,location,supervisor_staff_id,start_date,end_date) VALUES (?,?,?,?,?,?,?)",
-                                (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None),
-                            )
-                            st.success("Project created.")
-                            st.rerun()
-                        else:
-                            execute(
-                                "UPDATE projects SET code=?,name=?,client=?,location=?,supervisor_staff_id=?,start_date=?,end_date=? WHERE id=?",
-                                (code.strip(), name.strip(), client.strip() or None, location.strip() or None, supervisor_id, start_date.strip() or None, end_date.strip() or None, int(selected["id"])),
-                            )
-                            st.success("Project updated.")
-                            st.rerun()
-            with colB:
-                if selected is not None:
-                    if st.button("Delete project", use_container_width=True):
-                        execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
-                        st.warning("Project deleted.")
-                        st.rerun()
-    if selected is not None:
-        st.caption("Detailed project management is available on the Projects page.")
-
-# ---------- Staff ----------
-
+from views.dashboard import page_dashboard
 
 @st.cache_data(ttl=20, show_spinner=False)
-def worknest_search(query: str):
+def worknest_search(query: str, staff_id=None, admin_flag: int = 0):
     q = str(query or '').strip()
     if len(q) < 2:
         return {
@@ -4579,91 +3241,197 @@ def worknest_search(query: str):
         }
     like = f"%{q.lower()}%"
     results = {}
+    staff_id_val = None
+    if staff_id is not None:
+        try:
+            staff_id_val = int(staff_id)
+        except Exception:
+            staff_id_val = None
+    is_admin_search = bool(admin_flag)
     try:
-        results['projects'] = fetch_df(
-            """SELECT id, code, name, client, location, COALESCE(status,'ACTIVE') AS status
-                   FROM projects
-                   WHERE LOWER(COALESCE(code,'')) LIKE ?
-                      OR LOWER(COALESCE(name,'')) LIKE ?
-                      OR LOWER(COALESCE(client,'')) LIKE ?
-                      OR LOWER(COALESCE(location,'')) LIKE ?
-                   ORDER BY code, name
-                   LIMIT 25""",
-            (like, like, like, like)
-        )
+        if is_admin_search:
+            results['projects'] = fetch_df(
+                """SELECT id, code, name, client, location, COALESCE(status,'ACTIVE') AS status
+                       FROM projects
+                       WHERE LOWER(COALESCE(code,'')) LIKE ?
+                          OR LOWER(COALESCE(name,'')) LIKE ?
+                          OR LOWER(COALESCE(client,'')) LIKE ?
+                          OR LOWER(COALESCE(location,'')) LIKE ?
+                       ORDER BY code, name
+                       LIMIT 25""",
+                (like, like, like, like)
+            )
+        elif staff_id_val is None:
+            results['projects'] = pd.DataFrame()
+        else:
+            results['projects'] = fetch_df(
+                """SELECT p.id, p.code, p.name, p.client, p.location, COALESCE(p.status,'ACTIVE') AS status
+                       FROM projects p
+                       JOIN project_staff ps ON ps.project_id=p.id
+                       WHERE ps.staff_id=?
+                         AND (
+                            LOWER(COALESCE(p.code,'')) LIKE ?
+                         OR LOWER(COALESCE(p.name,'')) LIKE ?
+                         OR LOWER(COALESCE(p.client,'')) LIKE ?
+                         OR LOWER(COALESCE(p.location,'')) LIKE ?
+                         )
+                       ORDER BY p.code, p.name
+                       LIMIT 25""",
+                (staff_id_val, like, like, like, like)
+            )
     except Exception:
         results['projects'] = pd.DataFrame()
     try:
-        results['documents'] = fetch_df(
-            """SELECT d.id, p.code AS project_code, p.name AS project_name, d.category, d.file_path, d.uploaded_at
-                   FROM documents d
-                   LEFT JOIN projects p ON p.id=d.project_id
-                   WHERE LOWER(COALESCE(d.category,'')) LIKE ?
-                      OR LOWER(COALESCE(d.file_path,'')) LIKE ?
-                      OR LOWER(COALESCE(p.code,'')) LIKE ?
-                      OR LOWER(COALESCE(p.name,'')) LIKE ?
-                   ORDER BY d.uploaded_at DESC, d.id DESC
-                   LIMIT 40""",
-            (like, like, like, like)
-        )
+        if is_admin_search:
+            results['documents'] = fetch_df(
+                """SELECT d.id, p.code AS project_code, p.name AS project_name, d.category, d.file_path, d.uploaded_at
+                       FROM documents d
+                       LEFT JOIN projects p ON p.id=d.project_id
+                       WHERE LOWER(COALESCE(d.category,'')) LIKE ?
+                          OR LOWER(COALESCE(d.file_path,'')) LIKE ?
+                          OR LOWER(COALESCE(p.code,'')) LIKE ?
+                          OR LOWER(COALESCE(p.name,'')) LIKE ?
+                       ORDER BY d.uploaded_at DESC, d.id DESC
+                       LIMIT 40""",
+                (like, like, like, like)
+            )
+        elif staff_id_val is None:
+            results['documents'] = pd.DataFrame()
+        else:
+            results['documents'] = fetch_df(
+                """SELECT d.id, p.code AS project_code, p.name AS project_name, d.category, d.file_path, d.uploaded_at
+                       FROM documents d
+                       LEFT JOIN projects p ON p.id=d.project_id
+                       WHERE d.project_id IN (
+                           SELECT project_id FROM project_staff WHERE staff_id=?
+                       )
+                         AND (
+                            LOWER(COALESCE(d.category,'')) LIKE ?
+                         OR LOWER(COALESCE(d.file_path,'')) LIKE ?
+                         OR LOWER(COALESCE(p.code,'')) LIKE ?
+                         OR LOWER(COALESCE(p.name,'')) LIKE ?
+                         )
+                       ORDER BY d.uploaded_at DESC, d.id DESC
+                       LIMIT 40""",
+                (staff_id_val, like, like, like, like)
+            )
     except Exception:
         results['documents'] = pd.DataFrame()
     try:
-        results['reports'] = fetch_df(
-            """SELECT r.id, p.code AS project_code, p.name AS project_name,
-                          COALESCE(r.cycle_no, 0) AS cycle_no,
-                          COALESCE(r.status,'APPROVED') AS status,
-                          COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp,
-                          LEFT(COALESCE(r.site_activities,'') || ' ' || COALESCE(r.reinforcement_observations,'') || ' ' ||
-                               COALESCE(r.concrete_observations,'') || ' ' || COALESCE(r.hse_observations,'') || ' ' ||
-                               COALESCE(r.rfi_notes,'') || ' ' || COALESCE(r.general_remarks,''), 220) AS snippet
-                   FROM biweekly_reports r
-                   LEFT JOIN projects p ON p.id=r.project_id
-                   WHERE COALESCE(r.status,'PENDING') <> 'REJECTED'
-                     AND (
-                         LOWER(COALESCE(p.code,'')) LIKE ?
-                      OR LOWER(COALESCE(p.name,'')) LIKE ?
-                      OR LOWER(COALESCE(r.site_activities,'')) LIKE ?
-                      OR LOWER(COALESCE(r.reinforcement_observations,'')) LIKE ?
-                      OR LOWER(COALESCE(r.concrete_observations,'')) LIKE ?
-                      OR LOWER(COALESCE(r.hse_observations,'')) LIKE ?
-                      OR LOWER(COALESCE(r.rfi_notes,'')) LIKE ?
-                      OR LOWER(COALESCE(r.general_remarks,'')) LIKE ?
-                   )
-                   ORDER BY stamp DESC, r.id DESC
-                   LIMIT 25""",
-            (like, like, like, like, like, like, like, like)
-        )
+        if is_admin_search:
+            results['reports'] = fetch_df(
+                """SELECT r.id, p.code AS project_code, p.name AS project_name,
+                              COALESCE(r.cycle_no, 0) AS cycle_no,
+                              COALESCE(r.status,'APPROVED') AS status,
+                              COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp,
+                              LEFT(COALESCE(r.site_activities,'') || ' ' || COALESCE(r.reinforcement_observations,'') || ' ' ||
+                                   COALESCE(r.concrete_observations,'') || ' ' || COALESCE(r.hse_observations,'') || ' ' ||
+                                   COALESCE(r.rfi_notes,'') || ' ' || COALESCE(r.general_remarks,''), 220) AS snippet
+                       FROM biweekly_reports r
+                       LEFT JOIN projects p ON p.id=r.project_id
+                       WHERE COALESCE(r.status,'PENDING') <> 'REJECTED'
+                         AND (
+                             LOWER(COALESCE(p.code,'')) LIKE ?
+                          OR LOWER(COALESCE(p.name,'')) LIKE ?
+                          OR LOWER(COALESCE(r.site_activities,'')) LIKE ?
+                          OR LOWER(COALESCE(r.reinforcement_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.concrete_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.hse_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.rfi_notes,'')) LIKE ?
+                          OR LOWER(COALESCE(r.general_remarks,'')) LIKE ?
+                       )
+                       ORDER BY stamp DESC, r.id DESC
+                       LIMIT 25""",
+                (like, like, like, like, like, like, like, like)
+            )
+        elif staff_id_val is None:
+            results['reports'] = pd.DataFrame()
+        else:
+            results['reports'] = fetch_df(
+                """SELECT r.id, p.code AS project_code, p.name AS project_name,
+                              COALESCE(r.cycle_no, 0) AS cycle_no,
+                              COALESCE(r.status,'APPROVED') AS status,
+                              COALESCE(r.submitted_on, r.uploaded_at, r.report_date) AS stamp,
+                              LEFT(COALESCE(r.site_activities,'') || ' ' || COALESCE(r.reinforcement_observations,'') || ' ' ||
+                                   COALESCE(r.concrete_observations,'') || ' ' || COALESCE(r.hse_observations,'') || ' ' ||
+                                   COALESCE(r.rfi_notes,'') || ' ' || COALESCE(r.general_remarks,''), 220) AS snippet
+                       FROM biweekly_reports r
+                       LEFT JOIN projects p ON p.id=r.project_id
+                       WHERE COALESCE(r.status,'PENDING') <> 'REJECTED'
+                         AND r.project_id IN (
+                             SELECT project_id FROM project_staff WHERE staff_id=?
+                         )
+                         AND (
+                             LOWER(COALESCE(p.code,'')) LIKE ?
+                          OR LOWER(COALESCE(p.name,'')) LIKE ?
+                          OR LOWER(COALESCE(r.site_activities,'')) LIKE ?
+                          OR LOWER(COALESCE(r.reinforcement_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.concrete_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.hse_observations,'')) LIKE ?
+                          OR LOWER(COALESCE(r.rfi_notes,'')) LIKE ?
+                          OR LOWER(COALESCE(r.general_remarks,'')) LIKE ?
+                       )
+                       ORDER BY stamp DESC, r.id DESC
+                       LIMIT 25""",
+                (staff_id_val, like, like, like, like, like, like, like, like)
+            )
     except Exception:
         results['reports'] = pd.DataFrame()
     try:
-        results['tests'] = fetch_df(
-            """SELECT tr.id, p.code AS project_code, p.name AS project_name, tr.test_type, tr.batch_id,
-                          COALESCE(tr.status,'APPROVED') AS status, COALESCE(tr.test_date, tr.uploaded_at) AS stamp,
-                          LEFT(COALESCE(tr.result_summary, tr.notes, ''), 220) AS snippet
-                   FROM test_results tr
-                   LEFT JOIN projects p ON p.id=tr.project_id
-                   WHERE LOWER(COALESCE(p.code,'')) LIKE ?
-                      OR LOWER(COALESCE(p.name,'')) LIKE ?
-                      OR LOWER(COALESCE(tr.test_type,'')) LIKE ?
-                      OR LOWER(COALESCE(tr.batch_id,'')) LIKE ?
-                      OR LOWER(COALESCE(tr.result_summary, tr.notes, '')) LIKE ?
-                   ORDER BY stamp DESC, tr.id DESC
-                   LIMIT 25""",
-            (like, like, like, like, like)
-        )
+        if is_admin_search:
+            results['tests'] = fetch_df(
+                """SELECT tr.id, p.code AS project_code, p.name AS project_name, tr.test_type, tr.batch_id,
+                              COALESCE(tr.status,'APPROVED') AS status, COALESCE(tr.test_date, tr.uploaded_at) AS stamp,
+                              LEFT(COALESCE(tr.result_summary, tr.notes, ''), 220) AS snippet
+                       FROM test_results tr
+                       LEFT JOIN projects p ON p.id=tr.project_id
+                       WHERE LOWER(COALESCE(p.code,'')) LIKE ?
+                          OR LOWER(COALESCE(p.name,'')) LIKE ?
+                          OR LOWER(COALESCE(tr.test_type,'')) LIKE ?
+                          OR LOWER(COALESCE(tr.batch_id,'')) LIKE ?
+                          OR LOWER(COALESCE(tr.result_summary, tr.notes, '')) LIKE ?
+                       ORDER BY stamp DESC, tr.id DESC
+                       LIMIT 25""",
+                (like, like, like, like, like)
+            )
+        elif staff_id_val is None:
+            results['tests'] = pd.DataFrame()
+        else:
+            results['tests'] = fetch_df(
+                """SELECT tr.id, p.code AS project_code, p.name AS project_name, tr.test_type, tr.batch_id,
+                              COALESCE(tr.status,'APPROVED') AS status, COALESCE(tr.test_date, tr.uploaded_at) AS stamp,
+                              LEFT(COALESCE(tr.result_summary, tr.notes, ''), 220) AS snippet
+                       FROM test_results tr
+                       LEFT JOIN projects p ON p.id=tr.project_id
+                       WHERE tr.project_id IN (
+                           SELECT project_id FROM project_staff WHERE staff_id=?
+                       )
+                         AND (
+                            LOWER(COALESCE(p.code,'')) LIKE ?
+                         OR LOWER(COALESCE(p.name,'')) LIKE ?
+                         OR LOWER(COALESCE(tr.test_type,'')) LIKE ?
+                         OR LOWER(COALESCE(tr.batch_id,'')) LIKE ?
+                         OR LOWER(COALESCE(tr.result_summary, tr.notes, '')) LIKE ?
+                         )
+                       ORDER BY stamp DESC, tr.id DESC
+                       LIMIT 25""",
+                (staff_id_val, like, like, like, like, like)
+            )
     except Exception:
         results['tests'] = pd.DataFrame()
     try:
-        results['chat'] = fetch_df(
-            """SELECT c.id, COALESCE(s.name,'Unknown') AS staff_name, c.created_at, LEFT(COALESCE(c.message,''), 220) AS snippet
-                   FROM chat_messages c
-                   LEFT JOIN staff s ON s.id=c.staff_id
-                   WHERE LOWER(COALESCE(c.message,'')) LIKE ?
-                   ORDER BY c.created_at DESC, c.id DESC
-                   LIMIT 25""",
-            (like,)
-        )
+        if is_admin_search:
+            results['chat'] = fetch_df(
+                """SELECT c.id, COALESCE(s.name,'Unknown') AS staff_name, c.created_at, LEFT(COALESCE(c.message,''), 220) AS snippet
+                       FROM chat_messages c
+                       LEFT JOIN staff s ON s.id=c.staff_id
+                       WHERE LOWER(COALESCE(c.message,'')) LIKE ?
+                       ORDER BY c.created_at DESC, c.id DESC
+                       LIMIT 25""",
+                (like,)
+            )
+        else:
+            results['chat'] = pd.DataFrame()
     except Exception:
         results['chat'] = pd.DataFrame()
     return results
@@ -4689,12 +3457,12 @@ def page_chat():
 
     with st.form('chat_send', clear_on_submit=True):
         selected_mentions = st.multiselect(
-            'Tag staff (optional — type to search, full name will be inserted automatically)',
+            'Tag staff (optional  type to search, full name will be inserted automatically)',
             options=mention_names,
             default=[],
             key='chat_mentions_picker'
         )
-        msg=st.text_area('Message', height=90, placeholder='Type your message…')
+        msg=st.text_area('Message', height=90, placeholder='Type your message')
         img=st.file_uploader('Optional image', type=['png','jpg','jpeg','webp','gif'])
         sent=st.form_submit_button('Send')
         if sent:
@@ -4771,16 +3539,16 @@ def page_search():
     if len(str(q or '').strip()) < 2:
         st.info('Type at least 2 characters to search.')
         return
-    res = worknest_search(q)
+    res = worknest_search(q, current_staff_id(), 1 if is_admin() else 0)
     total = sum(0 if getattr(df, 'empty', True) else len(df) for df in res.values())
-    st.caption(f"Results for: {q} — {total} match(es)")
+    st.caption(f"Results for: {q}  {total} match(es)")
 
     if not res['projects'].empty:
         st.markdown('### Projects')
         for _, r in res['projects'].iterrows():
             c1, c2 = st.columns([6,1])
             with c1:
-                st.write(f"**{r.get('code','')} — {r.get('name','')}**")
+                st.write(f"**{r.get('code','')}  {r.get('name','')}**")
                 meta = " | ".join([x for x in [str(r.get('client') or '').strip(), str(r.get('location') or '').strip(), str(r.get('status') or '').strip()] if x])
                 if meta:
                     st.caption(meta)
@@ -4798,7 +3566,7 @@ def page_search():
         for _, r in ddf.iterrows():
             c1, c2, c3 = st.columns([6,1,1])
             with c1:
-                st.write(f"**{r.get('project_code','')} — {r.get('project_name','')}** | {r.get('category','')} | {os.path.basename(str(r.get('file_path') or ''))}")
+                st.write(f"**{r.get('project_code','')}  {r.get('project_name','')}** | {r.get('category','')} | {os.path.basename(str(r.get('file_path') or ''))}")
                 st.caption(str(r.get('uploaded_at') or ''))
             with c2:
                 if st.button('Open', key=f"srch_doc_open_{int(r['id'])}"):
@@ -4844,605 +3612,8 @@ def _build_expected_biweekly_windows(start_date:date, today:date)->list:
         out.append((cur, nxt))
         cur=nxt
     return out
-def page_projects():
-    st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
-    # For Staff: show posted projects first, then the rest.
-    if is_admin() or can_manage_projects():
-        projects=fetch_df("""
-            SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
-                   COALESCE(p.status,'ACTIVE') AS status, p.dormant_since, p.dormant_reason,
-                   (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor
-            FROM projects p
-            ORDER BY CASE WHEN COALESCE(p.status,'ACTIVE')='ACTIVE' THEN 0 ELSE 1 END, p.code
-        """)
-    else:
-        sid = current_staff_id()
-        projects=fetch_df("""
-            SELECT p.id, p.code, p.name, p.client, p.location, p.start_date, p.end_date, p.next_due_date, p.supervisor_staff_id,
-                   COALESCE(p.status,'ACTIVE') AS status, p.dormant_since, p.dormant_reason,
-                   (SELECT name FROM staff s WHERE s.id=p.supervisor_staff_id) supervisor,
-                   CASE WHEN EXISTS (
-                        SELECT 1 FROM project_staff ps
-                        WHERE ps.project_id = p.id AND ps.staff_id = ?
-                   ) THEN 0 ELSE 1 END AS _posted_sort
-            FROM projects p
-            ORDER BY _posted_sort, p.code
-        """, (sid,))
+from views.projects import page_projects
 
-    # Filter large project lists
-    proj_filter = st.radio("Project view", ["Active", "Dormant", "All"], horizontal=True, key="proj_filter")
-    if not projects.empty:
-        ps = projects["status"].astype(str).str.upper()
-        if proj_filter == "Active":
-            projects = projects[ps == "ACTIVE"]
-        elif proj_filter == "Dormant":
-            projects = projects[ps == "DORMANT"]
-
-    # Admin control: global reset of next bi-weekly due dates
-    if is_admin():
-        with st.expander("🛠️ Admin: Reset live bi-weekly cycle (global)", expanded=False):
-            st.caption("This realigns every project to the same live reporting baseline. It updates each project's next due date and also resets the global cycle anchor used for report numbering and compliance.")
-            reset_date = st.date_input("Set live cycle start / next due date for all projects", value=date(2026,4,14), key="global_due_reset")
-            if st.button("Apply global reset", key="btn_global_due_reset"):
-                execute("UPDATE projects SET next_due_date=?", (str(reset_date),))
-                execute("""INSERT INTO app_settings(key,value) VALUES(?,?)
-                           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", ("GLOBAL_BIWEEKLY_NEXT_DUE", str(reset_date)))
-                execute("""INSERT INTO app_settings(key,value) VALUES(?,?)
-                           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""", ("BIWEEKLY_CYCLE_START_DATE", str(reset_date)))
-                st.success(f"Updated all projects: next due date and cycle anchor set to {reset_date}.")
-                st.rerun()
-
-    left,right=st.columns([1,2])
-    with left:
-        st.subheader("Project List")
-        if projects.empty:
-            st.info("No projects yet. Use the form on the right to add one.")
-            selected=None
-        else:
-            labels=[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
-            pre_idx = 0
-            try:
-                target_pid = st.session_state.get("selected_project_id")
-                if target_pid is not None:
-                    match_idx = next((i for i, (_, rr) in enumerate(projects.iterrows()) if int(rr["id"]) == int(target_pid)), None)
-                    if match_idx is not None:
-                        pre_idx = match_idx
-            except Exception:
-                pre_idx = 0
-            selected_label=st.selectbox("Select a project", labels, index=pre_idx if labels else 0, key="proj_select")
-            selected=projects.iloc[labels.index(selected_label)] if labels else None
-    with right:
-        st.subheader("Create / Update Project")
-        if not can_manage_projects():
-            st.info("Only Admin can create/update/delete projects.")
-
-        # Streamlit widgets keep values by key; so ensure keys vary by selected project.
-        # This makes the right-side panel instantly reflect the selected project.
-        suffix = f"_{int(selected['id'])}" if selected is not None else "_new"
-
-        staff=fetch_df("SELECT id,name,section FROM staff ORDER BY name")
-        sup_names=["—"]+[s for s in staff["name"].tolist()] if not staff.empty else ["—"]
-        code=st.text_input("Code", value=(selected["code"] if selected is not None else ""), key=f"proj_code{suffix}")
-        name=st.text_input("Name", value=(selected["name"] if selected is not None else ""), key=f"proj_name{suffix}")
-        client=st.text_input("Client", value=(selected["client"] if selected is not None and pd.notna(selected["client"]) else ""), key=f"proj_client{suffix}")
-        location=st.text_input("Location", value=(selected["location"] if selected is not None and pd.notna(selected["location"]) else ""), key=f"proj_loc{suffix}")
-        start=st.date_input("Start Date", value=date.today(), key="lv_start")
-        end=st.date_input("End Date", value=(safe_parse_date(selected["end_date"], date.today()) if selected is not None else date.today()), key=f"proj_end{suffix}")
-        sup_default = selected["supervisor"] if (selected is not None and pd.notna(selected["supervisor"])) else "—"
-        sup_name=st.selectbox("Supervisor", sup_names, index=sup_names.index(sup_default) if sup_default in sup_names else 0, key=f"proj_sup{suffix}")
-        status_opts = ["ACTIVE", "DORMANT"]
-        p_status = st.selectbox("Project Status", status_opts, index=(status_opts.index(str(selected.get('status') or 'ACTIVE').upper()) if selected is not None and str(selected.get('status') or 'ACTIVE').upper() in status_opts else 0), key=f"proj_status{suffix}")
-        dormant_since = st.text_input("Dormant Since (YYYY-MM-DD)", value=(selected.get('dormant_since') if selected is not None and pd.notna(selected.get('dormant_since')) else ""), key=f"proj_dormant_since{suffix}") if p_status == "DORMANT" else ""
-        dormant_reason = st.text_input("Dormant Reason", value=(selected.get('dormant_reason') if selected is not None and pd.notna(selected.get('dormant_reason')) else ""), key=f"proj_dormant_reason{suffix}") if p_status == "DORMANT" else ""
-        colA,colB=st.columns(2)
-        with colA:
-            if can_manage_projects() and st.button("💾 Save / Update", key=f"proj_save{suffix}"):
-                if selected is None:
-                    sup_id=None
-                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""INSERT INTO projects (code,name,client,location,start_date,end_date,supervisor_staff_id,status,dormant_since,dormant_reason)
-                               VALUES (?,?,?,?,?,?,?,?,?,?)""", (code,name,client or None,location or None,str(start),str(end),sup_id,p_status,dormant_since or None,dormant_reason or None))
-                    st.success("Project created.")
-                else:
-                    sup_id=None
-                    if sup_name!="—": sup_id=int(staff[staff["name"]==sup_name]["id"].iloc[0])
-                    execute("""UPDATE projects SET code=?,name=?,client=?,location=?,start_date=?,end_date=?,supervisor_staff_id=?,status=?,dormant_since=?,dormant_reason=? WHERE id=?""",
-                            (code,name,client or None,location or None,str(start),str(end),sup_id,p_status,(dormant_since or None) if p_status=='DORMANT' else None,(dormant_reason or None) if p_status=='DORMANT' else None,int(selected["id"])))
-                    st.success("Project updated.")
-                st.rerun()
-        with colB:
-            if (selected is not None) and st.button("🗑️ Delete", key=f"proj_del{suffix}"):
-                execute("DELETE FROM projects WHERE id=?", (int(selected["id"]),))
-                st.success("Project deleted."); st.rerun()
-
-    if selected is not None:
-        pid=int(selected["id"])
-        st.markdown("### Posted Staff")
-        df=fetch_df("""
-            SELECT s.name, s.rank, ps.role
-            FROM project_staff ps JOIN staff s ON s.id=ps.staff_id
-            WHERE ps.project_id=? ORDER BY s.rank, s.name
-        """,(pid,))
-        st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), width='stretch')
-
-        st.markdown("---")
-        tabs = st.tabs(["🏢 Buildings","📄 Core Docs","🧪 Tests","📝 Biweekly Reports"])
-
-        # Buildings
-        with tabs[0]:
-            bdf=fetch_df("SELECT id,name,floors FROM buildings WHERE project_id=? ORDER BY name",(pid,))
-            st.subheader("Buildings")
-            st.dataframe(bdf if not bdf.empty else pd.DataFrame(columns=["id","name","floors"]), width='stretch')
-            st.markdown("**Add / Edit Building**")
-            names = ["— New —"] + (bdf["name"].tolist() if not bdf.empty else [])
-            pick = st.selectbox("Choose building", names, key="b_pick")
-            if pick=="— New —":
-                b_name = st.text_input("Building name", key="b_name_new")
-                floors = st.number_input("Floors", 0, 200, 0, key="b_f_new")
-                if st.button("➕ Add Building", key="b_add"):
-                    execute("INSERT INTO buildings (project_id,name,floors) VALUES (?,?,?)",(pid,b_name,int(floors)))
-                    st.success("Building added."); st.rerun()
-            else:
-                brow = bdf[bdf["name"]==pick].iloc[0]
-                b_name = st.text_input("Building name", value=brow["name"], key="b_name_edit")
-                floors = st.number_input("Floors", 0, 200, int(brow["floors"]), key="b_f_edit")
-                colx,coly=st.columns(2)
-                with colx:
-                    if st.button("💾 Save Building", key="b_save"):
-                        execute("UPDATE buildings SET name=?, floors=? WHERE id=?", (b_name,int(floors),int(brow["id"])))
-                        st.success("Building updated."); st.rerun()
-                with coly:
-                    if st.button("🗑️ Delete Building", key="b_del"):
-                        execute("DELETE FROM buildings WHERE id=?", (int(brow["id"]),))
-                        st.success("Building deleted."); st.rerun()
-
-        # Core Documents upload/list
-        with tabs[1]:
-            st.subheader("Core Documents")
-            c1,c2=st.columns(2)
-            with c1:
-                st.caption("Required categories: " + ", ".join(CORE_DOC_CATEGORIES))
-            with c2:
-                allowed = can_upload_core_to_project(pid)
-                st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-            if allowed:
-                cat = st.selectbox("Category", CORE_DOC_CATEGORIES, key="doc_cat")
-                up = st.file_uploader("Upload file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key="doc_file")
-                if st.button("⬆️ Upload Document", key="doc_up"):
-                    path=save_uploaded_file(up, f"project_{pid}/docs")
-                    if path:
-                        execute("""INSERT INTO documents (project_id, building_id, category, file_path, uploaded_at, uploader_staff_id)
-                                   VALUES (?,?,?,?,?,?)""",(pid, None, cat, path, datetime.now().isoformat(timespec="seconds"), current_staff_id()))
-                        st.success("Document uploaded.")
-                    else:
-                        st.error("Select a file first.")
-            ddf=fetch_df("SELECT id,category,file_path,uploaded_at FROM documents WHERE project_id=? ORDER BY uploaded_at DESC",(pid,))
-            if ddf.empty:
-                st.info("No documents yet.")
-            else:
-                for _,r in ddf.iterrows():
-                    colA,colB=st.columns([3,1])
-                    with colA: st.write(f"**{r['category']}** — {os.path.basename(r['file_path'])}  \n*{r['uploaded_at']}*")
-                    with colB: file_download_button("⬇️ Download", r["file_path"], key=f"docdl{r['id']}")
-
-        # Tests upload/list
-        with tabs[2]:
-            st.subheader("Test Results (per building & stage)")
-            allowed = can_upload_project_outputs(pid)
-            st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-
-            edit_test_id = st.session_state.get(f"test_edit_{pid}")
-            edit_test = None
-            if edit_test_id:
-                tedit = fetch_df("SELECT * FROM test_results WHERE id=? AND project_id=?", (int(edit_test_id), pid))
-                if not tedit.empty:
-                    edit_test = tedit.iloc[0]
-
-            bdf=fetch_df("SELECT id,name FROM buildings WHERE project_id=? ORDER BY name",(pid,))
-            b_opts = ["— (no specific building) —"] + (bdf["name"].tolist() if not bdf.empty else [])
-            selected_b = "— (no specific building) —"
-            if edit_test is not None and pd.notna(edit_test.get('building_id')) and not bdf.empty:
-                mt = bdf[bdf['id']==int(edit_test['building_id'])]
-                if not mt.empty:
-                    selected_b = str(mt['name'].iloc[0])
-            with st.form(f"test_form_{pid}"):
-                b_pick = st.selectbox("Building", b_opts, index=(b_opts.index(selected_b) if selected_b in b_opts else 0), key=f"t_building_{pid}")
-                bid = None
-                if b_pick!="— (no specific building) —" and (not bdf.empty):
-                    bid = int(bdf[bdf["name"]==b_pick]["id"].iloc[0])
-                stage_default = str(edit_test.get('stage') or STAGES[0]) if edit_test is not None else STAGES[0]
-                stage = st.selectbox("Stage", STAGES, index=(STAGES.index(stage_default) if stage_default in STAGES else 0), key=f"t_stage_{pid}")
-                labels = [x[1] for x in TEST_TYPES_DISPLAY]
-                reverse = {v:k for k,v in TEST_TYPES_DISPLAY}
-                default_label = next((v for k,v in TEST_TYPES_DISPLAY if edit_test is not None and k == str(edit_test.get('test_type') or '')), labels[0])
-                ttype_label = st.selectbox("Test Type", labels, index=(labels.index(default_label) if default_label in labels else 0), key=f"t_type_{pid}")
-                ttype = reverse[ttype_label]
-                batch_needed = (ttype in ["steel","reinforcement"])
-                batch_id = st.text_input("Batch ID (required for batch tests)", value=(str(edit_test.get('batch_id') or '') if edit_test is not None else ''), key=f"t_batch_{pid}") if batch_needed else None
-                test_date_val = safe_parse_date(edit_test.get('test_date'), date.today()) if edit_test is not None else date.today()
-                test_date = st.date_input("Test Date", value=test_date_val, key=f"t_date_{pid}")
-                result_summary = st.text_area("Result Summary / Notes", value=(str(edit_test.get('result_summary') or edit_test.get('notes') or '') if edit_test is not None else ''), key=f"t_summary_{pid}")
-                attachment_caption = st.text_input("Attachment caption", value='', key=f"t_caption_{pid}")
-                up = st.file_uploader("Upload test result file (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"t_file_{pid}")
-                c1, c2 = st.columns(2)
-                submit_label = "💾 Update Test Result" if edit_test is not None else "⬆️ Save Test Result"
-                save_test = c1.form_submit_button(submit_label)
-                cancel_test = c2.form_submit_button("Cancel Edit") if edit_test is not None else False
-            if cancel_test:
-                st.session_state.pop(f"test_edit_{pid}", None)
-                st.rerun()
-            if save_test:
-                if not allowed:
-                    st.error("You don't have permission to upload to this project.")
-                elif batch_needed and (not batch_id or not str(batch_id).strip()):
-                    st.error("Batch ID is required for steel/reinforcement tests.")
-                else:
-                    now_iso = datetime.now().isoformat(timespec='seconds')
-                    if edit_test is not None and _editable_status(edit_test.get('status')) and int(edit_test.get('uploader_staff_id') or -1) == int(current_staff_id() or -999) or is_admin():
-                        path = str(edit_test.get('file_path') or '')
-                        if up is not None:
-                            path = save_uploaded_file(up, f"project_{pid}/tests") or path
-                        execute("UPDATE test_results SET building_id=?, stage=?, test_type=?, batch_id=?, file_path=?, test_date=?, result_summary=?, notes=?, updated_at=?, status=? WHERE id=?",
-                                (bid, stage, ttype, batch_id, path, str(test_date), result_summary, result_summary, now_iso, 'PENDING', int(edit_test['id'])))
-                        rid = int(edit_test['id'])
-                        if up is not None:
-                            _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
-                        admin_numbers = _admin_phones()
-                        if admin_numbers:
-                            _send_sms_notice(
-                                admin_numbers,
-                                f"WorkNest: Test result resubmitted for {selected['code']} ({str(test_date)}). Please review."
-                            )
-                        st.success("Test result updated and resubmitted for admin review.")
-                        st.session_state.pop(f"test_edit_{pid}", None)
-                        st.rerun()
-                    else:
-                        path = save_uploaded_file(up, f"project_{pid}/tests") if up is not None else ''
-                        rid = execute("""INSERT INTO test_results (project_id,building_id,stage,test_type,batch_id,file_path,uploaded_at,uploader_staff_id,test_date,result_summary,notes,status,updated_at)
-                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                      (pid, bid, stage, ttype, batch_id, path or '', now_iso, current_staff_id(), str(test_date), result_summary, result_summary, 'PENDING', now_iso))
-                        if up is not None:
-                            _save_test_result_attachment(rid, up, attachment_caption, pid=pid)
-                        admin_numbers = _admin_phones()
-                        if admin_numbers:
-                            _send_sms_notice(
-                                admin_numbers,
-                                f"WorkNest: New test result submitted for {selected['code']} ({str(test_date)}). Please review."
-                            )
-                        st.success("Test result saved — pending admin approval.")
-                        st.rerun()
-
-            tdf=fetch_df("""
-                SELECT tr.id, b.name AS building, tr.building_id, tr.stage, tr.test_type, tr.batch_id, tr.file_path, tr.uploaded_at, tr.test_date,
-                       COALESCE(tr.result_summary,tr.notes,'') AS result_summary, COALESCE(tr.status,'APPROVED') AS status, tr.uploader_staff_id
-                FROM test_results tr
-                LEFT JOIN buildings b ON b.id=tr.building_id
-                WHERE tr.project_id=?
-                  AND (COALESCE(tr.status,'APPROVED')='APPROVED' OR tr.uploader_staff_id=? OR ?=1)
-                ORDER BY COALESCE(tr.updated_at,tr.uploaded_at) DESC, tr.id DESC
-            """,(pid, current_staff_id() or -1, 1 if is_admin() else 0))
-            if tdf.empty:
-                st.info("No tests uploaded yet.")
-            else:
-                for _,r in tdf.iterrows():
-                    ctop, cstat = st.columns([4,1])
-                    bname = r["building"] if pd.notna(r["building"]) else "—"
-                    lab = str(r["test_type"]).capitalize()
-                    if r["test_type"] in ["steel","reinforcement"] and pd.notna(r["batch_id"]):
-                        lab += f" (Batch: {r['batch_id']})"
-                    with ctop:
-                        st.markdown(f"**{lab}** — Building: {bname} — Stage: {r['stage']}  \n**Test Date:** {r.get('test_date') or '—'}  \n{r.get('result_summary') or ''}")
-                    with cstat:
-                        st.markdown(f"<span class='pill'>{r['status']}</span>", unsafe_allow_html=True)
-                    cols = st.columns([1,1,1,1])
-                    if str(r.get('file_path') or '').strip():
-                        with cols[0]:
-                            file_download_button("⬇️ Main File", r["file_path"], key=f"tdl{r['id']}")
-                    editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
-                    if editable:
-                        with cols[1]:
-                            if st.button("✏️ Edit", key=f"tedit_{r['id']}"):
-                                st.session_state[f"test_edit_{pid}"] = int(r['id'])
-                                st.rerun()
-                    if is_admin():
-                        with cols[2]:
-                            if r['status']!='APPROVED' and st.button("✅ Approve", key=f"tapp{r['id']}"):
-                                execute("UPDATE test_results SET status='APPROVED', reviewed_by_staff_id=?, reviewed_at=?, approved_at=?, approved_by_staff_id=? WHERE id=?",
-                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
-                                st.rerun()
-                        with cols[3]:
-                            if r['status']!='REJECTED' and st.button("✖ Reject", key=f"trej{r['id']}"):
-                                execute("UPDATE test_results SET status='REJECTED', reviewed_by_staff_id=?, reviewed_at=? WHERE id=?",
-                                        (current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
-                                st.rerun()
-                    _render_attachment_list('test', int(r['id']), f"tatt_{r['id']}")
-                    st.markdown('---')
-
-        # Biweekly Reports
-        with tabs[3]:
-            st.subheader("Biweekly Reports")
-            allowed = can_upload_project_outputs(pid)
-            st.markdown(f"Upload permission: <span class='pill'>{'Yes' if allowed else 'No'}</span>", unsafe_allow_html=True)
-            if _project_is_dormant(pid):
-                st.info("This project is dormant. Biweekly reporting is ignored while dormant.")
-                current_cycle, cycle_reason = None, "Dormant project"
-            else:
-                current_cycle, cycle_reason = _project_open_biweekly_cycle(pid)
-                if current_cycle is not None:
-                    st.markdown(
-                        f"""
-                        <div style="background:#f8f9fa;border:1px solid #d9d9d9;border-radius:10px;padding:14px 16px;margin:8px 0 12px 0;color:#111;line-height:1.65;">
-                          <div style="font-size:1.05rem;font-weight:700;margin-bottom:8px;">Current Reporting Window</div>
-                          <div><strong>Report No:</strong> {current_cycle['cycle_no']}</div>
-                          <div><strong>Reporting Period:</strong> {current_cycle['window_start'].isoformat()} → {current_cycle['window_end'].isoformat()}</div>
-                          <div><strong>Submission Deadline:</strong> Tue {current_cycle['due_date'].isoformat()}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.info(cycle_reason or "No report window is currently available for upload.")
-
-            hist = _project_missing_historical_cycles(pid)
-            if hist:
-                with st.expander("Historical Backfill (old report cycles)", expanded=False):
-                    options = {f"Report {c['cycle_no']} — {c['window_start'].isoformat()} → {c['window_end'].isoformat()} — Due {c['due_date'].isoformat()}": c for c in hist}
-                    pick = st.selectbox("Historical cycle", list(options.keys()), key=f"hist_pick_{pid}")
-                    chosen = options[pick]
-                    manual_sub = st.date_input("Actual submission date", value=chosen['due_date'], key=f"hist_sub_{pid}")
-                    up_hist = st.file_uploader("Upload historical biweekly report (PDF/Image)", type=["pdf","png","jpg","jpeg"], key=f"bw_hist_file_{pid}")
-                    if st.button("⬆️ Upload Historical Report", key=f"bw_hist_up_{pid}"):
-                        if not allowed:
-                            st.error("You don't have permission to upload to this project.")
-                        else:
-                            path = save_uploaded_file(up_hist, f"project_{pid}/reports")
-                            if path:
-                                timing_status = _biweekly_timing_status(chosen['due_date'], manual_sub)
-                                execute(
-                                    "INSERT INTO biweekly_reports (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                    (pid, str(chosen['due_date']), path, datetime.now().isoformat(timespec='seconds'), str(manual_sub), current_staff_id(), 'PENDING', int(chosen['cycle_no']), str(chosen['window_start']), str(chosen['window_end']), str(chosen['due_date']), timing_status)
-                                )
-                                st.success(f"Historical report uploaded. Status: {_timing_status_label(timing_status)} — pending admin approval.")
-                                st.rerun()
-                            else:
-                                st.error("Select a file first.")
-
-            edit_report_id = st.session_state.get(f"bw_edit_{pid}")
-            edit_report = None
-            if edit_report_id:
-                edf = fetch_df("SELECT * FROM biweekly_reports WHERE id=? AND project_id=?", (int(edit_report_id), pid))
-                if not edf.empty:
-                    edit_report = edf.iloc[0]
-            elif current_cycle is not None and current_staff_id() is not None:
-                draft_df = fetch_df("""SELECT * FROM biweekly_reports
-                                       WHERE project_id=? AND uploader_staff_id=? AND cycle_no=? AND COALESCE(status,'PENDING') <> 'APPROVED'
-                                       ORDER BY id DESC LIMIT 1""",
-                                    (pid, current_staff_id(), int(current_cycle['cycle_no'])))
-                if not draft_df.empty:
-                    edit_report = draft_df.iloc[0]
-
-            if current_cycle is not None or edit_report is not None:
-                default_cycle = int(edit_report['cycle_no']) if edit_report is not None and pd.notna(edit_report.get('cycle_no')) else (int(current_cycle['cycle_no']) if current_cycle is not None else None)
-                default_start = safe_parse_date(edit_report.get('window_start'), current_cycle['window_start'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_start'] if current_cycle is not None else date.today())
-                default_end = safe_parse_date(edit_report.get('window_end'), current_cycle['window_end'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['window_end'] if current_cycle is not None else date.today())
-                default_due = safe_parse_date(edit_report.get('due_date'), current_cycle['due_date'] if current_cycle is not None else date.today()) if edit_report is not None else (current_cycle['due_date'] if current_cycle is not None else date.today())
-                st.markdown("#### Complete report in WorkNest")
-                st.caption("This report can be edited until admin approval. Once approved, it becomes locked.")
-                if edit_report is not None and str(edit_report.get("status") or "").upper() == "NEEDS_REVISION":
-                    st.warning(f"Revision requested: {edit_report.get('review_note') or 'Please review and update this report before resubmitting.'}")
-                cmeta1, cmeta2, cmeta3 = st.columns(3)
-                cmeta1.text_input("Report No.", value=(str(default_cycle) if default_cycle is not None else ''), disabled=True, key=f"bw_cycle_{pid}")
-                cmeta2.text_input("Reporting Window", value=f"{default_start} → {default_end}", disabled=True, key=f"bw_window_{pid}")
-                cmeta3.text_input("Submission Deadline", value=str(default_due), disabled=True, key=f"bw_due_{pid}")
-                report_date_val = safe_parse_date(edit_report.get('report_date'), default_due) if edit_report is not None else default_due
-                structured_existing = _normalize_biweekly_structured_payload(edit_report.get('structured_report_json') if edit_report is not None else None)
-                default_selected_modules = structured_existing.get("selected_modules") or []
-                module_options = list(_BIWEEKLY_MODULES.keys())
-                selected_modules = st.multiselect(
-                    "Observed structural activities",
-                    options=module_options,
-                    default=default_selected_modules,
-                    format_func=lambda k: _BIWEEKLY_MODULES[k]["label"],
-                    key=f"bw_modules_{pid}",
-                    help="Select only the activities actually observed on site for this reporting visit.",
-                )
-                if selected_modules:
-                    st.caption("Complete the compliance checkpoints for each observed activity.")
-                else:
-                    st.info("Select at least one observed activity to open the structured inspection sections.")
-
-                with st.form(f"bw_form_{pid}"):
-                    report_date = st.date_input("Report Date", value=report_date_val, key=f"bw_report_date_{pid}")
-                    structured_payload = {"selected_modules": selected_modules, "modules": {}}
-                    for module_key in selected_modules:
-                        meta = _BIWEEKLY_MODULES[module_key]
-                        module_state = structured_existing["modules"].get(module_key, _biweekly_default_module_state(module_key))
-                        with st.expander(meta["label"], expanded=True):
-                            checks_state = {}
-                            for idx, (field_key, label) in enumerate(meta.get("checks", [])):
-                                checks_state[field_key] = st.selectbox(
-                                    label,
-                                    _BIWEEKLY_STATUS_OPTIONS,
-                                    index=max(0, _BIWEEKLY_STATUS_OPTIONS.index(module_state["checks"].get(field_key, "Not checked")) if module_state["checks"].get(field_key, "Not checked") in _BIWEEKLY_STATUS_OPTIONS else 2),
-                                    key=f"bw_{module_key}_{field_key}_{pid}",
-                                )
-                            extras_state = {}
-                            for field_key, label in meta.get("extras", []):
-                                if field_key in meta.get("selects", {}):
-                                    opts = meta["selects"][field_key]
-                                    current_val = module_state["extras"].get(field_key, opts[0])
-                                    extras_state[field_key] = st.selectbox(
-                                        label,
-                                        opts,
-                                        index=max(0, opts.index(current_val) if current_val in opts else 0),
-                                        key=f"bw_{module_key}_{field_key}_{pid}",
-                                    )
-                                else:
-                                    extras_state[field_key] = st.text_input(
-                                        label,
-                                        value=str(module_state["extras"].get(field_key) or ""),
-                                        key=f"bw_{module_key}_{field_key}_{pid}",
-                                    )
-                            remarks_val = st.text_area(
-                                f"{meta['label']} remarks",
-                                value=str(module_state.get("remarks") or ""),
-                                height=80,
-                                key=f"bw_{module_key}_remarks_{pid}",
-                            )
-                            structured_payload["modules"][module_key] = {
-                                "checks": checks_state,
-                                "extras": extras_state,
-                                "remarks": remarks_val,
-                            }
-                    hse_observations = st.text_area("HSE Observations", value=(str(edit_report.get('hse_observations') or '') if edit_report is not None else ''), height=80, key=f"bw_hse_{pid}")
-                    rfi_notes = st.text_area("RFI / EI Notes", value=(str(edit_report.get('rfi_notes') or '') if edit_report is not None else ''), height=80, key=f"bw_rfi_{pid}")
-                    general_remarks = st.text_area("General Remarks", value=(str(edit_report.get('general_remarks') or '') if edit_report is not None else ''), height=100, key=f"bw_rem_{pid}")
-                    legacy_sections = _legacy_sections_from_structured(structured_payload, hse_observations, rfi_notes, general_remarks)
-                    site_activities = legacy_sections["site_activities"]
-                    reinforcement_observations = legacy_sections["reinforcement_observations"]
-                    concrete_observations = legacy_sections["concrete_observations"]
-                    structured_report_json = _structured_payload_to_json(structured_payload)
-                    st.markdown("**Images only**")
-                    st.caption("Maximum of 5 images. On phones, use the Upload button to choose from gallery or camera. On computers, upload from storage only.")
-                    photo_files = st.file_uploader("Upload images (maximum 5)", type=["png","jpg","jpeg"], accept_multiple_files=True, key=f"bw_files_{pid}")
-                    if photo_files and len(photo_files) > 5:
-                        st.error("Maximum of 5 images allowed. Only the first 5 will be used.")
-                        photo_files = photo_files[:5]
-                    if photo_files:
-                        st.caption(f"{len(photo_files)}/5 images selected")
-                    caption_register = st.text_area("Image caption register (one line per image)", value='', help="Write captions line by line in the same order as the uploaded images.", key=f"bw_caps_{pid}")
-                    f1, f2 = st.columns(2)
-                    submit_text = "💾 Update Report" if edit_report is not None else "⬆️ Submit Report"
-                    do_save = f1.form_submit_button(submit_text)
-                    do_cancel = f2.form_submit_button("Cancel Edit") if edit_report is not None else False
-                if do_cancel:
-                    st.session_state.pop(f"bw_edit_{pid}", None)
-                    st.rerun()
-                if do_save:
-                    if not allowed:
-                        st.error("You don't have permission to upload to this project.")
-                    elif not selected_modules:
-                        st.error("Select at least one observed activity before submitting the report.")
-                    elif current_cycle is None and edit_report is None:
-                        st.error(cycle_reason or "No open reporting cycle is available.")
-                    else:
-                        now_iso = datetime.now().isoformat(timespec='seconds')
-                        target_cycle = default_cycle
-                        target_start = default_start
-                        target_end = default_end
-                        target_due = default_due
-                        submitted_on = _today()
-                        timing_status = _biweekly_timing_status(target_due, submitted_on)
-                        if edit_report is not None and (_editable_status(edit_report.get('status')) and (is_admin() or int(edit_report.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))):
-                            base_path = str(edit_report.get('file_path') or '')
-                            first_new = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            if first_new:
-                                base_path = first_new
-                            execute("""UPDATE biweekly_reports
-                                       SET report_date=?, file_path=?, updated_at=?, submitted_on=?, status=?, cycle_no=?, window_start=?, window_end=?, due_date=?, timing_status=?,
-                                           site_activities=?, reinforcement_observations=?, concrete_observations=?, hse_observations=?, rfi_notes=?, general_remarks=?, selected_modules=?, structured_report_json=?, review_note=?, reviewed_at=?, reviewed_by_staff_id=?
-                                       WHERE id=?""",
-                                    (str(report_date), base_path or '', now_iso, str(submitted_on), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status,
-                                     site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, json.dumps(selected_modules), structured_report_json, None, None, None, int(edit_report['id'])))
-                            _save_biweekly_attachments(int(edit_report['id']), photo_files, None, caption_register, pid=pid)
-                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(edit_report['id']),))
-                            if not refreshed.empty:
-                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(edit_report['id']),))
-                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
-                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(edit_report['id'])))
-                            admin_numbers = _admin_phones()
-                            if admin_numbers:
-                                _send_sms_notice(
-                                    admin_numbers,
-                                    f"WorkNest: Biweekly report resubmitted for {selected['code']} - Report {int(target_cycle) if target_cycle is not None else 'N/A'}. Please review."
-                                )
-                            st.success("Report updated and resubmitted for admin review.")
-                            st.session_state.pop(f"bw_edit_{pid}", None)
-                            st.rerun()
-                        else:
-                            base_path = save_uploaded_file(photo_files[0], f"project_{pid}/reports") if photo_files else None
-                            rid = execute(
-                                """INSERT INTO biweekly_reports
-                                   (project_id,report_date,file_path,uploaded_at,submitted_on,uploader_staff_id,status,cycle_no,window_start,window_end,due_date,timing_status,site_activities,reinforcement_observations,concrete_observations,hse_observations,rfi_notes,general_remarks,updated_at,selected_modules,structured_report_json)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (pid, str(report_date), base_path or '', now_iso, str(submitted_on), current_staff_id(), 'SUBMITTED', int(target_cycle) if target_cycle is not None else None, str(target_start), str(target_end), str(target_due), timing_status, site_activities, reinforcement_observations, concrete_observations, hse_observations, rfi_notes, general_remarks, now_iso, json.dumps(selected_modules), structured_report_json)
-                            )
-                            _save_biweekly_attachments(int(rid), photo_files, None, caption_register, pid=pid)
-                            refreshed = fetch_df("SELECT * FROM biweekly_reports WHERE id=?", (int(rid),))
-                            if not refreshed.empty:
-                                atts = fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(rid),))
-                                pdf_path = _build_biweekly_pdf_file(refreshed.iloc[0].to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=atts)
-                                execute("UPDATE biweekly_reports SET report_pdf_path=? WHERE id=?", (pdf_path, int(rid)))
-                            admin_numbers = _admin_phones()
-                            if admin_numbers:
-                                _send_sms_notice(
-                                    admin_numbers,
-                                    f"WorkNest: New biweekly report submitted for {selected['code']} - Report {int(target_cycle) if target_cycle is not None else 'N/A'}. Please review."
-                                )
-                            st.success(f"Report saved. Status: {_timing_status_label(timing_status)} — pending admin approval.")
-                            st.rerun()
-
-            rdf=fetch_df("""SELECT id,project_id,report_date,uploaded_at,submitted_on,file_path, report_pdf_path, COALESCE(status,'APPROVED') AS status, uploader_staff_id, cycle_no,
-                                   window_start, window_end, due_date, timing_status, site_activities, reinforcement_observations, concrete_observations,
-                                   hse_observations, rfi_notes, general_remarks, selected_modules, structured_report_json, reviewed_at, reviewed_by_staff_id, review_note
-                            FROM biweekly_reports
-                            WHERE project_id=?
-                              AND (
-                                    ?=1
-                                    OR (
-                                        COALESCE(status,'APPROVED') <> 'REJECTED'
-                                        AND (COALESCE(status,'APPROVED')='APPROVED' OR uploader_staff_id=?)
-                                    )
-                                  )
-                            ORDER BY date(COALESCE(due_date, report_date)) DESC, id DESC""",(pid, 1 if is_admin() else 0, current_staff_id()))
-            if rdf.empty:
-                st.info("No reports yet.")
-            else:
-                for _,r in rdf.iterrows():
-                    sub = r['uploaded_at'] if pd.notna(r.get('uploaded_at')) and str(r.get('uploaded_at')).strip() else r['report_date']
-                    st.markdown(f"**Report No.** {int(r['cycle_no']) if pd.notna(r.get('cycle_no')) else '—'}  \n**Period:** {r.get('window_start') or r['report_date']} → {r.get('window_end') or r['report_date']}  \n**Submitted:** {sub}  \n**Status:** {r['status']}  \n**Timing:** {_timing_status_label(r.get('timing_status')) if str(r.get('timing_status') or '').strip() else '—'}")
-                    with st.expander('Report details', expanded=False):
-                        rendered_structured = _render_biweekly_structured_details(r.to_dict())
-                        if not rendered_structured:
-                            st.markdown(f"**Site Activities**\n\n{r.get('site_activities') or '—'}")
-                            st.markdown(f"**Reinforcement Observations**\n\n{r.get('reinforcement_observations') or '—'}")
-                            st.markdown(f"**Concrete / Test Observations**\n\n{r.get('concrete_observations') or '—'}")
-                        st.markdown(f"**HSE Observations**\n\n{r.get('hse_observations') or '—'}")
-                        st.markdown(f"**RFI / EI Notes**\n\n{r.get('rfi_notes') or '—'}")
-                        st.markdown(f"**General Remarks**\n\n{r.get('general_remarks') or '—'}")
-                    if str(r.get('review_note') or '').strip():
-                        st.caption(f"Review note: {r.get('review_note')}")
-                    btns = st.columns([1,1,1])
-                    if str(r.get('file_path') or '').strip():
-                        with btns[0]:
-                            file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
-                    editable = _editable_status(r.get('status')) and (is_admin() or int(r.get('uploader_staff_id') or -1) == int(current_staff_id() or -999))
-                    if editable:
-                        with btns[1]:
-                            if st.button('✏️ Edit', key=f"bwedit_{r['id']}"):
-                                st.session_state[f"bw_edit_{pid}"] = int(r['id'])
-                                st.rerun()
-                    pdf_path = _ensure_biweekly_pdf(r.to_dict(), project_name=f"{selected['code']} — {selected['name']}", attachments_df=fetch_df("SELECT * FROM biweekly_report_attachments WHERE report_id=? ORDER BY id", (int(r['id']),)))
-                    with btns[2]:
-                        render_pdf_preview_and_download(f"bw_{int(r['id'])}", pdf_path)
-                    if is_admin():
-                        with st.expander('🧾 Review / Approval', expanded=False):
-                            review_note_val = st.text_area('Review note / revision instruction', value=str(r.get('review_note') or ''), key=f"bw_note_{r['id']}", help='Use this when sending a report back for correction or for internal review comments.')
-                            ra, rr = st.columns(2)
-                            with ra:
-                                if r['status']!='APPROVED' and st.button('✅ Approve', key=f"bapp{r['id']}"):
-                                    execute("UPDATE biweekly_reports SET review_note=?, reviewed_by_staff_id=?, reviewed_at=? WHERE id=?", (review_note_val or None, current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
-                                    approve_biweekly_report(int(r['id']), current_staff_id())
-                                    execute("UPDATE biweekly_reports SET approved_at=?, approved_by_staff_id=? WHERE id=?", (datetime.now().isoformat(timespec='seconds'), current_staff_id(), int(r['id'])))
-                                    st.rerun()
-                            with rr:
-                                if r['status']!='NEEDS_REVISION' and st.button('🔁 Request Revision', key=f"brev{r['id']}"):
-                                    execute("UPDATE biweekly_reports SET status='NEEDS_REVISION', review_note=?, reviewed_by_staff_id=?, reviewed_at=?, approved_at=NULL, approved_by_staff_id=NULL WHERE id=?",
-                                            ((review_note_val or 'Please review and update this report before resubmitting.'), current_staff_id(), datetime.now().isoformat(timespec='seconds'), int(r['id'])))
-                                    st.rerun()
-                    _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
-                    st.markdown('---')
-# ---------- Staff ----------
 def page_staff():
     st.markdown("<div class='worknest-header'><h2>👥 Staff</h2></div>", unsafe_allow_html=True)
     staff=fetch_df("SELECT id,name,rank,email,section FROM staff ORDER BY name")
@@ -5452,7 +3623,7 @@ def page_staff():
     names=[r["name"] for _,r in staff.iterrows()]
     sel=st.selectbox("Select staff", names, key="staff_pick")
     srow=staff[staff["name"]==sel].iloc[0]
-    st.markdown(f"**Name:** {srow['name']}  \n**Rank:** {srow['rank']}  \n**Email:** {srow['email'] or '—'}  \n**Section:** {srow['section'] or '—'}")
+    st.markdown(f"**Name:** {srow['name']}  \n**Rank:** {srow['rank']}  \n**Email:** {srow['email'] or ''}  \n**Section:** {srow['section'] or ''}")
     st.markdown("**Projects posted on:**")
     df=fetch_df("""
         SELECT p.code AS project_code, p.name AS project_name, COALESCE(ps.role,'Staff') AS role
@@ -5509,26 +3680,29 @@ def page_leave():
         taken_so_far=int(casual_taken_row["d"].iloc[0]) if (not casual_taken_row.empty and pd.notna(casual_taken_row["d"].iloc[0])) else 0
         casual_remaining=max(0, 14-taken_so_far)
 
-        max_days=None; cap_dec31=True; force_days=None
+        max_days=None; cap_dec31=True; force_days=None; default_days=5
         if ltype=="Annual":
-            max_days=30; cap_dec31=True
+            max_days=30; cap_dec31=True; default_days=30
         elif ltype=="Casual":
-            max_days=casual_remaining; cap_dec31=True
+            max_days=casual_remaining; cap_dec31=True; default_days=casual_remaining
         elif ltype=="Paternity":
             force_days=14; cap_dec31=True
         elif ltype=="Maternity":
             force_days=112; cap_dec31=False
+        elif ltype=="Sick":
+            max_days=30; default_days=5
         else:
-            max_days=30
+            max_days=30; default_days=3
 
         if force_days is not None:
             req=force_days; st.write(f"Working days (fixed): **{force_days}**")
         else:
             if ltype=="Casual" and max_days==0:
-                st.warning(f"You have used all 14 casual leave days in {yr}.")
+                st.warning("You have used all 14 casual leave days this year.")
             req=st.number_input("Requested working days", min_value=0 if ltype=="Casual" else 1,
                                 max_value=max_days if (max_days and max_days>0) else 60,
-                                value=min(5, max_days or 5), key="lv_req")
+                                value=default_days, key="lv_req",
+                                disabled=(ltype=="Casual" and max_days==0))
 
         end=add_working_days(start, int(req if req else 0), holidays, cap_dec31=cap_dec31)
         st.write(f"Computed End Date: **{end}**")
@@ -5548,7 +3722,7 @@ def page_leave():
                 try:
                     Ls=dtparser.parse(L["start_date"]).date(); Le=dtparser.parse(L["end_date"]).date()
                 except: continue
-                if (s<=Le and Ls<=e) and (str(L.get("status","Pending"))!="Rejected"):
+                if (s<=Le and Ls<=e) and (str(L.get("status","")).upper() in ("APPROVED","RECORDED")):
                     return True
         return False
 
@@ -5559,7 +3733,7 @@ def page_leave():
                 try:
                     Ls=dtparser.parse(L["start_date"]).date(); Le=dtparser.parse(L["end_date"]).date()
                 except: continue
-                if (s<=Le and Ls<=e) and (str(L.get("status","Pending"))!="Rejected"):
+                if (s<=Le and Ls<=e) and (str(L.get("status","")).upper() in ("APPROVED","RECORDED")):
                     return True
         return False
 
@@ -5625,11 +3799,26 @@ def page_leave():
             if is_on_leave(ch_id, start, end): can_submit=False; msg="Relieving officer is on leave in the requested period."
             if is_already_relieving(ch_id, start, end): can_submit=False; msg="Relieving officer is already assigned to relieve another staff in the requested period."
 
-    if st.button("📝 Submit Leave Application", key="lv_submit"):
+    if st.button("📝 Submit Leave Application", key="lv_submit", disabled=(ltype=="Casual" and casual_remaining==0)):
         if can_submit:
+            overlap = fetch_df(
+                """SELECT 1
+                   FROM leaves
+                   WHERE staff_id=?
+                     AND UPPER(COALESCE(status,'')) IN ('APPROVED','RECORDED')
+                     AND date(?) <= date(end_date)
+                     AND date(?) >= date(start_date)
+                   LIMIT 1""",
+                (int(srow["id"]), str(start), str(end)),
+            )
+            if not overlap.empty:
+                st.error("You already have a leave during this period.")
+                return
             reliever_id=int([p for p in pool if p[1]==reliever][0][0])
-            execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,'Pending',?)",
-                    (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,reason or None))
+            leave_status = "APPROVED" if ltype=="Annual" else "RECORDED"
+            leave_status = str(leave_status or "").strip().upper() or "RECORDED"
+            execute("INSERT INTO leaves (staff_id,leave_type,start_date,end_date,working_days,relieving_staff_id,status,reason) VALUES (?,?,?,?,?,?,?,?)",
+                    (int(srow["id"]),ltype,str(start),str(end),int(wd),reliever_id,leave_status,reason or None))
             st.success("Leave application submitted.")
         else:
             st.error(msg or "Validation failed.")
@@ -5671,399 +3860,7 @@ def _build_expected_biweekly_windows(start_date:date, today:date)->list:
         cur=nxt
     return out
 
-def page_tasks():
-    st.markdown("<div class='worknest-header'><h2>🗂️ Tasks & Performance</h2></div>", unsafe_allow_html=True)
-
-    today = _today()
-    monthly_start, monthly_end = _monthly_points_window(today)
-    comp = compliance_snapshot(today)
-
-    st.markdown("### ⏰ Reminders")
-    ass=fetch_df("""
-        SELECT
-            ta.id AS assignment_id,
-            t.title,
-            s.name AS staff,
-            COALESCE(p.code || ' — ' || p.name, p.code, '—') AS project,
-            t.due_date,
-            ta.status
-        FROM task_assignments ta
-        JOIN tasks t ON t.id=ta.task_id
-        JOIN staff s ON s.id=ta.staff_id
-        LEFT JOIN projects p ON p.id=t.project_id
-        WHERE ta.status!='Completed'
-        ORDER BY date(t.due_date) ASC
-    """)
-    if ass.empty:
-        st.caption("No open assignments, so no reminders.")
-    else:
-        ass["due_date"]=ass["due_date"].astype(str)
-        ass["days_to_due"]=ass["due_date"].apply(lambda d: (dtparser.parse(d).date()-date.today()).days if d else None)
-        due_soon=ass[(ass["days_to_due"].notna()) & (ass["days_to_due"]>=0) & (ass["days_to_due"]<=2)].copy()
-        overdue=ass[(ass["days_to_due"].notna()) & (ass["days_to_due"]<0)].copy()
-
-        c1,c2=st.columns(2)
-        with c1:
-            st.caption("Due soon (0–2 days)")
-            st.dataframe(due_soon[["project","title","staff","due_date","days_to_due"]] if not due_soon.empty else pd.DataFrame(columns=["project","title","staff","due_date","days_to_due"]),
-                         width='stretch')
-        with c2:
-            st.caption("Overdue")
-            st.dataframe(overdue[["project","title","staff","due_date","days_to_due"]] if not overdue.empty else pd.DataFrame(columns=["project","title","staff","due_date","days_to_due"]),
-                         width='stretch')
-
-        if is_admin():
-            st.caption("Email reminders are optional. Configure SMTP_* env vars to enable sending.")
-            if st.button("📨 Run reminder email check now", key="run_reminders_now"):
-                stats=run_task_reminders()
-                if smtp_configured():
-                    st.success(f"Checked {stats['checked']} assignments. Sent {stats['sent']} emails. Skipped {stats['skipped']}. Errors {stats['errors']}.")
-                else:
-                    st.warning("SMTP is not configured, so no emails were sent. In-app reminders above still work.")
-    staff=fetch_df("SELECT id,name,section FROM staff ORDER BY name")
-    projects=fetch_df("SELECT id,code,name,start_date,next_due_date FROM projects ORDER BY code")
-    st.subheader("Tasks")
-    titles=fetch_df("SELECT id,title FROM tasks ORDER BY id DESC")
-    mode_options = ["Edit existing"] if not can_assign_tasks() else ["Create new","Edit existing"]
-    mode=st.radio("Mode", mode_options, horizontal=True, key="tsk_mode")
-
-    if (not can_assign_tasks()) and mode=="Create new":
-        mode="Edit existing"
-
-    if mode=="Edit existing" and titles.empty:
-        st.info("No tasks to edit. Switch to 'Create new'.")
-        mode="Create new"
-    if mode=="Edit existing":
-        label_map={f"#{r['id']} — {r['title']}":int(r['id']) for _,r in titles.iterrows()}
-        pick=st.selectbox("Select task", list(label_map.keys()), key="tsk_pick")
-        tid=label_map[pick]
-        trow=fetch_df("SELECT * FROM tasks WHERE id=?", (tid,)).iloc[0]
-        task_dict = dict(trow)
-        # Ensure widget keys vary by selected task so the form reflects the selected task immediately.
-        tkey = f"_{int(tid)}"
-        can_edit = can_assign_tasks()
-        # Section Heads are restricted to their section only
-        if (not is_admin()) and user_role()=='section_head':
-            sec = current_staff_section()
-            if sec:
-                staff_allowed = staff[staff["section"].fillna("").str.strip()==sec].copy()
-            else:
-                staff_allowed = staff.iloc[0:0].copy()
-        else:
-            staff_allowed = staff.copy()
-
-        # If this task already includes assignees outside section, section head cannot edit it.
-        if (not is_admin()) and user_role()=='section_head':
-            existing_ass = fetch_df("SELECT s.section FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))
-            if (not existing_ass.empty):
-                sec = current_staff_section() or ""
-                bad = existing_ass["section"].fillna("").str.strip().apply(lambda x: x!=sec).any()
-                if bad:
-                    can_edit = False
-        current_assignees = fetch_df("SELECT name FROM task_assignments ta JOIN staff s ON s.id=ta.staff_id WHERE ta.task_id=?", (tid,))["name"].tolist()
-        proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
-        proj_value="—"
-        if pd.notna(trow["project_id"]):
-            pr=projects[projects["id"]==int(trow["project_id"])]
-            if not pr.empty: proj_value=f"{pr['code'].iloc[0]} — {pr['name'].iloc[0]}"
-        assigned_by_name = ""
-        try:
-            creator = fetch_df("SELECT name FROM staff WHERE id=?", (int(trow.get("created_by")),))
-            if not creator.empty:
-                assigned_by_name = str(creator["name"].iloc[0])
-        except Exception:
-            assigned_by_name = ""
-        title_value = str(trow["title"] or "")
-        desc_value = str(trow["description"] or "")
-        date_assigned = dtparser.parse(trow["date_assigned"]).date()
-        due = dtparser.parse(trow["due_date"]).date()
-        da=int(max((due - date_assigned).days + 1, 1))
-
-        # Readable task summary for all users
-        st.markdown(
-            f"""
-            <div style="background:#ffffff;border:1px solid #d9d9d9;border-radius:10px;padding:16px 18px;margin:8px 0 14px 0;color:#111;">
-              <div style="font-size:1.15rem;font-weight:700;margin-bottom:10px;">{html.escape(title_value)}</div>
-              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 18px;line-height:1.6;">
-                <div><span style="font-weight:700;">Assigned by:</span> {html.escape(assigned_by_name or '—')}</div>
-                <div><span style="font-weight:700;">Date assigned:</span> {html.escape(str(date_assigned))}</div>
-                <div><span style="font-weight:700;">Due date:</span> {html.escape(str(due))}</div>
-                <div><span style="font-weight:700;">Days allotted:</span> {da}</div>
-                <div><span style="font-weight:700;">Project:</span> {html.escape(proj_value)}</div>
-                <div><span style="font-weight:700;">Assignees:</span> {html.escape(', '.join(current_assignees) if current_assignees else '—')}</div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("**Description**")
-        st.markdown(
-            f"""
-            <div style="background:#f8f9fa;padding:16px;border-radius:10px;border:1px solid #d9d9d9;color:#111;white-space:pre-wrap;line-height:1.65;margin-bottom:16px;">
-              {html.escape(desc_value) if desc_value else '<span style="color:#555;">No description provided.</span>'}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if can_edit:
-            st.markdown("### Edit task")
-            title=st.text_input("Title", value=title_value, key=f"tsk_title{tkey}")
-            desc=st.text_area("Description", value=desc_value, key=f"tsk_desc{tkey}", height=240)
-            date_assigned=st.date_input("Date assigned", value=date_assigned, key=f"tsk_da{tkey}")
-            due=st.date_input("Due date", value=due, key=f"tsk_due{tkey}")
-            da=int(max((due - date_assigned).days + 1, 1))
-            st.write(f"Days allotted (auto): **{da}**")
-            proj=st.selectbox("Project (optional)", proj_opt, index=proj_opt.index(proj_value) if proj_value in proj_opt else 0, key=f"tsk_proj{tkey}")
-            assignees=st.multiselect(
-                "Assignees",
-                staff_allowed["name"].tolist(),
-                key=f"tsk_asg{tkey}",
-                default=current_assignees,
-            )
-        else:
-            title = title_value
-            desc = desc_value
-            proj = proj_value
-            assignees = current_assignees
-        colA,colB,colC=st.columns(3)
-        with colA:
-            if can_edit and st.button("💾 Save", key=f"tsk_save{tkey}"):
-                execute("UPDATE tasks SET title=?,description=?,date_assigned=?,days_allotted=?,due_date=?,project_id=? WHERE id=?",
-                    (title, desc or None, str(date_assigned), int(da), str(due),
-                     int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None, tid))
-                execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
-                for nm in assignees:
-                    sid=int(staff[staff["name"]==nm]["id"].iloc[0])
-                    execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
-                st.success("Task updated."); st.rerun()
-        with colB:
-            # Completion workflow: only Admin or permitted Section Heads can confirm completion.
-            can_confirm = can_confirm_task_completion()
-            btn_label = "✅ Confirm Completed (today)" if not is_admin() else "✅ Admin: Certify Completed (today)"
-            if st.button(btn_label, key=f"tsk_done{tkey}", disabled=not can_confirm):
-                    # Section heads may only confirm tasks within their section
-                    if (not is_admin()) and user_role()=='section_head':
-                        sec = current_staff_section() or ""
-                        chk = fetch_df("""SELECT s.section FROM task_assignments ta
-                                           JOIN staff s ON s.id=ta.staff_id
-                                           WHERE ta.task_id=?""", (tid,))
-                        if (not chk.empty) and chk["section"].fillna("").str.strip().apply(lambda x: x!=sec).any():
-                            st.error("You can only confirm completion for tasks assigned within your section.")
-                            st.stop()
-
-                    today_d=date.today()
-                    today=str(today_d)
-                    da=_parse_date_safe(trow["date_assigned"]) or today_d
-                    ass=fetch_df("SELECT id, staff_id FROM task_assignments WHERE task_id=?", (tid,))
-                    for _,ar in ass.iterrows():
-                        days_taken=int((today_d - da).days)
-                        execute("UPDATE task_assignments SET status='Completed', completed_date=?, days_taken=? WHERE id=?",
-                                (today, days_taken, int(ar["id"])))
-                        # Legacy points table (kept for backward compatibility)
-                        try:
-                            execute("INSERT OR IGNORE INTO points (staff_id, source, source_id, points, awarded_at) VALUES (?,?,?,?,?)",
-                                    (int(ar["staff_id"]), "task", int(ar["id"]), 5, datetime.now().isoformat(timespec="seconds")))
-                        except Exception:
-                            pass
-                    st.success("Completion confirmed for all assignees."); st.rerun()
-
-            # Delete remains Admin-only
-            if is_admin():
-                if st.button("🗑️ Admin: Delete Task", key=f"tsk_del{tkey}"):
-                    execute("DELETE FROM task_assignments WHERE task_id=?", (tid,))
-                    execute("DELETE FROM tasks WHERE id=?", (tid,))
-                    st.success("Task deleted."); st.rerun()
-            else:
-                st.caption("Delete is Admin-only.")
-        with colC:
-            st.caption("Scores only computed for **Completed** tasks. Overdue **In progress** tasks are flagged below.")
-
-    if mode=="Edit existing":
-        # --- Task Attachments ---
-        st.markdown("#### 📎 Task Attachments")
-        attach_files = st.file_uploader("Attach files (PDF/Image)", type=["pdf","png","jpg","jpeg"],
-                                        accept_multiple_files=True,
-                                        key=f"tsk_attach_{tid}")
-        if st.button("📎 Upload Attachment(s)", key=f"tsk_attach_btn_{tid}"):
-            if not can_upload_task_files(task_dict):
-                st.error("You don't have permission to upload attachments for this task.")
-                st.stop()
-            if not attach_files:
-                st.error("Select one or more files first.")
-            else:
-                ok=0
-                for f in attach_files:
-                    path=save_uploaded_file(f, f"task_{tid}/attachments")
-                    if path:
-                        execute("""INSERT INTO task_documents (task_id,file_path,original_name,uploaded_at,uploader_staff_id)
-                                   VALUES (?,?,?,?,?)""",
-                                (int(tid), path, getattr(f, "name", None), datetime.now().isoformat(timespec="seconds"), current_staff_id()))
-                        ok += 1
-                st.success(f"Uploaded {ok} attachment(s)."); st.rerun()
-    
-        adf=fetch_df("SELECT id, original_name, file_path, uploaded_at FROM task_documents WHERE task_id=? ORDER BY uploaded_at DESC",(int(tid),))
-        if adf.empty:
-            st.caption("No attachments yet.")
-        else:
-            for _,r in adf.iterrows():
-                c1,c2,c3=st.columns([4,1,1])
-                with c1:
-                    nm = r["original_name"] if pd.notna(r["original_name"]) else os.path.basename(r["file_path"])
-                    st.write(f"**{nm}**  \n*{r['uploaded_at']}*")
-                with c2:
-                    if can_download_task_files(task_dict):
-                        file_download_button("⬇️ Download", r["file_path"], key=f"tsk_adl_{tid}_{int(r['id'])}")
-                    else:
-                        st.caption("🔒")
-                with c3:
-                    if is_admin() and st.button("🗑️", key=f"tsk_adel_{tid}_{int(r['id'])}"):
-                        execute("DELETE FROM task_documents WHERE id=?", (int(r["id"]),))
-                        st.success("Attachment removed."); st.rerun()
-    
-    else:
-        # Create new task (Admin or permitted Section Heads). Section Heads are restricted to their section only.
-        if (not is_admin()) and user_role()=='section_head':
-            sec = current_staff_section()
-            if sec:
-                staff_allowed_new = staff[staff["section"].fillna("").str.strip()==sec].copy()
-            else:
-                staff_allowed_new = staff.iloc[0:0].copy()
-        else:
-            staff_allowed_new = staff.copy()
-
-        title=st.text_input("Title", key="tsk_title_new")
-        desc=st.text_area("Description", key="tsk_desc_new")
-        date_assigned=st.date_input("Date assigned", value=date.today(), key="tsk_da_new")
-        due=st.date_input("Due date", value=date.today()+timedelta(days=7), key="tsk_due_new")
-        da=int(max((due - date_assigned).days + 1, 1))
-        st.write(f"Days allotted (auto): **{da}**")
-        proj_opt=["—"]+[f"{r['code']} — {r['name']}" for _,r in projects.iterrows()]
-        proj=st.selectbox("Project (optional)", proj_opt, key="tsk_proj_new")
-        assignees=st.multiselect("Assignees", staff_allowed_new["name"].tolist(), key="tsk_asg_new")
-        if can_assign_tasks() and st.button("➕ Create Task", key="tsk_create"):
-            pid = int(projects[projects['code']==proj.split(' — ')[0]]['id'].iloc[0]) if proj!="—" else None
-            tid=execute("INSERT INTO tasks (title,description,date_assigned,days_allotted,due_date,project_id,created_by_staff_id) VALUES (?,?,?,?,?,?,?)",
-                        (title, desc or None, str(date_assigned), int(da), str(due), pid, current_staff_id()))
-            for nm in assignees:
-                sid=int(staff[staff["name"]==nm]["id"].iloc[0])
-                execute("INSERT INTO task_assignments (task_id,staff_id,status) VALUES (?,?,?)",(tid,sid,"In progress"))
-            # Push notifications to assignees (best-effort)
-            try:
-                if "email" in staff.columns:
-                    emails = staff[staff["name"].isin(assignees)]["email"].dropna().astype(str).tolist()
-                else:
-                    emails = []
-                if emails:
-                    send_push(emails, "WorkNest: New Task", f"You have been assigned: {title[:80]}")
-            except Exception:
-                pass
-            st.success("Task created."); st.rerun()
-
-    st.subheader("Assignments")
-    df=fetch_df("""
-        SELECT
-            ta.id,
-            t.title,
-            s.name AS staff,
-            COALESCE(p.code || ' — ' || p.name, p.code, '—') AS project,
-            t.due_date,
-            ta.status,
-            ta.completed_date,
-            t.date_assigned,
-            t.days_allotted
-        FROM task_assignments ta
-        JOIN tasks t ON t.id=ta.task_id
-        JOIN staff s ON s.id=ta.staff_id
-        LEFT JOIN projects p ON p.id=t.project_id
-        ORDER BY date(t.due_date) ASC, project, t.title, s.name
-    """)
-    if df.empty:
-        st.info("No assignments yet.")
-    else:
-        df["overdue"]=df.apply(lambda r: (r["status"]!="Completed") and (date.today()>dtparser.parse(r["due_date"]).date()), axis=1)
-        def score_row(r):
-            if r["status"]!="Completed" or pd.isna(r["completed_date"]):
-                return 0
-            due=dtparser.parse(r["due_date"]).date()
-            cd=dtparser.parse(r["completed_date"]).date()
-            late=max((cd-due).days, 0)
-            return max(0, 100 - 5*late)
-        df["score"]=df.apply(score_row, axis=1)
-        st.dataframe(df[["project","title","staff","due_date","status","completed_date","days_allotted","overdue","score"]], width='stretch')
-
-    st.divider()
-    st.subheader("📊 Performance Scoreboard")
-    st.caption("Global totals come from the points ledger. Report fairness is shown separately so staff with more projects do not gain an automatic advantage.")
-
-    perf = fetch_df("""
-        SELECT
-            s.id,
-            s.name,
-            s.rank,
-            s.section,
-            COALESCE(SUM(CASE WHEN p.source = 'task' THEN p.points END), 0) AS task_points,
-            COALESCE(SUM(CASE WHEN p.source IN ('biweekly','report') THEN p.points END), 0) AS report_points,
-            COALESCE(SUM(CASE WHEN p.source = 'test' THEN p.points END), 0) AS test_points,
-            COALESCE(SUM(p.points), 0) AS total_score,
-            COALESCE(SUM(CASE WHEN COALESCE(NULLIF(p.awarded_at, '')::date, CURRENT_DATE) >= date(?) AND COALESCE(NULLIF(p.awarded_at, '')::date, CURRENT_DATE) <= date(?) THEN p.points END), 0) AS monthly_score
-        FROM staff s
-        LEFT JOIN points p ON p.staff_id = s.id
-        GROUP BY s.id, s.name, s.rank, s.section
-        ORDER BY total_score DESC, s.name ASC;
-    """, (monthly_start.isoformat(), monthly_end.isoformat()))
-
-    fairness = _report_scoreboard(today=today)
-    monthly_fairness = _report_scoreboard(today=today, month_start=monthly_start, month_end=monthly_end)
-    if perf.empty:
-        st.info("No points recorded yet.")
-    else:
-        perf = perf.merge(fairness[['staff_id','expected_reports','approved_reports','on_time_reports','late_reports','very_late_reports','missed_reports','report_score_pct']], how='left', left_on='id', right_on='staff_id')
-        perf['_report_score_sort'] = perf['report_score_pct'].fillna(-1.0)
-        perf = perf.sort_values(['total_score','monthly_score','_report_score_sort','name'], ascending=[False,False,False,True])
-        perf['report_score_pct_display'] = perf['report_score_pct'].map(lambda v: '—' if pd.isna(v) else f"{float(v):.1f}%")
-        g1, g2, g3 = st.columns(3)
-        winner = perf.iloc[0]
-        g1.success(f"🏆 Global leader: **{winner['name']}** — {int(winner['total_score'])} pts")
-        if not perf.empty:
-            month_winner = perf.sort_values(['monthly_score','total_score','_report_score_sort','name'], ascending=[False,False,False,True]).iloc[0]
-            g2.info(f"📅 Monthly leader: **{month_winner['name']}** — {int(month_winner['monthly_score'])} pts")
-        fair_candidates = fairness[fairness['expected_reports'] > 0] if not fairness.empty else fairness
-        if fair_candidates is not None and not fair_candidates.empty:
-            fair_winner = fair_candidates.iloc[0]
-            g3.info(f"⚖️ Best report score: **{fair_winner['name']}** — {float(fair_winner['report_score_pct']):.1f}%")
-        elif comp.get('no_obligation'):
-            g3.info("⚖️ Best report score: no live cycle due yet")
-        st.dataframe(
-            perf[[
-                'name','rank','section','task_points','report_points','test_points','monthly_score','total_score',
-                'expected_reports','approved_reports','on_time_reports','late_reports','very_late_reports','missed_reports','report_score_pct_display'
-            ]].rename(columns={
-                'name':'Staff','rank':'Rank','section':'Section','task_points':'Task pts','report_points':'Report pts',
-                'test_points':'Test pts','monthly_score':'Monthly pts','total_score':'Global pts','expected_reports':'Expected reports',
-                'approved_reports':'Approved reports','on_time_reports':'On-time','late_reports':'Late','very_late_reports':'Very late','missed_reports':'Missed',
-                'report_score_pct_display':'Report score %'
-            }),
-            width='stretch',
-            hide_index=True,
-        )
-
-    st.divider()
-    st.subheader("📈 Reporting Compliance")
-    try:
-        cdf = _report_scoreboard(today=today)
-        if cdf.empty:
-            st.info('No reporting compliance data yet.')
-        else:
-            cdf['report_score_pct_display'] = cdf['report_score_pct'].map(lambda v: '—' if pd.isna(v) else f"{float(v):.1f}%")
-            cdf['compliance_rate_%'] = ((cdf['approved_reports'] / cdf['expected_reports'].replace(0, np.nan)) * 100).round(1)
-            cdf['compliance_rate_display'] = cdf['compliance_rate_%'].map(lambda v: '—' if pd.isna(v) else f"{float(v):.1f}%")
-            st.dataframe(cdf[['name','rank','section','expected_reports','approved_reports','on_time_reports','late_reports','very_late_reports','missed_reports','report_points','report_score_pct_display','compliance_rate_display']].rename(columns={
-                'name':'Staff','rank':'Rank','section':'Section','expected_reports':'Expected','approved_reports':'Approved','on_time_reports':'On-time','late_reports':'Late','very_late_reports':'Very late','missed_reports':'Missed','report_points':'Report pts','report_score_pct_display':'Report score %','compliance_rate_display':'Compliance %'
-            }), width='stretch', hide_index=True)
-    except Exception as e:
-        st.info(f"Reporting compliance will appear once report cycles start running cleanly. ({e})")
-
+from views.tasks import page_tasks
 
 def page_admin_inbox():
     """Central approval queue for uploads across all projects.
@@ -6106,7 +3903,7 @@ def page_admin_inbox():
             file_path = r.get("file_path") or ""
 
             with st.container(border=True):
-                st.markdown(f"**{code}** — {pname}")
+                st.markdown(f"**{code}**  {pname}")
                 st.write(f"**Uploader:** {uploader} · **Status:** {status} · **Due/Test date:** {period_dt} · **Uploaded:** {uploaded_at}")
 
                 if file_path and not os.path.exists(file_path):
@@ -6157,6 +3954,7 @@ def page_admin_inbox():
                                 "UPDATE biweekly_reports SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
                                 (ts, current_staff_id(), rid),
                             )
+                            _sync_biweekly_points_for_report(int(rid))
                         elif kind == "test":
                             execute_sql(
                                 "UPDATE test_results SET status='REJECTED', reviewed_at=?, reviewed_by_staff_id=? WHERE id=?",
@@ -6308,6 +4106,7 @@ def page_import():
         if df is not None:
             created_users=0
             updated_users=0
+            temp_credentials = []
             for _,r in df.iterrows():
                 if pd.isna(r.get("name")) or pd.isna(r.get("rank")): 
                     continue
@@ -6344,30 +4143,35 @@ def page_import():
                 else:
                     role_norm = "staff"
 
-                uex = fetch_df("SELECT id, password_hash FROM users WHERE staff_id=? OR LOWER(username)=LOWER(?)", (staff_id, uname))
+                uex = fetch_df("SELECT id, password_hash, password_salt FROM users WHERE staff_id=? OR LOWER(username)=LOWER(?)", (staff_id, uname))
                 if uex.empty:
-                    # Default password is fcda; force change on first login
+                    temp_password = _generate_temporary_password()
+                    pw_hash, pw_salt = hash_pwd(temp_password)
                     try:
-                        execute("""INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active,must_change_password)
-                                   VALUES (?,?,?,?,?,?,?)""",
-                                (staff_id, uname, hash_pwd("fcda"), is_admin_flag, role_norm, 1, 1))
+                        execute("""INSERT INTO users (staff_id,username,password_hash,password_salt,is_admin,role,is_active,must_change_password)
+                                   VALUES (?,?,?,?,?,?,?,?)""",
+                                (staff_id, uname, pw_hash, pw_salt, is_admin_flag, role_norm, 1, 1))
                     except Exception:
                         # Backward compatibility if column doesn't exist yet
-                        execute("""INSERT INTO users (staff_id,username,password_hash,is_admin,role,is_active)
-                                   VALUES (?,?,?,?,?,?)""",
-                                (staff_id, uname, hash_pwd("fcda"), is_admin_flag, role_norm, 1))
+                        execute("""INSERT INTO users (staff_id,username,password_hash,password_salt,is_admin,role,is_active)
+                                   VALUES (?,?,?,?,?,?,?)""",
+                                (staff_id, uname, pw_hash, pw_salt, is_admin_flag, role_norm, 1))
+                    temp_credentials.append({"Username": uname, "Temporary Password": temp_password})
                     created_users += 1
                 else:
                     # Keep existing password unless it's blank; update username/role linkage
                     pw = uex["password_hash"].iloc[0]
+                    pw_salt = uex["password_salt"].iloc[0] if "password_salt" in uex.columns else None
                     if pw is None or str(pw).strip()=="":
-                        pw = hash_pwd("fcda")
+                        temp_password = _generate_temporary_password()
+                        pw, pw_salt = hash_pwd(temp_password)
                         try:
-                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, is_admin=?, role=?, is_active=1, must_change_password=1 WHERE id=?""",
-                                    (staff_id, uname, pw, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, password_salt=?, is_admin=?, role=?, is_active=1, must_change_password=1 WHERE id=?""",
+                                    (staff_id, uname, pw, pw_salt, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
                         except Exception:
-                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, is_admin=?, role=?, is_active=1 WHERE id=?""",
-                                    (staff_id, uname, pw, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                            execute("""UPDATE users SET staff_id=?, username=?, password_hash=?, password_salt=?, is_admin=?, role=?, is_active=1 WHERE id=?""",
+                                    (staff_id, uname, pw, pw_salt, is_admin_flag, role_norm, int(uex["id"].iloc[0])))
+                        temp_credentials.append({"Username": uname, "Temporary Password": temp_password})
                     else:
                         try:
                             execute("""UPDATE users SET staff_id=?, username=?, is_admin=?, role=?, is_active=1 WHERE id=?""",
@@ -6377,6 +4181,9 @@ def page_import():
                     updated_users += 1
 
             st.success(f"Staff imported/updated. Users created: {created_users}, users updated: {updated_users}.")
+            if temp_credentials:
+                st.warning("Temporary passwords were generated for new or repaired accounts. Share them securely and require users to change them at first login.")
+                st.dataframe(pd.DataFrame(temp_credentials), hide_index=True, width='stretch')
         else:
             st.error("data/ staff_template.csv could not be read.")
 
@@ -6483,7 +4290,7 @@ def page_access_control():
     if not is_admin():
         st.error("Only Admin can manage access control.")
         return
-    st.caption("Admin can define what staff see by assigning roles and enabling/disabling accounts. Default password for new staff accounts is 'fcda'.")
+    st.caption("Admin can define what staff see by assigning roles and enabling/disabling accounts. New accounts receive temporary credentials and must change them at first login.")
     if not is_admin():
         st.error("Admin only.")
         return
@@ -6508,7 +4315,7 @@ def page_access_control():
     user_labels = []
     label_to_id = {}
     for _,r in df.iterrows():
-        label = f"{r.get('name') or r.get('username')} — {r.get('username')} (role: {r.get('role')})"
+        label = f"{r.get('name') or r.get('username')}  {r.get('username')} (role: {r.get('role')})"
         user_labels.append(label)
         label_to_id[label] = int(r["user_id"])
 
@@ -6544,8 +4351,9 @@ def page_access_control():
         isadm = 1 if role_norm=="admin" else 0
 
         if new_pwd.strip():
-            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=? WHERE id=?",
-                    (role_norm, isadm, int(active), hash_pwd(new_pwd.strip()), int(user_id)))
+            new_hash, new_salt = hash_pwd(new_pwd.strip())
+            execute("UPDATE users SET role=?, is_admin=?, is_active=?, password_hash=?, password_salt=? WHERE id=?",
+                    (role_norm, isadm, int(active), new_hash, new_salt, int(user_id)))
         else:
             execute("UPDATE users SET role=?, is_admin=?, is_active=? WHERE id=?",
                     (role_norm, isadm, int(active), int(user_id)))
@@ -6563,8 +4371,8 @@ def page_access_control():
         st.rerun()
 
 def page_staff_directory():
-    st.title("👥 Staff Directory")
-    st.caption("Read‑only directory. For edits, admins use **Staff Admin**.")
+    st.title("📇 Staff Directory")
+    st.caption("Read-only directory. For edits, admins use **Staff Admin**.")
     q = st.text_input("Search (name / rank / section / email)", "")
     df = fetch_df("SELECT id, name, rank, section, email, phone, grade, join_date, dob FROM staff ORDER BY name")
     if q.strip():
@@ -6596,7 +4404,7 @@ def page_account():
     if must == 1:
         st.warning("You must change your password before continuing.")
         st.subheader("Change password")
-        st.caption("After a successful change, we’ll take you back to the dashboard.")
+        st.caption("After a successful change, we'll take you back to the dashboard.")
 
         with st.form("change_password_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
@@ -6611,13 +4419,14 @@ def page_account():
             elif new1 != new2:
                 st.error("Passwords do not match.")
             else:
-                row = fetch_df("SELECT password_hash FROM users WHERE id=?", (uid,))
-                if row.empty or (hash_pwd(old) != str(row.iloc[0]["password_hash"])):
+                row = fetch_df("SELECT password_hash, password_salt FROM users WHERE id=?", (uid,))
+                if row.empty or (not verify_pwd(old, row.iloc[0]["password_hash"], row.iloc[0]["password_salt"] if "password_salt" in row.columns else None)):
                     st.error("Current password is incorrect.")
                 else:
+                    new_hash, new_salt = hash_pwd(new1)
                     execute_sql(
-                        "UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
-                        (hash_pwd(new1), uid),
+                        "UPDATE users SET password_hash=?, password_salt=?, must_change_password=0 WHERE id=?",
+                        (new_hash, new_salt, uid),
                     )
                     st.session_state["user"]["must_change_password"] = 0
                     st.session_state["flash_success"] = "Password updated successfully."
@@ -6661,7 +4470,7 @@ def page_account():
                     onesignal_opt_out(app_id, external_id)
                     st.toast("Disabling…", icon="🔕")
                     st.rerun()
-                c2.caption("You’ll keep receiving WorkNest notifications on this browser until you disable it.")
+                c2.caption("You'll keep receiving WorkNest notifications on this browser until you disable it.")
             else:
                 if perm == "granted":
                     st.info("Permission is granted, but you are not subscribed yet.")
@@ -6678,7 +4487,7 @@ def page_account():
     # Password change (optional)
     # ------------------------
     st.subheader("Change password")
-    st.caption("After a successful change, we’ll take you back to the dashboard.")
+    st.caption("After a successful change, we'll take you back to the dashboard.")
 
     with st.form("change_password_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
@@ -6693,13 +4502,14 @@ def page_account():
         elif new1 != new2:
             st.error("Passwords do not match.")
         else:
-            row = fetch_df("SELECT password_hash FROM users WHERE id=?", (uid,))
-            if row.empty or (hash_pwd(old) != str(row.iloc[0]["password_hash"])):
+            row = fetch_df("SELECT password_hash, password_salt FROM users WHERE id=?", (uid,))
+            if row.empty or (not verify_pwd(old, row.iloc[0]["password_hash"], row.iloc[0]["password_salt"] if "password_salt" in row.columns else None)):
                 st.error("Current password is incorrect.")
             else:
+                new_hash, new_salt = hash_pwd(new1)
                 execute_sql(
-                    "UPDATE users SET password_hash=? WHERE id=?",
-                    (hash_pwd(new1), uid),
+                    "UPDATE users SET password_hash=?, password_salt=? WHERE id=?",
+                    (new_hash, new_salt, uid),
                 )
                 st.session_state["flash_success"] = "Password updated successfully."
                 st.session_state["_pending_nav"] = "🏠 Dashboard"
@@ -6715,7 +4525,7 @@ def _read_help_md(fname:str)->str:
 
 def page_help():
     st.title("❓ Help")
-    st.caption("Quick guides for staff and admins. If something is unclear, we’ll tighten it up as we go.")
+    st.caption("Quick guides for staff and admins. If something is unclear, we'll tighten it up as we go.")
 
     tabs = st.tabs(["Quick Start", "Tasks", "Leave", "Passwords", "Admin"])
     with tabs[0]:
@@ -6738,6 +4548,140 @@ def page_help():
             st.info("Admin help is restricted.")
 
 
+
+
+def page_office_diary():
+    st.markdown("<div class='worknest-header'><h2>📘 Office Diary</h2></div>", unsafe_allow_html=True)
+    if not is_admin():
+        st.info("Admin only.")
+        return
+
+    sid = current_staff_id()
+    today_value = date.today()
+    today_iso = today_value.isoformat()
+    projects_df = fetch_df("SELECT id, code, name FROM projects ORDER BY code, name")
+    project_options = ["— No project linked —"]
+    project_map = {"— No project linked —": None}
+    if not projects_df.empty:
+        for _, row in projects_df.iterrows():
+            label = " — ".join([x for x in [str(row.get("code") or "").strip(), str(row.get("name") or "").strip()] if x])
+            project_options.append(label)
+            project_map[label] = int(row["id"])
+
+    edit_id = st.session_state.get("office_diary_edit_id")
+    edit_row = None
+    if edit_id is not None:
+        edit_df = fetch_df("SELECT * FROM office_diary WHERE id=?", (int(edit_id),))
+        if not edit_df.empty:
+            edit_row = edit_df.iloc[0]
+        else:
+            st.session_state.pop("office_diary_edit_id", None)
+
+    st.markdown("### Entry Form")
+    with st.form("office_diary_form", clear_on_submit=edit_row is None):
+        entry_title = st.text_input("Title", value=str(edit_row.get("title") or "") if edit_row is not None else "")
+        entry_note = st.text_area("Note", value=str(edit_row.get("note") or "") if edit_row is not None else "", height=160)
+        selected_project_label = "— No project linked —"
+        if edit_row is not None and pd.notna(edit_row.get("project_id")) and not projects_df.empty:
+            match = projects_df[projects_df["id"] == int(edit_row["project_id"])]
+            if not match.empty:
+                selected_project_label = " — ".join([x for x in [str(match.iloc[0].get("code") or "").strip(), str(match.iloc[0].get("name") or "").strip()] if x]) or "— No project linked —"
+        project_label = st.selectbox(
+            "Project (optional)",
+            project_options,
+            index=project_options.index(selected_project_label) if selected_project_label in project_options else 0,
+        )
+        c1, c2 = st.columns(2)
+        save_label = "Update Entry" if edit_row is not None else "Save Entry"
+        save_entry = c1.form_submit_button(save_label)
+        cancel_edit = c2.form_submit_button("Cancel Edit") if edit_row is not None else False
+
+    if cancel_edit:
+        st.session_state.pop("office_diary_edit_id", None)
+        st.rerun()
+
+    if save_entry:
+        if not str(entry_title or "").strip():
+            st.error("Title is required.")
+        elif not str(entry_note or "").strip():
+            st.error("Note is required.")
+        else:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            project_id = project_map.get(project_label)
+            if edit_row is not None:
+                execute(
+                    "UPDATE office_diary SET title=?, note=?, project_id=?, updated_at=? WHERE id=?",
+                    (str(entry_title).strip(), str(entry_note).strip(), project_id, now_iso, int(edit_row["id"])),
+                )
+                st.session_state.pop("office_diary_edit_id", None)
+                st.success("Office diary entry updated.")
+            else:
+                execute(
+                    "INSERT INTO office_diary (entry_date, title, note, project_id, created_by_staff_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (today_iso, str(entry_title).strip(), str(entry_note).strip(), project_id, sid, now_iso, now_iso),
+                )
+                st.success("Office diary entry saved.")
+            st.rerun()
+
+    st.markdown("### Entries")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("From", value=today_value - timedelta(days=7), key="office_diary_from")
+    with col2:
+        end_date = st.date_input("To", value=today_value, key="office_diary_to")
+    if start_date > end_date:
+        st.error("The 'From' date cannot be after the 'To' date.")
+        return
+    search_term = st.text_input("Search", value="", placeholder="Search title or note", key="office_diary_search")
+    diary_sql = """
+        SELECT od.id, od.entry_date, od.title, od.note, od.project_id, od.created_at, od.updated_at,
+               p.code AS project_code, p.name AS project_name,
+               s.name AS created_by_name
+        FROM office_diary od
+        LEFT JOIN projects p ON p.id=od.project_id
+        LEFT JOIN staff s ON s.id=od.created_by_staff_id
+    """
+    diary_sql += """
+        WHERE date(od.entry_date) BETWEEN ? AND ?
+    """
+    diary_params = (start_date.isoformat(), end_date.isoformat())
+    if str(search_term or "").strip():
+        diary_sql += """
+        AND (
+            LOWER(COALESCE(od.title,'')) LIKE ?
+            OR LOWER(COALESCE(od.note,'')) LIKE ?
+        )
+        """
+        like_term = f"%{str(search_term).strip().lower()}%"
+        diary_params = diary_params + (like_term, like_term)
+    diary_sql += " ORDER BY date(od.entry_date) DESC, COALESCE(od.updated_at, od.created_at) DESC, od.id DESC"
+    entries_df = fetch_df(diary_sql, diary_params)
+
+    if entries_df.empty:
+        st.info("No diary entries for selected date range.")
+        return
+
+    for _, row in entries_df.iterrows():
+        project_label = " - ".join([x for x in [str(row.get("project_code") or "").strip(), str(row.get("project_name") or "").strip()] if x])
+        st.markdown(f"**{row.get('title') or 'Untitled'}**")
+        meta_bits = [str(row.get("entry_date") or "")]
+        if project_label:
+            meta_bits.append(project_label)
+        if str(row.get("created_by_name") or "").strip():
+            meta_bits.append(f"By {row.get('created_by_name')}")
+        st.caption(" | ".join([x for x in meta_bits if x]))
+        st.write(str(row.get("note") or ""))
+        a1, a2 = st.columns([1, 1])
+        if a1.button("Edit", key=f"office_diary_edit_{int(row['id'])}"):
+            st.session_state["office_diary_edit_id"] = int(row["id"])
+            st.rerun()
+        if a2.button("Delete", key=f"office_diary_delete_{int(row['id'])}"):
+            execute("DELETE FROM office_diary WHERE id=?", (int(row["id"]),))
+            if st.session_state.get("office_diary_edit_id") == int(row["id"]):
+                st.session_state.pop("office_diary_edit_id", None)
+            st.success("Office diary entry deleted.")
+            st.rerun()
+        st.markdown("---")
 
 
 # =========================
@@ -6992,6 +4936,7 @@ def main():
     elif page.startswith("🔎"): page_search()
     elif page.startswith("🏗️"): page_projects()
     elif page.startswith("👥"): page_staff()
+    elif page.startswith("📘"): page_office_diary()
     elif page.startswith("🧳"): page_leave()
     elif page.startswith("💬"): page_chat()
     elif page.startswith("📇"): page_staff_directory()
@@ -7008,3 +4953,5 @@ def main():
 
 if __name__=="__main__":
     main()
+
+
