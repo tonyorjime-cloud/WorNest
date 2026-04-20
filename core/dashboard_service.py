@@ -334,11 +334,10 @@ def today_absentees_snapshot(today_iso: str):
             FROM leaves l
             JOIN staff s ON s.id=l.staff_id
             WHERE UPPER(COALESCE(l.status,'')) IN ('APPROVED','RECORDED')
-              AND date(?) >= date(l.start_date)
-              AND date(?) <= date(l.end_date)
+              AND DATE(?) BETWEEN DATE(l.start_date) AND DATE(l.end_date)
             ORDER BY date(l.end_date) ASC, s.name ASC
             """,
-            (today_dt.isoformat(), today_dt.isoformat()),
+            (today_dt.isoformat(),),
         )
         for _, row in adf.iterrows():
             rows.append(
@@ -351,6 +350,50 @@ def today_absentees_snapshot(today_iso: str):
     except Exception:
         return []
     return rows
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def ncr_dashboard_snapshot(today_iso: str):
+    today_dt = _to_date_or_none(today_iso) or date.today()
+    base_df = fetch_df(
+        """
+        SELECT n.id, n.project_id, n.ncr_no, n.deadline, p.code AS project_code, p.name AS project_name
+        FROM ncrs n
+        JOIN projects p ON p.id=n.project_id
+        WHERE COALESCE(n.status,'OPEN')='OPEN'
+        ORDER BY date(n.deadline) ASC, n.id ASC
+        """
+    )
+    if base_df.empty:
+        return {"open_count": 0, "overdue_count": 0, "items": []}
+
+    open_count = len(base_df.index)
+    overdue_count = 0
+    items = []
+    for _, row in base_df.head(5).iterrows():
+        deadline = _to_date_or_none(row.get("deadline"))
+        is_overdue = bool(deadline and deadline < today_dt)
+        if is_overdue:
+            overdue_count += 1
+        items.append(
+            {
+                "ncr_id": int(row.get("id") or 0),
+                "project_id": int(row.get("project_id") or 0),
+                "ncr_no": str(row.get("ncr_no") or "").strip(),
+                "project_code": str(row.get("project_code") or "").strip(),
+                "project_name": str(row.get("project_name") or "").strip(),
+                "deadline": deadline,
+                "is_overdue": is_overdue,
+            }
+        )
+
+    if "deadline" in base_df.columns:
+        for _, row in base_df.iloc[5:].iterrows():
+            deadline = _to_date_or_none(row.get("deadline"))
+            if deadline and deadline < today_dt:
+                overdue_count += 1
+
+    return {"open_count": int(open_count), "overdue_count": int(overdue_count), "items": items}
 
 
 @st.cache_data(ttl=45, show_spinner=False)

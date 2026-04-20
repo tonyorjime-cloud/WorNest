@@ -21,6 +21,7 @@ from core.dashboard_service import (
     historical_compliance_snapshot,
     latest_login_activity,
     my_current_cycle_compliance_snapshot,
+    ncr_dashboard_snapshot,
     obligations_snapshot,
     project_open_biweekly_cycle,
     render_pdf_preview_and_download,
@@ -47,6 +48,7 @@ def page_dashboard():
     hist_comp = historical_compliance_snapshot(today) if admin else None
     my_comp = my_current_cycle_compliance_snapshot(int(sid), today.isoformat()) if sid is not None else None
     absentees = today_absentees_snapshot(today.isoformat())
+    ncr = ncr_dashboard_snapshot(today.isoformat())
     ubs = unified_biweekly_snapshot(today.isoformat())
 
     def _day_count_text(n):
@@ -212,7 +214,18 @@ def page_dashboard():
                     st.markdown('---')
 
     st.markdown("### 🚫 Today's Absentees")
-    if not absentees:
+    if today.weekday() in (5, 6):
+        st.info("Today is not a working day.")
+        if not absentees:
+            st.write("No active leave records.")
+        else:
+            for row in absentees:
+                staff_name = row.get("staff_name") or "Unknown"
+                leave_type = row.get("leave_type") or "Leave"
+                end_date = row.get("end_date")
+                end_txt = end_date.isoformat() if end_date else "unknown date"
+                st.markdown(f"- 👤 {staff_name} — {leave_type} (returns {end_txt})")
+    elif not absentees:
         st.caption("All staff are available today.")
     else:
         for row in absentees:
@@ -260,6 +273,32 @@ def page_dashboard():
         my_pending_tasks = len(snap.get("tasks") or []) if sid is not None else 0
         b3.metric("My pending tasks", my_pending_tasks)
         b4.metric("Current report no.", int(current_cycle['cycle_no']))
+
+    st.markdown("### 🚨 NCR Status")
+    ncr_col1, ncr_col2 = st.columns(2)
+    ncr_col1.metric("Open NCRs", int(ncr.get("open_count", 0)))
+    ncr_col2.metric("Overdue NCRs", int(ncr.get("overdue_count", 0)))
+    if not (ncr.get("items") or []):
+        st.success("No open NCRs.")
+    else:
+        for item in ncr.get("items") or []:
+            ncr_no = item.get("ncr_no") or "NCR"
+            project_id = item.get("project_id")
+            ncr_id = item.get("ncr_id")
+            project_code = item.get("project_code") or ""
+            project_name = item.get("project_name") or "Unknown project"
+            button_label = f"{ncr_no} — {project_code} {project_name}".strip()
+            if st.button(button_label, key=f"dash_ncr_nav_{ncr_no}"):
+                st.session_state["nav_page"] = "🏗️ Projects"
+                st.session_state["nav_project_id"] = int(project_id) if project_id is not None else None
+                st.session_state["nav_ncr_id"] = int(ncr_id) if ncr_id is not None else None
+                st.rerun()
+            deadline = item.get("deadline")
+            if item.get("is_overdue"):
+                st.error(f"{ncr_no} — {project_name} (Overdue)")
+            else:
+                deadline_txt = deadline.isoformat() if deadline else "No deadline"
+                st.warning(f"{ncr_no} — {project_name} (Due {deadline_txt})")
 
     if admin and hist_comp is not None:
         st.markdown("**Full Compliance (Admin Only)**")

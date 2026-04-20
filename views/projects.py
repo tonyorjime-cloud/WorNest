@@ -25,8 +25,10 @@ from core.projects_service import (
     _build_biweekly_pdf_file,
     _ensure_biweekly_pdf,
     _legacy_sections_from_structured,
+    _next_ncr_number,
     _normalize_biweekly_structured_payload,
     _notify_admins_biweekly_submission,
+    _project_ncrs_df,
     _project_is_dormant,
     _project_missing_historical_cycles,
     _project_open_biweekly_cycle,
@@ -34,14 +36,17 @@ from core.projects_service import (
     _render_attachment_list,
     _render_biweekly_structured_details,
     _save_biweekly_attachments,
+    _save_ncr_attachments,
     _save_test_result_attachment,
     _send_sms_notice,
     _structured_payload_to_json,
     _sync_biweekly_points_for_report,
+    NCR_DISPOSITIONS,
     approve_biweekly_report,
     can_upload_core_to_project,
     can_upload_project_outputs,
     file_download_button,
+    generate_ncr_pdf,
     render_pdf_preview_and_download,
     save_uploaded_file,
 )
@@ -49,6 +54,19 @@ from core.utils import _PDF_ERROR_PREFIX
 
 def page_projects():
     st.markdown("<div class='worknest-header'><h2>🏗️ Projects</h2></div>", unsafe_allow_html=True)
+    selected_project_id = None
+    if "nav_project_id" in st.session_state:
+        try:
+            selected_project_id = int(st.session_state.pop("nav_project_id"))
+            st.session_state["selected_project_id"] = selected_project_id
+        except Exception:
+            selected_project_id = None
+    highlight_ncr_id = None
+    if "nav_ncr_id" in st.session_state:
+        try:
+            highlight_ncr_id = int(st.session_state.pop("nav_ncr_id"))
+        except Exception:
+            highlight_ncr_id = None
     # For Staff: show posted projects first, then the rest.
     if is_admin() or can_manage_projects():
         projects=fetch_df("""
@@ -105,7 +123,7 @@ def page_projects():
             labels=[f"{r['code']}  {r['name']}" for _,r in projects.iterrows()]
             pre_idx = 0
             try:
-                target_pid = st.session_state.get("selected_project_id")
+                target_pid = selected_project_id if selected_project_id is not None else st.session_state.get("selected_project_id")
                 if target_pid is not None:
                     match_idx = next((i for i, (_, rr) in enumerate(projects.iterrows()) if int(rr["id"]) == int(target_pid)), None)
                     if match_idx is not None:
@@ -169,7 +187,7 @@ def page_projects():
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["name","rank","role"]), width='stretch')
 
         st.markdown("---")
-        tabs = st.tabs([" Buildings"," Core Docs"," Tests"," Biweekly Reports"])
+        tabs = st.tabs([" Buildings"," Core Docs"," Tests"," Biweekly Reports", " 🚨 NCRs"])
 
         # Buildings
         with tabs[0]:
@@ -671,7 +689,7 @@ def page_projects():
                         st.caption(f"Review note: {r.get('review_note')}")
                     if str(r.get('rejected_reason') or '').strip():
                         st.caption(f"Rejected reason: {r.get('rejected_reason')}")
-                    btns = st.columns([1,1,1])
+                    btns = st.columns([1,1,1,1])
                     if str(r.get('file_path') or '').strip():
                         with btns[0]:
                             file_download_button('⬇️ Main File', r['file_path'], key=f"bw{r['id']}")
@@ -685,6 +703,10 @@ def page_projects():
                     pdf_path = _ensure_biweekly_pdf(r.to_dict(), project_name=f"{selected['code']}  {selected['name']}", attachments_df=report_atts)
                     with btns[2]:
                         render_pdf_preview_and_download(f"bw_{int(r['id'])}", pdf_path)
+                    with btns[3]:
+                        if st.button("📝 Create NCR", key=f"ncr_from_report_{int(r['id'])}"):
+                            st.session_state[f"ncr_prefill_report_{pid}"] = int(r['id'])
+                            st.rerun()
                     if is_admin():
                         with st.expander('🧾 Review / Approval', expanded=False):
                             review_note_val = st.text_area('Review note / revision instruction', value=str(r.get('review_note') or ''), key=f"bw_note_{r['id']}", help='Use this when sending a report back for correction or for internal review comments.')
@@ -720,4 +742,190 @@ def page_projects():
                                         st.rerun()
                     _render_attachment_list('biweekly', int(r['id']), f"bwatt_{r['id']}")
                     st.markdown('---')
+
+        with tabs[4]:
+            st.markdown("### NCRs for this Project")
+            ncr_prefill_report_id = st.session_state.get(f"ncr_prefill_report_{pid}")
+            ncr_number_preview = _next_ncr_number()
+            rdf_ncr = _project_visible_biweekly_reports_df(
+                int(pid),
+                1 if is_admin() else 0,
+                int(current_staff_id() or -1),
+            )
+            report_options = {"None": None}
+            if not rdf_ncr.empty:
+                for _, rr in rdf_ncr.iterrows():
+                    label = f"Report {int(rr['cycle_no']) if pd.notna(rr.get('cycle_no')) else rr['id']} — {str(rr.get('status') or '').upper()} — {str(rr.get('submitted_on') or rr.get('uploaded_at') or rr.get('report_date') or '')[:10]}"
+                    report_options[label] = int(rr["id"])
+            report_labels = list(report_options.keys())
+            default_report_idx = 0
+            if ncr_prefill_report_id is not None:
+                for idx, lbl in enumerate(report_labels):
+                    if report_options[lbl] == int(ncr_prefill_report_id):
+                        default_report_idx = idx
+                        break
+
+            if ncr_prefill_report_id is not None:
+                st.info(f"NCR form pre-filled from report ID {int(ncr_prefill_report_id)}.")
+            elif highlight_ncr_id is not None:
+                st.info("Dashboard navigation targeted an NCR in this project.")
+
+            with st.form(f"ncr_form_{pid}"):
+                st.markdown("#### Create NCR")
+                st.selectbox(
+                    "Project",
+                    [f"{selected['code']} — {selected['name']}"],
+                    index=0,
+                    disabled=True,
+                    key=f"ncr_project_{pid}",
+                )
+                linked_report_label = st.selectbox(
+                    "Linked Report (optional)",
+                    report_labels,
+                    index=default_report_idx,
+                    key=f"ncr_report_{pid}",
+                )
+                linked_report_id = report_options.get(linked_report_label)
+                ncr_meta_1, ncr_meta_2 = st.columns(2)
+                with ncr_meta_1:
+                    st.text_input("NCR Number", value=ncr_number_preview, disabled=True, key=f"ncr_no_preview_{pid}")
+                with ncr_meta_2:
+                    st.text_input("Date", value=date.today().isoformat(), disabled=True, key=f"ncr_date_preview_{pid}")
+                ncr_description = st.text_area("Description of Non-Conformance", key=f"ncr_description_{pid}", height=120)
+                ncr_location = st.text_input("Location", key=f"ncr_location_{pid}")
+                ncr_specification = st.text_input("Specification Violated", key=f"ncr_specification_{pid}")
+                ncr_evidence = st.file_uploader(
+                    "Evidence",
+                    type=["png", "jpg", "jpeg"],
+                    accept_multiple_files=True,
+                    key=f"ncr_evidence_{pid}",
+                )
+                ncr_corrective_action = st.text_area("Required Corrective Action", key=f"ncr_corrective_action_{pid}", height=120)
+                ncr_deadline = st.date_input("Deadline", value=date.today(), key=f"ncr_deadline_{pid}")
+                st.text_input("Status", value="OPEN", disabled=True, key=f"ncr_status_preview_{pid}")
+                save_ncr = st.form_submit_button("Save NCR")
+
+            if save_ncr:
+                if not str(ncr_description or "").strip():
+                    st.error("Description of Non-Conformance is required.")
+                else:
+                    new_ncr_id = None
+                    last_exc = None
+                    for _ in range(3):
+                        ncr_no = _next_ncr_number()
+                        try:
+                            new_ncr_id = execute(
+                                """INSERT INTO ncrs
+                                   (project_id, report_id, created_by, ncr_no, description, location, specification, corrective_action, deadline, status, created_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                (
+                                    int(pid),
+                                    int(linked_report_id) if linked_report_id is not None else None,
+                                    current_staff_id(),
+                                    ncr_no,
+                                    str(ncr_description).strip(),
+                                    str(ncr_location or "").strip(),
+                                    str(ncr_specification or "").strip(),
+                                    str(ncr_corrective_action or "").strip(),
+                                    str(ncr_deadline),
+                                    "OPEN",
+                                    datetime.now().isoformat(timespec='seconds'),
+                                ),
+                            )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                    if new_ncr_id is None:
+                        st.error(f"Unable to create NCR. {last_exc}")
+                    else:
+                        _save_ncr_attachments(int(new_ncr_id), ncr_evidence, pid=pid)
+                        _project_ncrs_df.clear()
+                        st.session_state.pop(f"ncr_prefill_report_{pid}", None)
+                        st.success("NCR created successfully.")
+                        st.rerun()
+
+            ncr_df = _project_ncrs_df(pid)
+            if ncr_df.empty:
+                st.caption("No NCRs recorded for this project.")
+            else:
+                for _, ncr in ncr_df.iterrows():
+                    short_desc = str(ncr.get("description") or "").strip()
+                    if len(short_desc) > 120:
+                        short_desc = short_desc[:117] + "..."
+                    status_text = str(ncr.get("status") or "OPEN").upper()
+                    status_line = "**Status:** :green[CLOSED]" if status_text == "CLOSED" else f"**Status:** {status_text}"
+                    if highlight_ncr_id is not None and int(ncr.get("id") or 0) == int(highlight_ncr_id):
+                        st.info(f"Selected NCR: {ncr.get('ncr_no') or ''}")
+                    st.markdown(
+                        f"**{ncr.get('ncr_no') or ''}**  \n"
+                        f"{status_line}  \n"
+                        f"**Deadline:** {ncr.get('deadline') or ''}  \n"
+                        f"**Description:** {short_desc}"
+                    )
+                    with st.expander("NCR details", expanded=False):
+                        if pd.notna(ncr.get("cycle_no")):
+                            st.caption(f"Linked report: Report {int(ncr['cycle_no'])}")
+                        st.markdown(f"**Description of Non-Conformance**\n\n{ncr.get('description') or ''}")
+                        st.markdown(f"**Location**\n\n{ncr.get('location') or ''}")
+                        st.markdown(f"**Specification Violated**\n\n{ncr.get('specification') or ''}")
+                        st.markdown(f"**Required Corrective Action**\n\n{ncr.get('corrective_action') or ''}")
+                        st.markdown(f"**Deadline**\n\n{ncr.get('deadline') or ''}")
+                        st.markdown(f"**Status**\n\n{status_text}")
+                        if status_text == "CLOSED":
+                            st.markdown(f"**Disposition**\n\n{ncr.get('disposition') or ''}")
+                            st.markdown(f"**Closed By**\n\n{ncr.get('closed_by_name') or ''}")
+                            st.markdown(f"**Closed At**\n\n{ncr.get('closed_at') or ''}")
+                            st.markdown(f"**Remarks**\n\n{ncr.get('closure_remarks') or ''}")
+                    ncr_cols = st.columns([1, 1, 1])
+                    with ncr_cols[0]:
+                        ncr_pdf_path = generate_ncr_pdf(int(ncr["id"]))
+                        render_pdf_preview_and_download(f"ncr_{int(ncr['id'])}", ncr_pdf_path)
+                    with ncr_cols[1]:
+                        _render_attachment_list('ncr', int(ncr['id']), f"ncratt_{ncr['id']}")
+                    with ncr_cols[2]:
+                        if status_text == "OPEN":
+                            close_flag_key = f"ncr_close_open_{int(ncr['id'])}"
+                            if not st.session_state.get(close_flag_key, False):
+                                if st.button("Close NCR", key=f"close_ncr_btn_{int(ncr['id'])}"):
+                                    st.session_state[close_flag_key] = True
+                                    st.rerun()
+                        else:
+                            st.caption("Closed")
+                    if status_text == "OPEN" and st.session_state.get(f"ncr_close_open_{int(ncr['id'])}", False):
+                        with st.form(f"close_ncr_form_{int(ncr['id'])}"):
+                            default_disp = str(ncr.get("disposition") or NCR_DISPOSITIONS[0])
+                            disposition = st.selectbox(
+                                "Disposition",
+                                NCR_DISPOSITIONS,
+                                index=(NCR_DISPOSITIONS.index(default_disp) if default_disp in NCR_DISPOSITIONS else 0),
+                                key=f"ncr_disposition_{int(ncr['id'])}",
+                            )
+                            closure_remarks = st.text_area(
+                                "Closure Remarks",
+                                value=str(ncr.get("closure_remarks") or ""),
+                                key=f"ncr_closure_remarks_{int(ncr['id'])}",
+                                height=100,
+                            )
+                            close_form_cols = st.columns(2)
+                            confirm_close = close_form_cols[0].form_submit_button("Confirm Closure")
+                            cancel_close = close_form_cols[1].form_submit_button("Cancel")
+                        if cancel_close:
+                            st.session_state.pop(f"ncr_close_open_{int(ncr['id'])}", None)
+                            st.rerun()
+                        if confirm_close:
+                            execute(
+                                "UPDATE ncrs SET status='CLOSED', disposition=?, closed_by=?, closed_at=?, closure_remarks=? WHERE id=? AND COALESCE(status,'OPEN')='OPEN'",
+                                (
+                                    str(disposition or "").strip(),
+                                    current_staff_id(),
+                                    datetime.now().isoformat(timespec='seconds'),
+                                    str(closure_remarks or "").strip(),
+                                    int(ncr["id"]),
+                                ),
+                            )
+                            _project_ncrs_df.clear()
+                            st.session_state.pop(f"ncr_close_open_{int(ncr['id'])}", None)
+                            st.success("NCR closed.")
+                            st.rerun()
+                    st.markdown("---")
 # ---------- Staff ----------

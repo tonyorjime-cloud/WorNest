@@ -5,6 +5,7 @@ import os
 import textwrap
 import traceback
 import uuid
+from datetime import date
 from io import BytesIO
 
 import pandas as pd
@@ -23,6 +24,15 @@ from core.permissions import can_upload_core_docs, has_perm
 from core.labels import _biweekly_timing_status, _timing_status_label, _timing_status_points
 from core.tasks_service import file_download_button, save_uploaded_file
 from core.utils import _PDF_ERROR_PREFIX, _is_supported_pdf_image, _normalize_ng, _pdf_error_value, _safe_pdf_text
+
+
+NCR_DISPOSITIONS = [
+    "RECTIFIED",
+    "ACCEPTED AS-IS",
+    "PROCEEDED WITH WORK",
+    "MONITOR",
+    "REQUIRES REDESIGN",
+]
 
 
 
@@ -491,6 +501,42 @@ def _structured_payload_to_json(payload: dict) -> str:
     return json.dumps(_normalize_biweekly_structured_payload(payload), ensure_ascii=False)
 
 
+def _module_summary_lines(module_key: str, module_state: dict) -> list[str]:
+    meta = _BIWEEKLY_MODULES.get(module_key, {})
+    lines = []
+    rendered_extras = set()
+    for field_key, label in meta.get("checks", []):
+        val = str((module_state.get("checks") or {}).get(field_key) or "Not checked")
+        lines.append(f"{label}: {val}")
+        detail = str((module_state.get("check_details") or {}).get(field_key) or "").strip()
+        if detail:
+            lines.append(f"{label} reason/details: {detail}")
+        rule = _biweekly_check_extra_rule(module_key, field_key)
+        if rule:
+            extra_key = rule["extra_key"]
+            extra_val = str((module_state.get("extras") or {}).get(extra_key) or "").strip()
+            if extra_val:
+                lines.append(f"{rule['label']}: {extra_val}")
+            rendered_extras.add(extra_key)
+    for field_key, label in meta.get("extras", []):
+        if field_key in rendered_extras:
+            continue
+        val = str((module_state.get("extras") or {}).get(field_key) or "").strip()
+        if val:
+            lines.append(f"{label}: {val}")
+    remarks = str(module_state.get("remarks") or "").strip()
+    if remarks:
+        lines.append(f"Remarks: {remarks}")
+    return lines
+
+
+def _structured_module_markdown(module_key: str, module_state: dict) -> str:
+    lines = _module_summary_lines(module_key, module_state)
+    if not lines:
+        return ""
+    return "\n".join([f"- {line}" for line in lines])
+
+
 def _legacy_sections_from_structured(payload: dict, hse_text: str = "", rfi_text: str = "", general_text: str = "") -> dict:
     payload = _normalize_biweekly_structured_payload(payload)
     selected = payload.get("selected_modules") or []
@@ -566,9 +612,233 @@ def _save_test_result_attachment(test_result_id: int, upload=None, caption: str 
     return path
 
 
+def _next_ncr_number(on_date: date | None = None) -> str:
+    on_date = on_date or date.today()
+    year = int(on_date.year)
+    prefix = f"NCR-{year}-"
+    df = fetch_df(
+        "SELECT ncr_no FROM ncrs WHERE ncr_no LIKE ? ORDER BY ncr_no DESC LIMIT 1",
+        (f"{prefix}%",),
+    )
+    seq = 1
+    if not df.empty:
+        raw = str(df.iloc[0].get("ncr_no") or "").strip()
+        try:
+            seq = int(raw.rsplit("-", 1)[-1]) + 1
+        except Exception:
+            seq = 1
+    return f"{prefix}{seq:03d}"
+
+
+def _save_ncr_attachments(ncr_id: int, uploads=None, pid: int | None = None):
+    uploads = uploads or []
+    saved = []
+    for up in [u for u in uploads if u is not None]:
+        path = save_uploaded_file(up, f"project_{pid}/ncrs") if pid is not None else save_uploaded_file(up, "ncrs")
+        if path:
+            execute(
+                "INSERT INTO ncr_attachments (ncr_id,file_path,caption,uploaded_at,uploader_staff_id) VALUES (?,?,?,?,?)",
+                (int(ncr_id), path, '', datetime.now().isoformat(timespec='seconds'), current_staff_id()),
+            )
+            saved.append(path)
+    return saved
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _project_ncrs_df(pid: int) -> pd.DataFrame:
+    return fetch_df(
+        """
+        SELECT n.id, n.project_id, n.report_id, n.created_by, n.ncr_no, n.description, n.location,
+               n.specification, n.corrective_action, n.deadline, COALESCE(n.status,'OPEN') AS status,
+               n.created_at, n.closed_by, n.closed_at, n.closure_remarks, n.disposition,
+               p.code AS project_code, p.name AS project_name, br.cycle_no,
+               s.name AS closed_by_name
+        FROM ncrs n
+        JOIN projects p ON p.id=n.project_id
+        LEFT JOIN biweekly_reports br ON br.id=n.report_id
+        LEFT JOIN staff s ON s.id=n.closed_by
+        WHERE n.project_id=?
+        ORDER BY date(COALESCE(n.deadline, n.created_at)) ASC, n.id DESC
+        """,
+        (int(pid),),
+    )
+
+
+def _ncr_wrap_lines(c, text: str, max_width: float, font_name: str = "Helvetica", font_size: int = 11) -> list[str]:
+    words = str(text or "").replace("\r", "").split("\n")
+    lines = []
+    for paragraph in words:
+        para = paragraph.strip()
+        if not para:
+            lines.append("")
+            continue
+        current = ""
+        for word in para.split():
+            test = f"{current} {word}".strip()
+            if current and c.stringWidth(test, font_name, font_size) > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = test
+        if current:
+            lines.append(current)
+    return lines or [""]
+
+
+def _generate_ncr_pdf_bytes(ncr_row: dict, attachments_df=None) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    margin = 20 * mm
+    y = height - margin
+    content_width = width - (2 * margin)
+
+    def new_page():
+        nonlocal y
+        c.showPage()
+        y = height - margin
+
+    def ensure_space(required_height: float):
+        nonlocal y
+        if y - required_height < margin:
+            new_page()
+
+    def draw_text_block(text: str, font_name: str = "Helvetica", font_size: int = 11, leading: int = 14, gap_after: int = 8):
+        nonlocal y
+        lines = _ncr_wrap_lines(c, text, content_width, font_name=font_name, font_size=font_size)
+        needed = max(leading, len(lines) * leading)
+        ensure_space(needed + gap_after)
+        c.setFont(font_name, font_size)
+        for line in lines:
+            c.drawString(margin, y, line)
+            y -= leading
+        y -= gap_after
+
+    def draw_heading(text: str):
+        draw_text_block(text, font_name="Helvetica-Bold", font_size=12, leading=15, gap_after=6)
+
+    def draw_image(path: str):
+        nonlocal y
+        if not path or not os.path.exists(path) or not _is_supported_pdf_image(path):
+            draw_text_block(os.path.basename(path or ""), gap_after=4)
+            return
+        try:
+            img = Image.open(path)
+            img = ImageOps.exif_transpose(img)
+            iw, ih = img.size
+            if not iw or not ih:
+                return
+            max_w = content_width
+            max_h = 75 * mm
+            scale = min(max_w / float(iw), max_h / float(ih))
+            draw_w = iw * scale
+            draw_h = ih * scale
+            ensure_space(draw_h + 10)
+            c.drawImage(ImageReader(img), margin, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+            y -= draw_h + 10
+        except Exception:
+            draw_text_block(os.path.basename(path), gap_after=4)
+
+    project_label = " — ".join([x for x in [str(ncr_row.get("project_code") or "").strip(), str(ncr_row.get("project_name") or "").strip()] if x])
+    created_txt = str(ncr_row.get("created_at") or "").strip()[:10] or date.today().isoformat()
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawCentredString(width / 2, y, "NON-CONFORMANCE REPORT")
+    y -= 20
+
+    draw_text_block(f"Project: {project_label or 'N/A'}")
+    draw_text_block(f"NCR No: {ncr_row.get('ncr_no') or 'N/A'}")
+    draw_text_block(f"Date: {created_txt}")
+    if ncr_row.get("cycle_no") is not None:
+        draw_text_block(f"Linked Report: Report {int(ncr_row.get('cycle_no'))}")
+
+    draw_heading("1. Description of Non-Conformance")
+    draw_text_block(str(ncr_row.get("description") or ""))
+
+    draw_heading("2. Location")
+    draw_text_block(str(ncr_row.get("location") or ""))
+
+    draw_heading("3. Specification Violated")
+    draw_text_block(str(ncr_row.get("specification") or ""))
+
+    draw_heading("4. Evidence")
+    if attachments_df is None or attachments_df.empty:
+        draw_text_block("No evidence images attached.")
+    else:
+        for _, row in attachments_df.iterrows():
+            draw_image(str(row.get("file_path") or ""))
+
+    draw_heading("5. Required Corrective Action")
+    draw_text_block(str(ncr_row.get("corrective_action") or ""))
+
+    draw_heading("6. Deadline")
+    draw_text_block(str(ncr_row.get("deadline") or ""))
+
+    draw_heading("7. Status")
+    draw_text_block(str(ncr_row.get("status") or "OPEN"))
+
+    draw_heading("8. Closure")
+    draw_text_block(f"Status: {str(ncr_row.get('status') or 'OPEN')}")
+    if str(ncr_row.get("status") or "").upper() == "CLOSED":
+        draw_text_block(f"Disposition: {str(ncr_row.get('disposition') or '')}")
+        draw_text_block(f"Closed By: {str(ncr_row.get('closed_by_name') or 'N/A')}")
+        draw_text_block(f"Closed At: {str(ncr_row.get('closed_at') or '')}")
+        draw_text_block("Remarks:")
+        draw_text_block(str(ncr_row.get("closure_remarks") or ""))
+
+    c.save()
+    return buf.getvalue()
+
+
+def _build_ncr_pdf_file(ncr_row: dict, attachments_df=None):
+    try:
+        project_id = int(ncr_row.get("project_id") or 0)
+        ncr_id = int(ncr_row.get("id") or 0)
+        folder = os.path.join(UPLOAD_DIR, f"project_{project_id}/ncrs") if project_id else os.path.join(UPLOAD_DIR, "ncrs")
+        os.makedirs(folder, exist_ok=True)
+        out_path = os.path.join(folder, f"ncr_{ncr_id or datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+        pdf_bytes = _generate_ncr_pdf_bytes(ncr_row, attachments_df=attachments_df)
+        with open(out_path, "wb") as f:
+            f.write(pdf_bytes)
+        return out_path
+    except Exception as e:
+        err_value = _pdf_error_value(e)
+        print("NCR PDF BUILD ERROR:", err_value)
+        print(traceback.format_exc())
+        return err_value
+
+
+def generate_ncr_pdf(ncr_id: int):
+    ndf = fetch_df(
+        """
+        SELECT n.id, n.project_id, n.report_id, n.created_by, n.ncr_no, n.description, n.location,
+               n.specification, n.corrective_action, n.deadline, COALESCE(n.status,'OPEN') AS status,
+               n.created_at, n.closed_by, n.closed_at, n.closure_remarks, n.disposition,
+               p.code AS project_code, p.name AS project_name, br.cycle_no,
+               s.name AS closed_by_name
+        FROM ncrs n
+        JOIN projects p ON p.id=n.project_id
+        LEFT JOIN biweekly_reports br ON br.id=n.report_id
+        LEFT JOIN staff s ON s.id=n.closed_by
+        WHERE n.id=?
+        LIMIT 1
+        """,
+        (int(ncr_id),),
+    )
+    if ndf.empty:
+        return _pdf_error_value("NCR not found")
+    row = ndf.iloc[0].to_dict()
+    attachments_df = _attachment_rows("ncr", int(ncr_id))
+    return _build_ncr_pdf_file(row, attachments_df=attachments_df)
+
+
 def _attachment_rows(kind: str, parent_id: int):
-    table = 'biweekly_report_attachments' if kind == 'biweekly' else 'test_result_attachments'
-    idcol = 'report_id' if kind == 'biweekly' else 'test_result_id'
+    if kind == 'biweekly':
+        table, idcol = 'biweekly_report_attachments', 'report_id'
+    elif kind == 'test':
+        table, idcol = 'test_result_attachments', 'test_result_id'
+    else:
+        table, idcol = 'ncr_attachments', 'ncr_id'
     try:
         return fetch_df(f"SELECT id,file_path,caption,uploaded_at FROM {table} WHERE {idcol}=? ORDER BY id", (int(parent_id),))
     except Exception:
@@ -578,8 +848,12 @@ def _attachment_rows(kind: str, parent_id: int):
 def _attachment_rows_bulk(kind: str, parent_ids: tuple[int, ...]):
     if not parent_ids:
         return pd.DataFrame(columns=['id', 'parent_id', 'file_path', 'caption', 'uploaded_at'])
-    table = 'biweekly_report_attachments' if kind == 'biweekly' else 'test_result_attachments'
-    idcol = 'report_id' if kind == 'biweekly' else 'test_result_id'
+    if kind == 'biweekly':
+        table, idcol = 'biweekly_report_attachments', 'report_id'
+    elif kind == 'test':
+        table, idcol = 'test_result_attachments', 'test_result_id'
+    else:
+        table, idcol = 'ncr_attachments', 'ncr_id'
     qmarks = ",".join(["?"] * len(parent_ids))
     try:
         return fetch_df(
